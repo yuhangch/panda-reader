@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0"><channel><title>示例订阅</title><link>https://example.com/</link>
+  <item><guid>post-1</guid><title>阅读器文章</title><link>/articles/one</link>
+    <description><![CDATA[<p>中文正文 <strong>加粗</strong></p>]]></description>
+    <pubDate>Mon, 01 Jun 2026 09:00:00 GMT</pubDate>
+  </item>
+</channel></rss>

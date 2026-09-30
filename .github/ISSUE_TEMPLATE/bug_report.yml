@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible problem in Panda Reader
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include passwords, API tokens, private feed URLs, or personal article content. Use SECURITY.md to report vulnerabilities privately.
+  - type: input
+    id: version
+    attributes:
+      label: Panda Reader version
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: OS and version
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Subscription source
+      options:
+        - Local
+        - Miniflux
+        - FreshRSS
+        - Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the expected and actual result. Redact private information.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or screenshots
+      description: Remove tokens, private URLs, and personal content before attaching.

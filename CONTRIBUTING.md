@@ -1,0 +1,26 @@
+# Contributing
+
+Thanks for helping improve Panda Reader. Issues and pull requests are welcome.
+
+## Development checks
+
+Use the stable Rust toolchain and run these commands before submitting a change:
+
+```sh
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo check --workspace --locked
+```
+
+The GitHub Actions workflow additionally builds the desktop app on Windows, macOS, and Linux. On the maintainer's Windows machine, keep `.cargo/config.toml` unchanged because it places linker output on a local disk.
+
+## Pull requests
+
+- Describe the user-visible change and any migration or provider behavior.
+- Include focused tests for data migrations, sync behavior, and error handling when applicable.
+- Do not include credentials, personal feed exports, or private data in commits or issue attachments.
+- Keep provider-specific behavior behind the provider abstraction and describe unsupported capabilities in the UI/docs.
+
+## Adding a provider
+
+Implement the provider in `crates/panda-providers`, document supported operations and limitations, and add mock HTTP tests for authentication, pagination, state updates, feed changes, and API errors. Ensure its data is stored in a distinct workspace.

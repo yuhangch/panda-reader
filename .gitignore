@@ -1,0 +1,9 @@
+/target
+/dist/
+docs/node_modules/
+docs/dist/
+docs/.astro/
+*.db
+*.db-shm
+*.db-wal
+AGENTS.md

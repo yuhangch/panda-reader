@@ -1,0 +1,4 @@
+# TextView HTML layout recurses; deep article DOM can overflow the default 1MB stack.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:16777216"]
+

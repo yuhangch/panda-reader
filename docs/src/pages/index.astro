@@ -1,0 +1,125 @@
+---
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+const repository = 'https://github.com/yuhangch/panda-reader';
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f4ee" />
+    <meta name="description" content="Panda Reader is an open-source desktop RSS reader. Manage feeds locally or sync with Miniflux and FreshRSS." />
+    <title>Panda Reader — just an RSS reader</title>
+    <link rel="icon" type="image/png" href={`${base}app-icon.png`} />
+  </head>
+  <body>
+    <main id="top" class="layout wrap">
+      <div class="copy">
+      <section class="introduction" aria-labelledby="intro-title">
+        <img src={`${base}app-icon.png`} alt="" width="80" height="80" />
+        <div class="intro-copy">
+          <h1 id="intro-title">
+            <span class="product-name">Panda Reader</span>
+          </h1>
+          <p class="intro-description">An RSS reader for your desktop, built with <a href="https://gpui-kit.com/">gpui-kit</a>.</p>
+          <p class="source-note">Manage feeds locally, or sync with Miniflux and FreshRSS.</p>
+        </div>
+      </section>
+
+      <section class="manifesto" aria-labelledby="manifesto-title">
+        <h2 id="manifesto-title">
+          <span><em>No</em> minimalism.</span>
+          <span><em>No</em> performance promises.</span>
+          <span><em>No</em> AI hype.</span>
+        </h2>
+        <p>Just a reader I wanted to use.</p>
+      </section>
+
+      <section class="personal" aria-label="Why I made Panda Reader">
+        <p>I wanted to go back to RSS. For news, sure, but mostly for independent blogs: ordinary lives, written honestly, without a big hook.</p>
+        <p>Choosing a reader started taking as much time as making one. So I made Panda Reader. I can change it whenever I like. That’s the whole advantage.</p>
+        <p class="invitation">It won’t suit everyone. Use it, change it, fork it. That’s why it’s open source.</p>
+      </section>
+
+      <div class="download">
+        <a class="button" href={`${repository}/releases/latest`}>Download Panda Reader <span aria-hidden="true">↗</span></a>
+        <span class="platforms">Windows · macOS · Linux</span>
+      </div>
+      </div>
+
+      <figure class="screenshot" id="reading">
+        <img src={`${base}reader-window.webp`} alt="Panda Reader showing feed categories, a news article list, and a Guardian World article in the reading pane" width="1744" height="1142" />
+      </figure>
+    </main>
+
+    <footer class="footer wrap">
+      <p>Made by <a href="https://github.com/yuhangch">yuhangch</a> with <a href="https://gpui-kit.com/">gpui-kit</a>. Inspired by <a href="https://github.com/l0ng-ai/tty7">tty7</a>.</p>
+      <div class="footer-links">
+        <a href={repository}>GitHub</a>
+        <a href={`${repository}/blob/main/LICENSE`}>MIT License</a>
+      </div>
+    </footer>
+  </body>
+</html>
+
+<style>
+  :global(*) { box-sizing: border-box; }
+  :global(html) { background: #f5f4ee; }
+  :global(body) { margin: 0; color: #20281f; background: #f5f4ee; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+  :global(a) { color: inherit; text-decoration: none; }
+  .wrap { width: min(1320px, calc(100% - 80px)); margin: 0 auto; }
+  .layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: clamp(28px, 4vw, 56px); align-items: center; padding: 48px 0; }
+  .copy { min-width: 0; container-type: inline-size; }
+  a:hover { color: #315d47; }
+  a:focus-visible { outline: 2px solid #315d47; outline-offset: 4px; }
+  .introduction { display: flex; align-items: center; gap: 18px; padding: 0 0 28px; }
+  .introduction img { display: block; width: 80px; height: 80px; flex: 0 0 80px; object-fit: contain; }
+  .intro-copy { min-width: 0; }
+  h1 { margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: 23px; font-weight: 400; letter-spacing: -.035em; line-height: 1.25; }
+  h1 span { display: block; }
+  h1 .product-name { margin-bottom: 5px; color: #315d47; font-size: clamp(26px, 7cqi, 34px); letter-spacing: -.045em; white-space: nowrap; }
+  .introduction p { margin: 0; color: #73796f; font-size: 13px; line-height: 1.6; }
+  .introduction .intro-description { margin-bottom: 6px; color: #20281f; font-family: Georgia, "Times New Roman", serif; font-size: 14px; letter-spacing: -.02em; line-height: 1.5; }
+  .manifesto { padding: 0 0 30px; }
+  h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: clamp(26px, 9cqi, 52px); font-weight: 400; line-height: 1.1; letter-spacing: -.055em; }
+  h2 span { display: block; }
+  h2 em { color: #547257; font-weight: 400; }
+  .manifesto p { margin: 16px 0 0; color: #8d7260; font-size: 13px; }
+  .personal { max-width: 640px; padding: 24px 0 0; border-top: 1px solid #dcded3; }
+  .personal p { margin: 0 0 14px; font-size: 14px; line-height: 1.75; color: #536052; }
+  .personal .invitation { margin-bottom: 0; color: #73796f; font-size: 13px; }
+  .download { display: flex; flex-wrap: wrap; gap: 16px 20px; align-items: center; margin: 28px 0 0; }
+  .button { display: inline-flex; gap: 24px; align-items: center; min-height: 44px; padding: 0 18px; border-radius: 4px; background: #315d47; color: #fbfaf5; font-size: 12px; font-weight: 600; }
+  .button:hover { background: #264b39; color: #fbfaf5; }
+  .platforms { color: #73796f; font-size: 11px; }
+  .screenshot { min-width: 0; margin: 0; overflow: hidden; border: 1px solid #dcded3; border-radius: 8px; background: #f1f3f6; }
+  .screenshot img { width: calc(100% + 2px); max-width: none; height: auto; display: block; margin: -1px; }
+  .footer { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; padding: 20px 0 28px; border-top: 1px solid #e3e2d8; color: #73796f; font-size: 11px; line-height: 1.7; }
+  .footer p { margin: 0; }
+  .footer p a { text-decoration: underline; text-decoration-color: #c9cdbf; text-underline-offset: 3px; }
+  .footer-links { display: flex; gap: 18px; }
+  @container (max-width: 420px) {
+    .introduction { display: grid; grid-template-columns: 80px minmax(0, 1fr); row-gap: 10px; }
+    .introduction img { grid-column: 1; grid-row: 1; }
+    .intro-copy { display: contents; }
+    h1 { grid-column: 2; margin: 0; }
+    .introduction .intro-description { grid-column: 1 / -1; margin: 0; font-size: clamp(11px, 4.3cqi, 14px); white-space: nowrap; }
+    .source-note { grid-column: 1 / -1; }
+  }
+  @media (max-width: 720px) {
+    .wrap { width: calc(100% - 44px); }
+    .layout { grid-template-columns: 1fr; gap: 32px; padding: 32px 0; }
+    .introduction { gap: 14px; padding: 0 0 26px; }
+    .introduction { grid-template-columns: 64px minmax(0, 1fr); }
+    .introduction img { width: 64px; height: 64px; flex-basis: 64px; }
+    h1 { font-size: 20px; }
+    h1 .product-name { font-size: 30px; }
+    h2 { font-size: clamp(26px, 9cqi, 46px); }
+    .manifesto { padding-bottom: 26px; }
+    .personal p { font-size: 13px; }
+    .download { margin: 24px 0 0; }
+  }
+</style>

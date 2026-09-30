@@ -1,0 +1,23 @@
+---
+description: Shared Panda Reader conventions for agents
+alwaysApply: true
+---
+
+# Panda Reader
+
+## Workspace
+
+- `apps/panda-reader` — GPUI desktop app
+- `crates/panda-core` — shared types
+- `crates/panda-store` — local articles and feeds
+- `crates/panda-miniflux` — Miniflux client
+
+## Build
+
+- On Windows, when building from a mapped or network drive, set `CARGO_TARGET_DIR` to a local disk to avoid MSVC PDB errors. Keep machine-specific absolute paths out of the shared Cargo config.
+- Run with `cargo run -p panda-reader` (or the local `CARGO_TARGET_DIR` override documented in `AGENTS.md`).
+
+## Product / UI
+
+- Local data lives under the app data dir for `com.PandaReader.PandaReader` (`panda-reader.sqlite3`, `preferences.json`, `miniflux.json`).
+- Left column uses Inter. Do not vendor Anthropic Sans (proprietary, no Chinese glyphs).

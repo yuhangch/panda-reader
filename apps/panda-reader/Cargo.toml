@@ -1,0 +1,37 @@
+[package]
+name = "panda-reader"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "panda-reader"
+path = "src/main.rs"
+# Keep GPUI's desktop bin out of the test harness: rustc overflows its stack
+# expanding the UI-heavy test binary on Windows. The normal bin still builds.
+test = false
+bench = false
+
+[dependencies]
+ammonia.workspace = true
+anyhow.workspace = true
+arboard.workspace = true
+chrono.workspace = true
+directories.workspace = true
+gpui-kit.workspace = true
+image.workspace = true
+panda-core = { path = "../../crates/panda-core" }
+panda-miniflux = { path = "../../crates/panda-miniflux" }
+panda-providers = { path = "../../crates/panda-providers" }
+panda-store = { path = "../../crates/panda-store" }
+panda-translate = { path = "../../crates/panda-translate" }
+reqwest.workspace = true
+reqwest_client.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0.11"
