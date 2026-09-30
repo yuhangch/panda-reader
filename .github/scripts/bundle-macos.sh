@@ -11,7 +11,7 @@ TARGET="$1"
 ARCH="$2"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
-VERSION="$("$ROOT/.github/scripts/version.sh")"
+VERSION="$(bash "$ROOT/.github/scripts/version.sh")"
 NAME="panda-reader-${VERSION}-macos-${ARCH}"
 APP="dist/Panda Reader.app"
 
