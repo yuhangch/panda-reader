@@ -102,6 +102,7 @@ jobs:
             dist/*.AppImage
             dist/*-setup.exe
             dist/*-signing-status.txt
+          retention-days: 1
           if-no-files-found: error
 
   publish:
