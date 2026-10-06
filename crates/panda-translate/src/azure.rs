@@ -1,4 +1,4 @@
-use crate::html::{block_needs_translation, split_blocks};
+use crate::html::{TranslationInput, translate_html_blocks};
 use crate::{TranslateRequest, TranslateResult, Translator};
 use anyhow::{Context as _, bail};
 use reqwest::Client;
@@ -92,6 +92,49 @@ impl AzureTranslator {
             .collect();
         Ok((parts, detected))
     }
+
+    pub(crate) async fn translate_titles(
+        &self,
+        titles: &[String],
+        target: &str,
+    ) -> Result<crate::TitleBatchResult, crate::TitleBatchFailure> {
+        let mut output = Vec::with_capacity(titles.len());
+        let mut requests = 0;
+        let mut start = 0;
+        while start < titles.len() {
+            let mut end = start;
+            let mut chars = 0;
+            while end < titles.len() && end - start < MAX_BATCH {
+                let n = titles[end].chars().count();
+                if end > start && chars + n > MAX_BATCH_CHARS {
+                    break;
+                }
+                chars += n;
+                end += 1;
+            }
+            if end == start {
+                end += 1;
+            }
+            let (parts, _) = self
+                .translate_texts(&titles[start..end], target)
+                .await
+                .map_err(|error| crate::TitleBatchFailure {
+                    requests: requests + 1,
+                    characters: titles[..end]
+                        .iter()
+                        .map(|title| title.chars().count())
+                        .sum(),
+                    error,
+                })?;
+            output.extend(parts);
+            requests += 1;
+            start = end;
+        }
+        Ok(crate::TitleBatchResult {
+            translations: output,
+            requests,
+        })
+    }
 }
 
 impl Translator for AzureTranslator {
@@ -126,49 +169,25 @@ impl Translator for AzureTranslator {
         let html = if req.html.trim().is_empty() {
             String::new()
         } else {
-            let blocks = split_blocks(&req.html);
-            let mut translated_blocks = blocks.clone();
-            let mut pending_indices = Vec::new();
-            let mut pending_texts = Vec::new();
-            for (index, block) in blocks.iter().enumerate() {
-                if block_needs_translation(block) {
-                    pending_indices.push(index);
-                    pending_texts.push(block.clone());
-                }
-            }
-            let mut cursor = 0usize;
-            while cursor < pending_texts.len() {
-                let mut end = cursor;
-                let mut total = 0usize;
-                while end < pending_texts.len() && end - cursor < MAX_BATCH {
-                    let next = pending_texts[end].chars().count();
-                    if end > cursor && total + next > MAX_BATCH_CHARS {
-                        break;
-                    }
-                    total += next;
-                    end += 1;
-                }
-                if end == cursor {
-                    end = cursor + 1;
-                }
-                let (parts, source) = self
-                    .translate_texts(&pending_texts[cursor..end], &req.target_lang)
-                    .await?;
-                if detected.is_none() {
-                    detected = source;
-                }
-                for (offset, part) in parts.into_iter().enumerate() {
-                    translated_blocks[pending_indices[cursor + offset]] = part;
-                }
-                cursor = end;
-            }
-            if translated_blocks
-                .iter()
-                .all(|block| block.trim().is_empty())
-            {
+            let target_lang = req.target_lang.clone();
+            let translation = translate_html_blocks(
+                &req.html,
+                TranslationInput::Html,
+                MAX_BATCH,
+                MAX_BATCH_CHARS,
+                MAX_BATCH_CHARS,
+                |texts| {
+                    let texts = texts.to_vec();
+                    let target_lang = target_lang.clone();
+                    async move { self.translate_texts(&texts, &target_lang).await }
+                },
+            )
+            .await?;
+            if translation.html.trim().is_empty() {
                 bail!("Azure Translator returned an empty translation");
             }
-            translated_blocks.join("\n")
+            detected = detected.or(translation.detected_source_lang);
+            translation.html
         };
 
         Ok(TranslateResult {

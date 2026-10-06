@@ -96,6 +96,9 @@ pub struct Feed {
     pub feed_url: String,
     #[serde(default)]
     pub site_url: String,
+    /// Language declared by the feed publisher (available in newer Miniflux versions).
+    #[serde(default)]
+    pub language: Option<String>,
     pub category: Option<Category>,
 }
 
@@ -347,7 +350,7 @@ mod tests {
         let server = std::thread::spawn(move || {
             let replies = [
                 r#"{"id":7,"username":"reader"}"#,
-                r#"[{"id":4,"title":"Feed","feed_url":"https://example.com/rss","site_url":"https://example.com","category":{"id":2,"title":"News"}}]"#,
+                r#"[{"id":4,"title":"Feed","feed_url":"https://example.com/rss","site_url":"https://example.com","language":"en-US","category":{"id":2,"title":"News"}}]"#,
                 r#"{"total":1,"entries":[{"id":8,"feed_id":4,"title":"Article","status":"unread"}]}"#,
             ];
             for (index, body) in replies.into_iter().enumerate() {
@@ -391,14 +394,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             assert_eq!(client.me().await.unwrap().username, "reader");
-            assert_eq!(
-                client.feeds().await.unwrap()[0]
-                    .category
-                    .as_ref()
-                    .unwrap()
-                    .title,
-                "News"
-            );
+            let feeds = client.feeds().await.unwrap();
+            assert_eq!(feeds[0].language.as_deref(), Some("en-US"));
+            assert_eq!(feeds[0].category.as_ref().unwrap().title, "News");
             assert_eq!(client.entries(0, 100).await.unwrap().entries[0].id, 8);
         });
         server.join().unwrap();

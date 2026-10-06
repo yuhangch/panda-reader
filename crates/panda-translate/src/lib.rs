@@ -1,5 +1,6 @@
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 mod azure;
@@ -7,8 +8,15 @@ pub mod html;
 mod volcengine;
 
 pub use azure::AzureTranslator;
-pub use html::{block_needs_translation, source_hash, split_blocks};
+pub use html::{
+    HtmlTranslation, TranslationInput, block_needs_translation, source_hash, split_blocks,
+    split_text_for_translate, translate_html_blocks, translation_cache_hash,
+};
 pub use volcengine::VolcengineTranslator;
+
+pub fn title_source_hash(title: &str) -> String {
+    hex::encode(Sha256::digest(title.as_bytes()))
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +160,19 @@ pub enum AnyTranslator {
     Volcengine(VolcengineTranslator),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TitleBatchResult {
+    pub translations: Vec<String>,
+    pub requests: usize,
+}
+
+#[derive(Debug)]
+pub struct TitleBatchFailure {
+    pub requests: usize,
+    pub characters: usize,
+    pub error: anyhow::Error,
+}
+
 impl AnyTranslator {
     pub fn id(&self) -> &'static str {
         match self {
@@ -171,6 +192,17 @@ impl AnyTranslator {
         match self {
             Self::Azure(translator) => translator.translate(req).await,
             Self::Volcengine(translator) => translator.translate(req).await,
+        }
+    }
+
+    pub async fn translate_titles(
+        &self,
+        titles: &[String],
+        target_lang: &str,
+    ) -> Result<TitleBatchResult, TitleBatchFailure> {
+        match self {
+            Self::Azure(translator) => translator.translate_titles(titles, target_lang).await,
+            Self::Volcengine(translator) => translator.translate_titles(titles, target_lang).await,
         }
     }
 }

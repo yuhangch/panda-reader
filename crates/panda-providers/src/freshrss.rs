@@ -211,6 +211,7 @@ impl FreshRss {
                     title,
                     feed_url,
                     site_url: site_url.unwrap_or_default(),
+                    language: None,
                     category,
                 })
             })

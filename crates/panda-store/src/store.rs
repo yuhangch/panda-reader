@@ -1,4 +1,4 @@
-use ammonia::{Builder as Sanitizer, UrlRelative};
+use crate::extraction::{extract_article_html, plain_text, sanitize_html};
 use anyhow::Context as _;
 use feed_rs::model::{Entry, Feed as ParsedFeed};
 use opml::{Head, OPML, Outline};
@@ -10,7 +10,6 @@ use panda_miniflux::{Entry as RemoteEntry, Feed as RemoteFeed, Miniflux};
 use panda_providers::{ProviderClient, ProviderKind};
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
-use scraper::{Html, Selector};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -39,6 +38,7 @@ impl Store {
                 id INTEGER PRIMARY KEY,
                 feed_url TEXT NOT NULL,
                 title TEXT NOT NULL,
+                custom_title TEXT,
                 site_url TEXT,
                 folder TEXT,
                 etag TEXT,
@@ -83,12 +83,41 @@ impl Store {
             "TEXT NOT NULL DEFAULT 'local'",
         )?;
         ensure_column(&connection, "feeds", "remote_id", "INTEGER")?;
+        ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
+        ensure_column(&connection, "feeds", "language", "TEXT")?;
+        ensure_column(
+            &connection,
+            "feeds",
+            "auto_translate_titles",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column(&connection, "articles", "remote_id", "INTEGER")?;
         ensure_column(&connection, "articles", "translated_html", "TEXT")?;
         ensure_column(&connection, "articles", "translated_title", "TEXT")?;
         ensure_column(&connection, "articles", "translated_lang", "TEXT")?;
         ensure_column(&connection, "articles", "translation_source_hash", "TEXT")?;
+        ensure_column(&connection, "articles", "auto_translated_title", "TEXT")?;
+        ensure_column(
+            &connection,
+            "articles",
+            "auto_translated_title_lang",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "articles",
+            "auto_translated_title_source_hash",
+            "TEXT",
+        )?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS translation_usage(day TEXT NOT NULL, provider TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, characters INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,provider));")?;
         migrate_workspace_schema(&connection)?;
+        ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
+        ensure_column(
+            &connection,
+            "pending_remote_marks",
+            "revision",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         connection.execute_batch(
             "DROP INDEX IF EXISTS idx_feeds_remote;
              DROP INDEX IF EXISTS idx_articles_remote;
@@ -116,11 +145,11 @@ impl Store {
     ) -> anyhow::Result<ReaderSnapshot> {
         let feeds = if include_feeds {
             let mut feeds_statement = self.connection.prepare(
-                "SELECT f.id, f.title, f.feed_url, f.site_url, f.folder,
-                        COUNT(CASE WHEN a.is_read=0 THEN 1 END), f.last_error
+                "SELECT f.id, COALESCE(f.custom_title,f.title), f.feed_url, f.site_url, f.folder,
+                        COUNT(CASE WHEN a.is_read=0 THEN 1 END), f.last_error, f.auto_translate_titles
                  FROM feeds f LEFT JOIN articles a ON a.feed_id=f.id
                  WHERE f.workspace=?1
-                 GROUP BY f.id ORDER BY COALESCE(f.folder,''), f.title COLLATE NOCASE",
+                 GROUP BY f.id ORDER BY COALESCE(f.folder,''), COALESCE(f.custom_title,f.title) COLLATE NOCASE",
             )?;
             feeds_statement
                 .query_map([&self.workspace], |row| {
@@ -132,6 +161,7 @@ impl Store {
                         folder: row.get(4)?,
                         unread: row.get(5)?,
                         last_error: row.get(6)?,
+                        auto_translate_titles: row.get::<_, i64>(7)? != 0,
                     })
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -167,7 +197,7 @@ impl Store {
         };
         // Search title/author/snippet only -- never scan full HTML blobs.
         let sql = format!(
-            "SELECT a.id,f.title,a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later
+            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles
              FROM articles a JOIN feeds f ON f.id=a.feed_id
                  WHERE f.workspace=? AND {filter} AND (?='' OR a.title LIKE ? OR IFNULL(a.author,'') LIKE ? OR a.snippet LIKE ?)
              {cursor_filter}
@@ -178,6 +208,8 @@ impl Store {
             Ok(ArticleSummary {
                 id: row.get(0)?,
                 feed_title: row.get(1)?,
+                feed_language: row.get(13)?,
+                feed_auto_translate_titles: row.get::<_, i64>(14)? != 0,
                 title: row.get(2)?,
                 url: row.get(3)?,
                 author: row.get(4)?,
@@ -186,6 +218,9 @@ impl Store {
                 is_read: row.get(7)?,
                 is_starred: row.get(8)?,
                 read_later: row.get(9)?,
+                auto_translated_title: row.get(10)?,
+                auto_translated_title_lang: row.get(11)?,
+                auto_translated_title_source_hash: row.get(12)?,
             })
         };
         let bind_search = |params: &mut Vec<rusqlite::types::Value>| {
@@ -268,7 +303,7 @@ impl Store {
             .filter(|html| !html.trim().is_empty())
             .unwrap_or(article.content_html.as_str());
         let title = article.summary.title.trim();
-        let source_hash = panda_translate::source_hash(source, title);
+        let source_hash = panda_translate::translation_cache_hash(source, title, translator.id());
         let has_body = article
             .translated_html
             .as_deref()
@@ -282,6 +317,21 @@ impl Store {
             .as_deref()
             .is_some_and(|hash| hash == source_hash);
         if lang_ok && has_body && hash_ok {
+            if let Some(translated_title) = article
+                .translated_title
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                && article.summary.feed_auto_translate_titles
+            {
+                self.save_auto_translated_title(
+                    article_id,
+                    &article.summary.title,
+                    translated_title,
+                    target_lang,
+                    &panda_translate::title_source_hash(&article.summary.title),
+                )?;
+                return self.article(article_id);
+            }
             return Ok(article);
         }
         if source.trim().is_empty() && title.is_empty() {
@@ -298,21 +348,75 @@ impl Store {
             "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4 WHERE id=?5",
             params![result.html, result.title, target_lang, source_hash, article_id],
         )?;
+        if let Some(translated_title) = result
+            .title
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            && article.summary.feed_auto_translate_titles
+        {
+            self.save_auto_translated_title(
+                article_id,
+                &article.summary.title,
+                translated_title,
+                target_lang,
+                &panda_translate::title_source_hash(&article.summary.title),
+            )?;
+        }
         self.article(article_id)
     }
 
     fn summary_by_id(&self, id: i64) -> anyhow::Result<ArticleSummary> {
         Ok(self.connection.query_row(
-            "SELECT a.id,f.title,a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later
+            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles
              FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE a.id=?1 AND f.workspace=?2",
             params![id, self.workspace],
             |row| Ok(ArticleSummary {
                 id: row.get(0)?, feed_title: row.get(1)?, title: row.get(2)?,
+                feed_language: row.get(13)?,
+                feed_auto_translate_titles: row.get::<_, i64>(14)? != 0,
                 url: row.get(3)?,
                 author: row.get(4)?, snippet: row.get(5)?, published_at: row.get(6)?,
                 is_read: row.get(7)?, is_starred: row.get(8)?, read_later: row.get(9)?,
+                auto_translated_title: row.get(10)?, auto_translated_title_lang: row.get(11)?, auto_translated_title_source_hash: row.get(12)?,
             }),
         )?)
+    }
+
+    pub fn save_auto_translated_title(
+        &self,
+        id: i64,
+        source_title: &str,
+        title: &str,
+        lang: &str,
+        source_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute("UPDATE articles SET auto_translated_title=?1,auto_translated_title_lang=?2,auto_translated_title_source_hash=?3 WHERE id=?4 AND articles.title=?5 AND EXISTS(SELECT 1 FROM feeds WHERE feeds.id=articles.feed_id AND feeds.workspace=?6)",params![title,lang,source_hash,id,source_title,self.workspace])?;
+        Ok(())
+    }
+
+    pub fn record_translation_usage(
+        &self,
+        day: &str,
+        provider: &str,
+        requests: u64,
+        characters: u64,
+    ) -> anyhow::Result<()> {
+        self.connection.execute("INSERT INTO translation_usage(day,provider,requests,characters) VALUES(?1,?2,?3,?4) ON CONFLICT(day,provider) DO UPDATE SET requests=requests+excluded.requests,characters=characters+excluded.characters",params![day,provider,requests,characters])?;
+        Ok(())
+    }
+
+    pub fn translation_usage(&self) -> anyhow::Result<Vec<panda_core::TranslationUsage>> {
+        let mut stmt=self.connection.prepare("SELECT day,provider,requests,characters FROM translation_usage ORDER BY day DESC,provider")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok(panda_core::TranslationUsage {
+                    day: r.get(0)?,
+                    provider: r.get(1)?,
+                    requests: r.get::<_, u64>(2)?,
+                    characters: r.get::<_, u64>(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn mark(&self, id: i64, field: MarkField, value: bool) -> anyhow::Result<()> {
@@ -329,8 +433,8 @@ impl Store {
             && let Some(remote_id) = self.remote_entry_id(id)?
         {
             self.connection.execute(
-                "INSERT INTO pending_remote_marks(workspace,remote_id,field,value) VALUES(?1,?2,?3,?4)
-                 ON CONFLICT(workspace,remote_id,field) DO UPDATE SET value=excluded.value",
+                "INSERT INTO pending_remote_marks(workspace,remote_id,field,value,revision) VALUES(?1,?2,?3,?4,1)
+                 ON CONFLICT(workspace,remote_id,field) DO UPDATE SET value=excluded.value,revision=pending_remote_marks.revision+1",
                 params![self.workspace, remote_id, column, value],
             )?;
         }
@@ -340,7 +444,7 @@ impl Store {
     pub async fn flush_provider_marks(&mut self, remote: &ProviderClient) -> anyhow::Result<usize> {
         let pending = {
             let mut statement = self.connection.prepare(
-                "SELECT remote_id,field,value FROM pending_remote_marks WHERE workspace=?1 ORDER BY remote_id,field",
+                "SELECT remote_id,field,value,revision FROM pending_remote_marks WHERE workspace=?1 ORDER BY remote_id,field",
             )?;
             statement
                 .query_map([&self.workspace], |row| {
@@ -348,6 +452,7 @@ impl Store {
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
@@ -355,7 +460,7 @@ impl Store {
         let mut read_ids = Vec::new();
         let mut unread_ids = Vec::new();
         let mut starred = Vec::new();
-        for (remote_id, field, value) in &pending {
+        for (remote_id, field, value, _) in &pending {
             match field.as_str() {
                 "is_read" if *value => read_ids.push(*remote_id),
                 "is_read" => unread_ids.push(*remote_id),
@@ -368,11 +473,15 @@ impl Store {
         for (remote_id, value) in starred {
             remote.set_starred(remote_id, value).await?;
         }
-        let completed = pending.len();
-        self.connection.execute(
-            "DELETE FROM pending_remote_marks WHERE workspace=?1",
-            [&self.workspace],
-        )?;
+        let transaction = self.connection.transaction()?;
+        let mut completed = 0;
+        for (remote_id, field, _, revision) in pending {
+            completed += transaction.execute(
+                "DELETE FROM pending_remote_marks WHERE workspace=?1 AND remote_id=?2 AND field=?3 AND revision=?4",
+                params![self.workspace, remote_id, field, revision],
+            )?;
+        }
+        transaction.commit()?;
         Ok(completed)
     }
 
@@ -415,8 +524,8 @@ impl Store {
                 .execute("UPDATE articles SET is_read=1 WHERE id=?1", [id])?;
             if let Some(remote_id) = remote_id {
                 self.connection.execute(
-                    "INSERT INTO pending_remote_marks(workspace,remote_id,field,value) VALUES(?1,?2,'is_read',1)
-                     ON CONFLICT(workspace,remote_id,field) DO UPDATE SET value=excluded.value",
+                    "INSERT INTO pending_remote_marks(workspace,remote_id,field,value,revision) VALUES(?1,?2,'is_read',1,1)
+                     ON CONFLICT(workspace,remote_id,field) DO UPDATE SET value=excluded.value,revision=pending_remote_marks.revision+1",
                     params![self.workspace, remote_id],
                 )?;
             }
@@ -430,6 +539,7 @@ impl Store {
         title: &str,
         folder: Option<&str>,
         feed_url: &str,
+        auto_translate_titles: bool,
     ) -> anyhow::Result<()> {
         let title = title.trim();
         let feed_url = feed_url.trim();
@@ -440,9 +550,18 @@ impl Store {
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
         self.connection.execute(
-            "UPDATE feeds SET title=?1, folder=?2, feed_url=?3 WHERE id=?4 AND workspace=?5",
-            params![title, folder, feed_url, id, self.workspace],
+            "UPDATE feeds SET custom_title=?1, folder=?2, feed_url=?3, auto_translate_titles=?4 WHERE id=?5 AND workspace=?6",
+            params![title, folder, feed_url, auto_translate_titles, id, self.workspace],
         )?;
+        Ok(())
+    }
+
+    pub fn set_feed_auto_translate_titles(&self, id: i64, enabled: bool) -> anyhow::Result<()> {
+        let changed = self.connection.execute(
+            "UPDATE feeds SET auto_translate_titles=?1 WHERE id=?2 AND workspace=?3",
+            params![enabled, id, self.workspace],
+        )?;
+        anyhow::ensure!(changed == 1, "Feed not found in this workspace");
         Ok(())
     }
 
@@ -560,30 +679,44 @@ impl Store {
         let mut seen = HashSet::new();
         for feed in feeds {
             seen.insert(feed.id);
+            let language = if kind == ProviderKind::Miniflux {
+                feed.language.as_deref()
+            } else {
+                None
+            };
             let folder = feed
                 .category
                 .as_ref()
                 .map(|category| category.title.as_str());
+            self.connection.execute(
+                "UPDATE articles SET auto_translated_title=NULL,auto_translated_title_lang=NULL,auto_translated_title_source_hash=NULL
+                 WHERE feed_id IN (
+                    SELECT id FROM feeds WHERE remote_id=?1 AND workspace=?2
+                    AND COALESCE(language,'') != COALESCE(?3,'')
+                 )",
+                params![feed.id, self.workspace, language],
+            )?;
             let updated = self.connection.execute(
-                "UPDATE feeds SET feed_url=?1,title=?2,site_url=?3,folder=?4,source=?5
-                 WHERE remote_id=?6 AND workspace=?7",
+                "UPDATE feeds SET feed_url=?1,title=?2,site_url=?3,folder=?4,source=?5,language=?6
+                 WHERE remote_id=?7 AND workspace=?8",
                 params![
                     feed.feed_url,
                     feed.title,
                     feed.site_url,
                     folder,
                     kind.key(),
+                    language,
                     feed.id,
                     self.workspace
                 ],
             )?;
             if updated == 0 {
                 self.connection.execute(
-                    "INSERT INTO feeds(feed_url,title,site_url,folder,source,remote_id,workspace)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7)
+                    "INSERT INTO feeds(feed_url,title,site_url,folder,source,remote_id,workspace,language)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(workspace,feed_url) DO UPDATE SET
                     title=excluded.title,site_url=excluded.site_url,folder=excluded.folder,
-                    source=excluded.source,remote_id=excluded.remote_id",
+                    source=excluded.source,remote_id=excluded.remote_id,language=excluded.language",
                     params![
                         feed.feed_url,
                         feed.title,
@@ -591,7 +724,8 @@ impl Store {
                         folder,
                         kind.key(),
                         feed.id,
-                        self.workspace
+                        self.workspace,
+                        language
                     ],
                 )?;
             }
@@ -848,10 +982,10 @@ impl Store {
         {
             return Ok(());
         }
-        let url: String = self.connection.query_row(
-            "SELECT url FROM articles WHERE id=?1",
+        let (url, title): (String, String) = self.connection.query_row(
+            "SELECT url,title FROM articles WHERE id=?1",
             [article_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let resolved = resolve_readable_url(&self.client, &url).await?;
         if resolved != url {
@@ -861,7 +995,7 @@ impl Store {
             )?;
         }
         let raw = fetch_html(&self.client, &resolved, Some("https://news.google.com/")).await?;
-        let sanitized = extract_article_html(&raw, &resolved, extractor);
+        let sanitized = extract_article_html(&raw, &resolved, &title, extractor);
         if plain_text(&sanitized).trim().len() < 80 {
             anyhow::bail!("No extractable article content found on this page");
         }
@@ -921,7 +1055,7 @@ impl Store {
     }
 
     pub fn export_opml(&self) -> anyhow::Result<String> {
-        let mut statement = self.connection.prepare("SELECT title,feed_url,folder FROM feeds WHERE workspace=?1 ORDER BY COALESCE(folder,''),title COLLATE NOCASE")?;
+        let mut statement = self.connection.prepare("SELECT COALESCE(custom_title,title),feed_url,folder FROM feeds WHERE workspace=?1 ORDER BY COALESCE(folder,''),COALESCE(custom_title,title) COLLATE NOCASE")?;
         let rows = statement
             .query_map([&self.workspace], |row| {
                 Ok((
@@ -1005,14 +1139,15 @@ fn migrate_workspace_schema(connection: &Connection) -> anyhow::Result<()> {
                 added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 source TEXT NOT NULL DEFAULT 'local',
                 remote_id INTEGER,
+                auto_translate_titles INTEGER NOT NULL DEFAULT 0,
                 workspace TEXT NOT NULL DEFAULT 'local',
                 UNIQUE(workspace,feed_url)
              );",
         )?;
         let account_workspace = "provider:miniflux";
         connection.execute(
-            "INSERT INTO feeds_workspace(id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,workspace)
-             SELECT id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,
+            "INSERT INTO feeds_workspace(id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,workspace)
+             SELECT id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,
                     CASE WHEN source='miniflux' THEN ?1 ELSE 'local' END FROM feeds",
             [&account_workspace],
         )?;
@@ -1118,104 +1253,6 @@ fn map_entry(entry: Entry, feed_url: &str, site_url: Option<&str>) -> Option<Par
         snippet,
         content_html: safe_html,
     })
-}
-
-fn sanitize_html(html: &str, base: Option<&str>) -> String {
-    // Strip logos before ammonia -- it drops id/class we use as signals.
-    let html = strip_boilerplate_images(html);
-    let lower = html.to_ascii_lowercase();
-    let has_embedded_media =
-        lower.contains("<video") || lower.contains("<iframe") || lower.contains("<audio");
-    let mut sanitizer = Sanitizer::default();
-    if let Some(base) = base.and_then(|s| Url::parse(s).ok()) {
-        sanitizer.url_relative(UrlRelative::RewriteWithBase(base));
-    }
-    let mut safe = sanitizer.clean(&html).to_string();
-    // Second pass for src-only signals after URL rewrite.
-    safe = strip_boilerplate_images(&safe);
-    if has_embedded_media {
-        safe.push_str("<p><em>Embedded media is unavailable here. Open the original article to view it.</em></p>");
-    }
-    safe
-}
-
-/// Drop site logos / WeChat share images that Readability often leaves behind.
-/// Same idea as Miniflux/FreshRSS CSS rewrite rules -- cheap filename/id heuristics.
-fn strip_boilerplate_images(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut index = 0usize;
-    while index < html.len() {
-        let rest_lower = &lower[index..];
-        if rest_lower.starts_with("<img") {
-            if let Some(rel) = rest_lower.find('>') {
-                let end = index + rel + 1;
-                let tag_lower = &lower[index..end];
-                if is_boilerplate_img_tag(tag_lower) {
-                    index = end;
-                    continue;
-                }
-                out.push_str(&html[index..end]);
-                index = end;
-                continue;
-            }
-        }
-        let ch = html[index..].chars().next().unwrap();
-        out.push(ch);
-        index += ch.len_utf8();
-    }
-    out
-}
-
-fn is_boilerplate_img_tag(tag_lower: &str) -> bool {
-    if tag_lower.contains("wx_img") {
-        return true;
-    }
-    if attr_contains_any(tag_lower, "id", &["logo", "qrcode", "qr-code"]) {
-        return true;
-    }
-    if attr_contains_any(tag_lower, "class", &["logo", "qrcode", "qr-code"]) {
-        return true;
-    }
-    if attr_contains_any(tag_lower, "src", &["logo", "qrcode", "qr-code"]) {
-        return true;
-    }
-    false
-}
-
-fn attr_contains_any(tag_lower: &str, name: &str, needles: &[&str]) -> bool {
-    let Some(value) = attr_value(tag_lower, name) else {
-        return false;
-    };
-    needles.iter().any(|needle| value.contains(needle))
-}
-
-fn attr_value<'a>(tag_lower: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!("{name}=");
-    let start = tag_lower.find(&key)? + key.len();
-    let bytes = tag_lower.as_bytes();
-    let quote = *bytes.get(start)?;
-    if quote == b'"' || quote == b'\'' {
-        let close = tag_lower[start + 1..].find(quote as char)? + start + 1;
-        Some(&tag_lower[start + 1..close])
-    } else {
-        let end = tag_lower[start..]
-            .find(|ch: char| ch.is_whitespace() || ch == '>')
-            .map(|rel| start + rel)
-            .unwrap_or(tag_lower.len());
-        Some(&tag_lower[start..end])
-    }
-}
-
-fn plain_text(html: &str) -> String {
-    Html::parse_fragment(html)
-        .root_element()
-        .text()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn normalize_http_url(raw: &str) -> anyhow::Result<String> {
@@ -1384,149 +1421,6 @@ fn parse_google_news_batch_url(body: &str) -> Option<String> {
     None
 }
 
-fn extract_article_html(raw: &str, base: &str, extractor: ContentExtractor) -> String {
-    match extractor {
-        ContentExtractor::DomSmoothie => {
-            if let Some(content) = readability_article_html(raw, base) {
-                return sanitize_html(&content, Some(base));
-            }
-            heuristic_article_html(raw, base)
-        }
-        ContentExtractor::Decruft => {
-            if let Some(content) = decruft_article_html(raw, base) {
-                return sanitize_html(&content, Some(base));
-            }
-            heuristic_article_html(raw, base)
-        }
-        ContentExtractor::Trafilatura => {
-            if let Some(content) = trafilatura_article_html(raw, base) {
-                return sanitize_html(&content, Some(base));
-            }
-            heuristic_article_html(raw, base)
-        }
-        ContentExtractor::Heuristic => heuristic_article_html(raw, base),
-    }
-}
-
-fn readability_article_html(raw: &str, base: &str) -> Option<String> {
-    let mut reader = dom_smoothie::Readability::new(raw, Some(base), None).ok()?;
-    let article = reader.parse().ok()?;
-    let content = article.content.trim();
-    if plain_text(content).trim().len() < 80 {
-        return None;
-    }
-    Some(content.to_owned())
-}
-
-fn decruft_article_html(raw: &str, base: &str) -> Option<String> {
-    let mut options = decruft::DecruftOptions::default();
-    options.url = Some(base.to_owned());
-    options.markdown = false;
-    options.allow_network = false;
-    options.remove_small_images = true;
-    let result = decruft::parse(raw, &options);
-    let content = result.content.trim();
-    if content.is_empty() || plain_text(content).trim().len() < 80 {
-        return None;
-    }
-    Some(content.to_owned())
-}
-
-fn trafilatura_article_html(raw: &str, base: &str) -> Option<String> {
-    let options = rs_trafilatura::Options {
-        url: Some(base.to_owned()),
-        include_images: true,
-        include_tables: true,
-        include_links: true,
-        include_formatting: true,
-        favor_recall: true,
-        ..rs_trafilatura::Options::default()
-    };
-    let result = rs_trafilatura::extract_with_options(raw, &options).ok()?;
-    let content = result
-        .content_html
-        .filter(|html| !html.trim().is_empty())
-        .unwrap_or(result.content_text);
-    let content = content.trim();
-    if plain_text(content).trim().len() < 80 {
-        return None;
-    }
-    Some(content.to_owned())
-}
-
-fn heuristic_article_html(raw: &str, base: &str) -> String {
-    let document = Html::parse_document(raw);
-    let selectors = [
-        "article",
-        "main",
-        "[role='main']",
-        ".article-content",
-        ".article_content",
-        "#article-content",
-        ".post-content",
-        ".entry-content",
-        ".post-body",
-        ".article-body",
-        ".story-body",
-        ".TRS_Editor",
-        "#zoom",
-        ".pages_content",
-        ".Custom_UnionStyle",
-        "#mainContent",
-        ".main-content",
-        ".content",
-        "#content",
-    ];
-    let mut best: Option<(usize, String)> = None;
-    for selector in selectors {
-        let Ok(parsed) = Selector::parse(selector) else {
-            continue;
-        };
-        for element in document.select(&parsed) {
-            let html = element.inner_html();
-            let score = plain_text(&html).trim().len();
-            if score < 80 {
-                continue;
-            }
-            // Prefer denser article-like nodes over huge page shells.
-            let tag = element.value().name();
-            let bonus = match tag {
-                "article" => 400,
-                "main" => 200,
-                _ => 0,
-            };
-            let score = score + bonus;
-            if best
-                .as_ref()
-                .is_none_or(|(best_score, _)| score > *best_score)
-            {
-                best = Some((score, html));
-            }
-        }
-    }
-    if best.is_none() {
-        if let Ok(parsed) = Selector::parse("p") {
-            let paragraphs = document
-                .select(&parsed)
-                .map(|element| element.html())
-                .filter(|html| plain_text(html).trim().len() >= 40)
-                .take(24)
-                .collect::<Vec<_>>();
-            if !paragraphs.is_empty() {
-                let combined = paragraphs.join("\n");
-                let score = plain_text(&combined).trim().len();
-                if score >= 80 {
-                    best = Some((score, combined));
-                }
-            }
-        }
-    }
-    let html = best
-        .map(|(_, html)| html)
-        .unwrap_or_else(|| document.root_element().inner_html());
-    sanitize_html(&html, Some(base))
-}
-
 fn collect_outlines(
     outline: &Outline,
     folder: Option<&str>,
@@ -1568,6 +1462,97 @@ mod tests {
         let store = Store::open_workspace(&directory.path().join("reader.sqlite3"), workspace)
             .expect("open test database");
         (directory, store)
+    }
+
+    #[test]
+    fn title_translation_cache_is_separate_and_usage_is_persistent_by_day_provider() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+                [],
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO articles(id,feed_id,guid,title) VALUES(7,1,'guid','The government announces a new policy for the country')",[]).unwrap();
+        let original = "The government announces a new policy for the country";
+        let hash = panda_translate::title_source_hash(original);
+        store
+            .save_auto_translated_title(7, original, "政府宣布新政策", "zh-Hans", &hash)
+            .unwrap();
+        let article = store.article(7).unwrap();
+        assert_eq!(
+            article.summary.auto_translated_title.as_deref(),
+            Some("政府宣布新政策")
+        );
+        assert_eq!(article.translated_html, None);
+        store
+            .record_translation_usage("2026-10-01", "azure", 2, 99)
+            .unwrap();
+        store
+            .record_translation_usage("2026-10-01", "azure", 1, 40)
+            .unwrap();
+        store
+            .record_translation_usage("2026-09-30", "volcengine", 1, 10)
+            .unwrap();
+        let usage = store.translation_usage().unwrap();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(
+            (
+                usage[0].day.as_str(),
+                usage[0].provider.as_str(),
+                usage[0].requests,
+                usage[0].characters
+            ),
+            ("2026-10-01", "azure", 3, 139)
+        );
+        assert_eq!(
+            (
+                usage[1].day.as_str(),
+                usage[1].provider.as_str(),
+                usage[1].requests,
+                usage[1].characters
+            ),
+            ("2026-09-30", "volcengine", 1, 10)
+        );
+        store.connection.execute("UPDATE articles SET title='The government announces a different policy for the country' WHERE id=7",[]).unwrap();
+        let updated = store.article(7).unwrap();
+        assert_ne!(
+            panda_translate::title_source_hash(&updated.summary.title),
+            updated.summary.auto_translated_title_source_hash.unwrap()
+        );
+    }
+
+    #[test]
+    fn feed_title_translation_is_manual_and_persisted() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(id,feed_id,guid,title) VALUES(7,1,'guid','A title')",
+                [],
+            )
+            .unwrap();
+
+        let initial = store.snapshot(Scope::All, "", 20, None, true).unwrap();
+        assert!(!initial.feeds[0].auto_translate_titles);
+        assert!(!initial.articles[0].feed_auto_translate_titles);
+
+        store.set_feed_auto_translate_titles(1, true).unwrap();
+        let enabled = store.snapshot(Scope::All, "", 20, None, true).unwrap();
+        assert!(enabled.feeds[0].auto_translate_titles);
+        assert!(enabled.articles[0].feed_auto_translate_titles);
+        assert!(store.article(7).unwrap().summary.feed_auto_translate_titles);
+
+        store.set_feed_auto_translate_titles(1, false).unwrap();
+        assert!(!store.article(7).unwrap().summary.feed_auto_translate_titles);
     }
 
     #[test]
@@ -1684,6 +1669,7 @@ mod tests {
             title: "远程订阅".into(),
             feed_url: "https://example.com/feed.xml".into(),
             site_url: "https://example.com".into(),
+            language: Some("en".into()),
             category: Some(panda_miniflux::Category {
                 id: 3,
                 title: "技术".into(),
@@ -1707,14 +1693,11 @@ mod tests {
         let snapshot = store.snapshot(Scope::All, "", 500, None, true).unwrap();
         assert_eq!(snapshot.feeds[0].folder.as_deref(), Some("技术"));
         let article_id = snapshot.articles[0].id;
+        assert_eq!(snapshot.articles[0].feed_language.as_deref(), Some("en"));
         assert_eq!(store.remote_entry_id(article_id).unwrap(), Some(99));
-        assert!(
-            !store
-                .article(article_id)
-                .unwrap()
-                .content_html
-                .contains("<script")
-        );
+        let article = store.article(article_id).unwrap();
+        assert_eq!(article.summary.feed_language.as_deref(), Some("en"));
+        assert!(!article.content_html.contains("<script"));
         store.mark(article_id, MarkField::Later, true).unwrap();
 
         let mut changed = entry;
@@ -1727,6 +1710,24 @@ mod tests {
         assert!(article.summary.read_later);
         store.mark(article_id, MarkField::Starred, false).unwrap();
         store.mark(article_id, MarkField::Starred, true).unwrap();
+        let source_title = store.article(article_id).unwrap().summary.title;
+        store
+            .save_auto_translated_title(
+                article_id,
+                &source_title,
+                "Translated title",
+                "zh-Hans",
+                &panda_translate::title_source_hash(&source_title),
+            )
+            .unwrap();
+        let mut language_changed_feed = remote_feed.clone();
+        language_changed_feed.language = Some("fr".into());
+        store
+            .save_remote_feeds(&[language_changed_feed], ProviderKind::Miniflux)
+            .unwrap();
+        let updated = store.article(article_id).unwrap();
+        assert_eq!(updated.summary.feed_language.as_deref(), Some("fr"));
+        assert!(updated.summary.auto_translated_title.is_none());
         let queued: (i64, bool) = store.connection.query_row(
             "SELECT COUNT(*),MAX(value) FROM pending_remote_marks WHERE workspace='provider:miniflux' AND remote_id=99 AND field='is_starred'",
             [], |row| Ok((row.get(0)?, row.get(1)?))
@@ -1740,6 +1741,124 @@ mod tests {
             .save_remote_feeds(&[removed_feed], ProviderKind::Miniflux)
             .unwrap();
         assert_eq!(store.remote_feed_id(ids[&42]).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn flush_keeps_a_newer_mark_queued_while_the_previous_value_is_in_flight() {
+        use std::{
+            io::{Read as _, Write as _},
+            sync::mpsc,
+            time::Duration,
+        };
+
+        let (directory, mut store) = test_store_for("provider:miniflux");
+        store.connection.execute(
+            "INSERT INTO feeds(id,feed_url,title,workspace,source,remote_id) VALUES(1,'https://example.com/rss','Feed','provider:miniflux','miniflux',1)",
+            [],
+        ).unwrap();
+        store.connection.execute(
+            "INSERT INTO articles(id,feed_id,guid,title,remote_id) VALUES(1,1,'1','Article',42)",
+            [],
+        ).unwrap();
+        store.mark(1, MarkField::Read, true).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            let count = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..count]).contains("PUT /v1/entries"));
+            received_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
+
+        let client = ProviderClient::new(
+            ProviderKind::Miniflux,
+            &panda_providers::ProviderSettings {
+                endpoint,
+                username: String::new(),
+                secret: "token".into(),
+            },
+        )
+        .unwrap();
+        let path = directory.path().join("reader.sqlite3");
+        let flush = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(store.flush_provider_marks(&client))
+                .unwrap()
+        });
+        received_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let newer = Store::open_workspace(&path, "provider:miniflux").unwrap();
+        newer.mark(1, MarkField::Read, false).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(flush.join().unwrap(), 0);
+        server.join().unwrap();
+
+        let pending: (i64, bool) = newer
+            .connection
+            .query_row(
+                "SELECT COUNT(*),MAX(value) FROM pending_remote_marks WHERE workspace='provider:miniflux' AND remote_id=42 AND field='is_read'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending, (1, false));
+    }
+
+    #[test]
+    fn edited_feed_fields_and_translation_preference_survive_refresh() {
+        use std::io::{Read as _, Write as _};
+
+        let (directory, mut store) = test_store();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let feed_url = format!("http://{}/rss", listener.local_addr().unwrap());
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,?1,'Source title')",
+                [&feed_url],
+            )
+            .unwrap();
+        store
+            .update_feed(1, "My title", None, &feed_url, true)
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            stream.read(&mut request).unwrap();
+            let body = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Source title</title><link>https://example.com</link><description>Feed</description><item><guid>entry-1</guid><title>Entry</title><link>https://example.com/post</link><description>Body text</description></item></channel></rss>"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/rss+xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(store.refresh_feed(1)).unwrap();
+        server.join().unwrap();
+
+        let snapshot = store.snapshot(Scope::All, "", 20, None, true).unwrap();
+        assert_eq!(snapshot.feeds[0].title, "My title");
+        assert!(snapshot.feeds[0].auto_translate_titles);
+        let article = store.article(snapshot.articles[0].id).unwrap();
+        assert_eq!(article.summary.feed_title, "My title");
+        assert!(article.summary.feed_auto_translate_titles);
+        drop(directory);
     }
 
     #[test]
@@ -1984,6 +2103,7 @@ mod tests {
         let html = extract_article_html(
             raw,
             "https://example.com/post",
+            "Clean headline",
             ContentExtractor::DomSmoothie,
         );
         let text = plain_text(&html);

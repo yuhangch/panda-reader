@@ -1,6 +1,6 @@
 //! Volcengine (火山引擎) machine translation via OpenAPI TranslateText.
 
-use crate::html::{block_needs_translation, split_blocks};
+use crate::html::{TranslationInput, split_text_for_translate, translate_html_blocks};
 use crate::{TranslateRequest, TranslateResult, Translator};
 use anyhow::{Context as _, bail};
 use hmac::{Hmac, Mac};
@@ -29,6 +29,47 @@ pub struct VolcengineTranslator {
 }
 
 impl VolcengineTranslator {
+    pub(crate) async fn translate_titles(
+        &self,
+        titles: &[String],
+        target: &str,
+    ) -> Result<crate::TitleBatchResult, crate::TitleBatchFailure> {
+        let texts: Vec<String> = titles
+            .iter()
+            .flat_map(|title| split_for_translate(title))
+            .collect();
+        let batches = batches_within_budget(&texts);
+        let mut output = Vec::with_capacity(texts.len());
+        let mut requests = 0usize;
+        let mut characters = 0usize;
+        for batch in &batches {
+            let batch_chars: usize = batch.iter().map(|text| text.chars().count()).sum();
+            let (parts, _) = self
+                .translate_batch(batch, map_target_lang(target))
+                .await
+                .map_err(|error| crate::TitleBatchFailure {
+                    requests: requests + 1,
+                    characters: characters + batch_chars,
+                    error,
+                })?;
+            output.extend(parts);
+            requests += 1;
+            characters += batch_chars;
+        }
+        // Keep positional mapping for normal-sized titles; long titles may be split and rejoined.
+        let mut mapped = Vec::with_capacity(titles.len());
+        let mut cursor = 0;
+        for title in titles {
+            let count = split_for_translate(title).len();
+            mapped.push(output[cursor..cursor + count].concat());
+            cursor += count;
+        }
+        Ok(crate::TitleBatchResult {
+            translations: mapped,
+            requests,
+        })
+    }
+
     pub fn new(access_key: &str, secret_key: &str) -> anyhow::Result<Self> {
         if access_key.trim().is_empty() || secret_key.trim().is_empty() {
             bail!("Enter Volcengine Access Key ID and Secret Access Key in Settings");
@@ -76,51 +117,20 @@ impl Translator for VolcengineTranslator {
         let html = if req.html.trim().is_empty() {
             String::new()
         } else {
-            let blocks = split_blocks(&req.html);
-            let mut translated_blocks = blocks.clone();
-            let mut pending_indices = Vec::new();
-            let mut pending_texts = Vec::new();
-            for (index, block) in blocks.iter().enumerate() {
-                if !block_needs_translation(block) {
-                    continue;
-                }
-                let chunks = split_for_translate(block);
-                if chunks.len() == 1 {
-                    pending_indices.push(index);
-                    pending_texts.push(chunks.into_iter().next().unwrap());
-                } else {
-                    translated_blocks[index] = self
-                        .translate_chunks(&chunks, target, &mut detected)
-                        .await?;
-                }
-            }
-            let mut cursor = 0usize;
-            while cursor < pending_texts.len() {
-                let mut end = cursor;
-                let mut total = 0usize;
-                while end < pending_texts.len() && end - cursor < MAX_BATCH {
-                    let next = pending_texts[end].chars().count();
-                    if end > cursor && total + next > MAX_REQUEST_CHARS {
-                        break;
-                    }
-                    total += next;
-                    end += 1;
-                }
-                if end == cursor {
-                    end = cursor + 1;
-                }
-                let (parts, source) = self
-                    .translate_batch(&pending_texts[cursor..end], target)
-                    .await?;
-                if detected.is_none() {
-                    detected = source;
-                }
-                for (offset, part) in parts.into_iter().enumerate() {
-                    translated_blocks[pending_indices[cursor + offset]] = part;
-                }
-                cursor = end;
-            }
-            translated_blocks.join("\n")
+            let translation = translate_html_blocks(
+                &req.html,
+                TranslationInput::PlainText,
+                MAX_BATCH,
+                MAX_REQUEST_CHARS,
+                MAX_ITEM_CHARS,
+                |texts| {
+                    let texts = texts.to_vec();
+                    async move { self.translate_batch(&texts, target).await }
+                },
+            )
+            .await?;
+            detected = detected.or(translation.detected_source_lang);
+            translation.html
         };
         Ok(TranslateResult {
             html,
@@ -293,32 +303,7 @@ fn map_target_lang(lang: &str) -> &str {
 }
 
 fn split_for_translate(html: &str) -> Vec<String> {
-    if html.chars().count() <= MAX_ITEM_CHARS {
-        return vec![html.to_owned()];
-    }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    let mut current_len = 0usize;
-    for ch in html.chars() {
-        // Prefer splitting after tag/word boundaries once we are near the limit.
-        let near_limit = current_len >= MAX_ITEM_CHARS.saturating_sub(200);
-        if near_limit && current_len > 0 && (ch == '>' || ch.is_whitespace()) {
-            current.push(ch);
-            chunks.push(std::mem::take(&mut current));
-            current_len = 0;
-            continue;
-        }
-        if current_len >= MAX_ITEM_CHARS {
-            chunks.push(std::mem::take(&mut current));
-            current_len = 0;
-        }
-        current.push(ch);
-        current_len += 1;
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
+    split_text_for_translate(html, MAX_ITEM_CHARS)
 }
 
 /// Group chunks so each request stays under the total-character budget.

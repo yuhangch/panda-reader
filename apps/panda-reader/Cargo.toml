@@ -17,6 +17,7 @@ bench = false
 ammonia.workspace = true
 anyhow.workspace = true
 arboard.workspace = true
+base64 = "=0.22.1"
 chrono.workspace = true
 directories.workspace = true
 gpui-kit.workspace = true
@@ -28,10 +29,24 @@ panda-store = { path = "../../crates/panda-store" }
 panda-translate = { path = "../../crates/panda-translate" }
 reqwest.workspace = true
 reqwest_client.workspace = true
+scraper.workspace = true
+resvg = "=0.45.1"
+qrcodegen = "1.8"
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+semver.workspace = true
+sha2.workspace = true
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0.11"

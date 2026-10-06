@@ -12,7 +12,7 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 publish = false
 license = "MIT"
 
@@ -31,8 +31,9 @@ hex = "0.4"
 hmac = "0.12"
 image = "0.25"
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.7" }
+semver = "1"
 opml = "1"
-reqwest = { version = "0.12", default-features = false, features = ["charset", "gzip", "brotli", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "charset", "gzip", "brotli", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
@@ -41,4 +42,5 @@ scraper = "0.21"
 sha2 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+libc = "0.2"
 url = "2"

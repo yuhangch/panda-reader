@@ -1,7 +1,13 @@
-use super::*;
+use crate::app::preferences::Language;
+use crate::ui::i18n;
+use crate::ui::settings::SettingsPage;
+use crate::ui::window::ReaderWindow;
+use gpui_kit::*;
+use panda_core::{ArticleSummary, Feed, MarkField, Scope};
+
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 
-impl ReaderView {
+impl ReaderWindow {
     pub(super) fn folder_context_menu(
         menu: PopupMenu,
         window: &mut Window,
@@ -168,10 +174,10 @@ impl ReaderView {
                     let app = app.clone();
                     move |_, _, cx| {
                         let _ = app.update(cx, |this, cx| {
-                            this.settings_open = true;
-                            this.settings_page = SettingsPage::General;
-                            this.pending_remove_feed = Some(id);
-                            this.theme_picker_open = false;
+                            this.settings.open = true;
+                            this.settings.page = SettingsPage::General;
+                            this.sidebar.pending_remove_feed = Some(id);
+                            this.settings.theme_picker_open = false;
                             cx.notify();
                         });
                     }
@@ -181,18 +187,82 @@ impl ReaderView {
 
     pub(super) fn article_context_menu(
         menu: PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<'_, PopupMenu>,
         article: &ArticleSummary,
         app: &WeakEntity<Self>,
         language: Language,
+        include_selection_edit: bool,
     ) -> PopupMenu {
         let id = article.id;
         let title = article.title.clone();
+        let source = article.feed_title.clone();
         let url = article.url.clone();
         let is_read = article.is_read;
         let is_starred = article.is_starred;
         let read_later = article.read_later;
+        let selected_text = if include_selection_edit {
+            gpui_kit::base::TextSelection::selected_text(window, cx)
+        } else {
+            String::new()
+        };
+        let mut menu = menu.min_w(px(220.));
+        if !selected_text.trim().is_empty() {
+            let poster_text = selected_text.clone();
+            let poster_title = title.clone();
+            let poster_source = source.clone();
+            let poster_url = url.clone();
+            let poster_app = app.clone();
+            menu = menu
+                .item(
+                    PopupMenuItem::new(i18n::text(language, "Create quote poster")).on_click({
+                        move |_, _, cx| {
+                            let _ = poster_app.update(cx, |this, cx| {
+                                let context_html = this.reader.body_html.to_string();
+                                let feed_icon = this
+                                    .sidebar
+                                    .feeds
+                                    .iter()
+                                    .find(|feed| feed.title == poster_source)
+                                    .and_then(|feed| {
+                                        let host = crate::services::favicon::feed_host(
+                                            feed.site_url.as_deref(),
+                                            &feed.feed_url,
+                                        )?;
+                                        let icon_path =
+                                            crate::services::favicon::local_favicon_path(
+                                                &this.sidebar.icons_dir,
+                                                &host,
+                                            )?;
+                                        std::fs::read(icon_path).ok()
+                                    });
+                                this.begin_quote_poster(
+                                    poster_text.clone(),
+                                    poster_title.clone(),
+                                    poster_source.clone(),
+                                    poster_url.clone(),
+                                    context_html,
+                                    feed_icon,
+                                    cx,
+                                );
+                            });
+                        }
+                    }),
+                )
+                .submenu(
+                    i18n::text(language, "Edit"),
+                    window,
+                    cx,
+                    move |menu, _, _| {
+                        menu.item(PopupMenuItem::new(i18n::text(language, "Copy")).on_click({
+                            let selected_text = selected_text.clone();
+                            move |_, _, cx| copy_text(cx, selected_text.clone())
+                        }))
+                    },
+                )
+                .separator();
+        }
         let mut menu = menu
-            .min_w(px(220.))
             .item(PopupMenuItem::new(i18n::text(language, "Open")).on_click({
                 let app = app.clone();
                 move |_, _, cx| {

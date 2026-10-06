@@ -5566,14 +5566,14 @@ dependencies = [
 
 [[package]]
 name = "panda-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "panda-miniflux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -5585,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "panda-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5601,32 +5601,41 @@ dependencies = [
 
 [[package]]
 name = "panda-reader"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "anyhow",
  "arboard",
+ "base64 0.22.1",
  "chrono",
  "directories",
  "embed-resource",
  "gpui-kit",
  "gpui-pre-reqwest-client",
  "image",
+ "libc",
  "panda-core",
  "panda-miniflux",
  "panda-providers",
  "panda-store",
  "panda-translate",
+ "qrcodegen",
  "reqwest",
+ "resvg 0.45.1",
  "rfd",
+ "scraper 0.21.0",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "panda-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -5650,7 +5659,7 @@ dependencies = [
 
 [[package]]
 name = "panda-translate"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6166,6 +6175,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcodegen"
+version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4339fc7a1021c9c1621d87f5e3505f2805c8c105420ba2f2a4df86814590c142"
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6583,7 +6598,9 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",

@@ -7,12 +7,16 @@ pub struct Feed {
     pub folder: Option<String>,
     pub unread: i64,
     pub last_error: Option<String>,
+    pub auto_translate_titles: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ArticleSummary {
     pub id: i64,
     pub feed_title: String,
+    /// Language declared by this article's feed, when the provider exposes it.
+    pub feed_language: Option<String>,
+    pub feed_auto_translate_titles: bool,
     pub title: String,
     pub url: Option<String>,
     pub author: Option<String>,
@@ -21,6 +25,17 @@ pub struct ArticleSummary {
     pub is_read: bool,
     pub is_starred: bool,
     pub read_later: bool,
+    pub auto_translated_title: Option<String>,
+    pub auto_translated_title_lang: Option<String>,
+    pub auto_translated_title_source_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranslationUsage {
+    pub day: String,
+    pub provider: String,
+    pub requests: u64,
+    pub characters: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
