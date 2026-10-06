@@ -1,8 +1,8 @@
 use super::commands::keymap::{
-    FocusSearch, LoadMoreArticles, NextArticle, OpenSettings, PreviousArticle, RefreshFeeds,
-    ShowKeyboardShortcuts, TogglePalette, ToggleSidebar, VimMarkAllRead, VimNextArticle,
-    VimNextUnread, VimOpenOriginal, VimPreviousArticle, VimPreviousUnread, VimRefresh, VimShowHelp,
-    VimToggleLater, VimToggleRead, VimToggleStar,
+    FocusSearch, ForceRefreshArticle, LoadMoreArticles, NextArticle, OpenSettings, PreviousArticle,
+    RefreshFeeds, ShowKeyboardShortcuts, TogglePalette, ToggleSidebar, VimMarkAllRead,
+    VimNextArticle, VimNextUnread, VimOpenOriginal, VimPreviousArticle, VimPreviousUnread,
+    VimRefresh, VimShowHelp, VimToggleLater, VimToggleRead, VimToggleStar,
 };
 use super::{
     article_list::ArticleList, article_view::ArticleView, feed_editor::FeedEditor,
@@ -11,7 +11,7 @@ use super::{
 use crate::app::preferences::Preferences;
 use crate::services::AppServices;
 use crate::ui::commands::{CommandKind, PaletteState};
-use crate::ui::components::{APP_ICON, app_ui_font, tty_icon};
+use crate::ui::components::{APP_ICON, BundledIcon, app_ui_font, bundled_icon};
 use crate::ui::i18n;
 use crate::ui::settings::SettingsPage;
 use crate::updater::{self, UpdateStatus};
@@ -48,6 +48,7 @@ pub struct ReaderWindow {
     pub(in crate::ui) data_dir: PathBuf,
     pub(in crate::ui) update_status: UpdateStatus,
     pub(in crate::ui) update_events: UnboundedSender<UpdateStatus>,
+    pub(in crate::ui) startup_sync_pending: bool,
 }
 
 impl ReaderWindow {
@@ -71,6 +72,7 @@ impl ReaderWindow {
             &preferences,
             &translator_config,
             provider_settings,
+            services.clone(),
         );
         let editor = FeedEditor::new(window, cx);
         let status = Status::default();
@@ -98,13 +100,14 @@ impl ReaderWindow {
             data_dir: data_dir.clone(),
             update_status,
             update_events: update_events.clone(),
+            startup_sync_pending: true,
         };
         view.subscribe_palette_input(window, cx);
         view.load_snapshot(cx);
         view.load_title_translation_usage(cx);
-        view.refresh(cx);
         if view.preferences.check_for_updates {
             updater::start_check(data_dir.clone(), update_events.clone());
+            view.settings.check_community_plugins(cx);
         }
         cx.spawn(async move |this, cx| {
             while let Some(status) = update_receiver.recv().await {
@@ -127,9 +130,10 @@ impl ReaderWindow {
                     .timer(Duration::from_secs(6 * 60 * 60))
                     .await;
                 if this
-                    .update(cx, |this, _| {
+                    .update(cx, |this, cx| {
                         if this.preferences.check_for_updates {
                             updater::start_check(data_dir.clone(), update_events.clone());
+                            this.settings.check_community_plugins(cx);
                         }
                     })
                     .is_err()
@@ -187,6 +191,9 @@ impl Render for ReaderWindow {
             }))
             .on_action(cx.listener(|this, _: &RefreshFeeds, window, cx| {
                 this.handle_chord(CommandKind::Refresh, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ForceRefreshArticle, window, cx| {
+                this.handle_chord(CommandKind::ForceRefreshArticle, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 this.handle_chord(CommandKind::OpenSettings, window, cx);
@@ -258,6 +265,9 @@ impl Render for ReaderWindow {
             .when(self.quote_poster.is_some(), |view| {
                 view.child(self.render_quote_poster(cx))
             })
+            .when_some(self.reader.image_viewer_url.clone(), |view, url| {
+                view.child(self.render_image_viewer(url, cx))
+            })
     }
 }
 
@@ -268,6 +278,46 @@ impl Focusable for ReaderWindow {
 }
 
 impl ReaderWindow {
+    fn render_image_viewer(&self, url: String, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x000000d8))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.reader.image_viewer_url = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .relative()
+                    .max_w_full()
+                    .max_h_full()
+                    .p_5()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(img(url).max_w(px(1400.)).max_h(px(1000.)).max_w_full())
+                    .child(
+                        Button::new("close-image-viewer")
+                            .absolute()
+                            .top_2()
+                            .right_2()
+                            .small()
+                            .secondary()
+                            .icon(bundled_icon(BundledIcon::Close))
+                            .tooltip(self.t("Close"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reader.image_viewer_url = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+    }
+
     fn render_title_bar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let collapsed = self.preferences.sidebar_collapsed;
         let open = self.settings.open;
@@ -308,7 +358,7 @@ impl ReaderWindow {
                             Button::new("title-add-feed")
                                 .small()
                                 .ghost()
-                                .icon(tty_icon("plus"))
+                                .icon(bundled_icon(BundledIcon::Plus))
                                 .tooltip(self.t("Add feed"))
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.settings.open = true;
@@ -328,7 +378,7 @@ impl ReaderWindow {
                                 Button::new("toggle-sidebar")
                                     .small()
                                     .ghost()
-                                    .icon(tty_icon("panel-left"))
+                                    .icon(bundled_icon(BundledIcon::PanelLeft))
                                     .tooltip(self.t(if collapsed {
                                         "Expand sidebar"
                                     } else {
@@ -356,7 +406,7 @@ impl ReaderWindow {
                     Button::new("title-appearance")
                         .small()
                         .ghost()
-                        .icon(tty_icon("appearance"))
+                        .icon(bundled_icon(BundledIcon::Appearance))
                         .tooltip(self.t("Appearance"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.settings.open = true;
@@ -371,7 +421,7 @@ impl ReaderWindow {
                     Button::new("title-settings")
                         .small()
                         .ghost()
-                        .icon(tty_icon("settings"))
+                        .icon(bundled_icon(BundledIcon::Settings))
                         .tooltip(self.t("Settings"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.settings.open = true;

@@ -7,6 +7,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     select::Select,
+    switch::Switch,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -63,16 +64,11 @@ impl Settings {
                             ),
                     )
                     .child(
-                        Button::new("settings-auto-translate-titles")
-                            .small()
-                            .secondary()
-                            .label(owner.t(if owner.preferences.auto_translate_titles {
-                                "On"
-                            } else {
-                                "Off"
-                            }))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_auto_translate_titles(cx)
+                        Switch::new("settings-auto-translate-titles")
+                            .checked(owner.preferences.auto_translate_titles)
+                            .accessibility_label(owner.t("Automatically translate titles"))
+                            .on_change(cx.listener(|this, checked, _, cx| {
+                                this.set_auto_translate_titles(*checked, cx)
                             })),
                     ),
             )

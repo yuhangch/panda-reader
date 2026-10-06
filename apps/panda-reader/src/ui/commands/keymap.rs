@@ -7,6 +7,7 @@ actions!(
     [
         TogglePalette,
         RefreshFeeds,
+        ForceRefreshArticle,
         OpenSettings,
         FocusSearch,
         ToggleSidebar,
@@ -45,6 +46,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-k", TogglePalette, None),
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-r", RefreshFeeds, None),
+        KeyBinding::new("secondary-shift-r", ForceRefreshArticle, None),
         KeyBinding::new("secondary-f", FocusSearch, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-]", NextArticle, None),

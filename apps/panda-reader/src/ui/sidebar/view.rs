@@ -1,7 +1,7 @@
 use crate::app::preferences::LibrarySource;
 use crate::services::favicon::{feed_host, local_favicon_path};
 use crate::ui::components::letter_avatar;
-use crate::ui::components::{preview_text, sidebar_font, tty_icon};
+use crate::ui::components::{BundledIcon, bundled_icon, preview_text, sidebar_font};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::{StyledExt as _, v_virtual_list};
 use gpui_kit::component::{
@@ -64,7 +64,7 @@ impl Render for FolderDragPreview {
             .bg(cx.theme().sidebar_accent)
             .text_color(cx.theme().sidebar_accent_foreground)
             .text_sm()
-            .child(tty_icon("folder").small())
+            .child(bundled_icon(BundledIcon::Folder).small())
             .child(self.name.clone())
     }
 }
@@ -480,10 +480,27 @@ impl Sidebar {
                         Button::new("refresh")
                             .small()
                             .ghost()
-                            .icon(tty_icon("refresh"))
-                            .tooltip(owner.t("Refresh feeds"))
+                            .icon(bundled_icon(BundledIcon::Refresh))
+                            .tooltip(
+                                owner.t("Refresh feeds (Shift-click to re-fetch current article)"),
+                            )
                             .loading(self.is_refreshing)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                            .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                                if event.modifiers().shift {
+                                    if let Some(id) = this
+                                        .reader
+                                        .article
+                                        .as_ref()
+                                        .map(|article| article.summary.id)
+                                    {
+                                        this.extract(id, true, cx);
+                                    } else {
+                                        this.set_flash(this.t("Select an article first"), cx);
+                                    }
+                                } else {
+                                    this.refresh(cx);
+                                }
+                            })),
                     ),
             )
             .child(
@@ -530,9 +547,9 @@ impl Sidebar {
                 cx.theme().sidebar_foreground
             })
             .child(match &scope {
-                Scope::All => tty_icon("list-flat").small(),
-                Scope::Starred => tty_icon("star").small(),
-                Scope::Later => tty_icon("bookmark").small(),
+                Scope::All => bundled_icon(BundledIcon::ListFlat).small(),
+                Scope::Starred => bundled_icon(BundledIcon::Star).small(),
+                Scope::Later => bundled_icon(BundledIcon::Bookmark).small(),
                 Scope::Folder(_) => Icon::new(IconName::FolderClosed).small(),
                 _ => Icon::new(icon).small(),
             })

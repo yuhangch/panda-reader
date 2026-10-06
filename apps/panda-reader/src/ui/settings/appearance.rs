@@ -1,5 +1,5 @@
 use super::Settings;
-use crate::ui::components::tty_icon;
+use crate::ui::components::{BundledIcon, bundled_icon};
 use crate::ui::theme::{self, PRESETS, Preset};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
@@ -144,7 +144,7 @@ impl Settings {
                 Button::new("font-larger")
                     .small()
                     .secondary()
-                    .icon(tty_icon("plus"))
+                    .icon(bundled_icon(BundledIcon::Plus))
                     .tooltip(owner.t("Larger"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.set_ui_font_size((this.preferences.ui_font_size + 1.).min(18.), cx)
@@ -194,7 +194,7 @@ impl Settings {
                         Button::new("close-theme-picker")
                             .small()
                             .ghost()
-                            .icon(tty_icon("close"))
+                            .icon(bundled_icon(BundledIcon::Close))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.theme_picker_open = false;
                                 cx.notify();

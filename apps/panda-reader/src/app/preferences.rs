@@ -9,6 +9,14 @@ pub const DEFAULT_THEME_ID: &str = "bamboo";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ReaderFontFamily {
+    Sans,
+    #[default]
+    Serif,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Language {
     #[default]
     English,
@@ -123,9 +131,18 @@ pub struct Preferences {
     /// Show the panda app icon in the custom title bar.
     pub show_app_icon: bool,
     pub ui_font_size: f32,
+    /// Font family used by article titles and body text.
+    pub reader_font_family: ReaderFontFamily,
+    pub reader_font_size: f32,
+    pub reader_line_height: f32,
+    pub reader_content_width: f32,
+    pub reader_paragraph_spacing: f32,
+    pub remember_reading_position: bool,
     pub language: Language,
     /// Target language for article body translation (independent of UI language).
     pub translation_language: Language,
+    /// Add two full-width spaces at the start of article paragraphs.
+    pub paragraph_indent: bool,
     /// Translate confidently identified article titles in the background.
     pub auto_translate_titles: bool,
     pub auto_extract_full_text: bool,
@@ -157,8 +174,15 @@ impl Default for Preferences {
             sidebar_collapsed: false,
             show_app_icon: true,
             ui_font_size: 15.,
+            reader_font_family: ReaderFontFamily::Serif,
+            reader_font_size: 19.,
+            reader_line_height: 1.65,
+            reader_content_width: 680.,
+            reader_paragraph_spacing: 1.35,
+            remember_reading_position: true,
             language: Language::English,
             translation_language: Language::ZhCn,
+            paragraph_indent: true,
             auto_translate_titles: false,
             auto_extract_full_text: false,
             content_extractor: ContentExtractor::DomSmoothie,

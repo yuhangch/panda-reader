@@ -5,6 +5,7 @@ mod article_view;
 mod commands;
 mod components;
 mod context_menus;
+mod date;
 mod feed_editor;
 pub(crate) mod i18n;
 mod quote_poster;

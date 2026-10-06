@@ -1,7 +1,6 @@
 use crate::ui::components::text_input;
 use crate::ui::i18n;
 use crate::ui::window::ReaderWindow;
-use chrono::DateTime;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
@@ -158,8 +157,11 @@ impl ArticleList {
                                         let date = article
                                             .published_at
                                             .as_deref()
-                                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                                            .map(|d| d.format("%m-%d").to_string())
+                                            .and_then(|value| {
+                                                super::super::date::format_published_at(
+                                                    value, language, false,
+                                                )
+                                            })
                                             .unwrap_or_default();
                                         let owner = view.clone();
                                         let menu_app = view.downgrade();
@@ -220,6 +222,11 @@ impl ArticleList {
                                                             .min_w_0()
                                                             .text_sm()
                                                             .font_semibold()
+                                                            .text_color(if article.is_read {
+                                                                cx.theme().foreground.opacity(0.78)
+                                                            } else {
+                                                                cx.theme().foreground
+                                                            })
                                                             .line_clamp(2)
                                                             .child(display_title(
                                                                 article,

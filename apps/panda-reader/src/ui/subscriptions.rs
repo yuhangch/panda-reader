@@ -159,6 +159,7 @@ impl ReaderWindow {
                         this.reader.is_extracting = false;
                         this.reader.article = None;
                         this.reader.body_html = SharedString::default();
+                        this.reader.body_markdown = SharedString::default();
                         this.reader.showing_translation = false;
                         this.list.scope = Scope::All;
                         this.set_flash(this.t("Feed removed from provider and locally"), cx);

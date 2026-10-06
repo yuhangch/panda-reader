@@ -25,7 +25,7 @@ impl ArticleList {
         cx: &mut Context<ReaderWindow>,
         language: crate::app::preferences::Language,
     ) -> Self {
-        let search_placeholder = i18n::text(language, "Search articles");
+        let search_placeholder = i18n::text(language, "Search title, author and body");
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(search_placeholder));
         let search_for_events = search_input.clone();
         let _subscriptions =

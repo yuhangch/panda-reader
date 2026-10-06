@@ -14,6 +14,7 @@ impl ReaderWindow {
         self.list.scope = scope;
         self.reader.article = None;
         self.reader.body_html = SharedString::default();
+        self.reader.body_markdown = SharedString::default();
         self.reader.showing_translation = false;
         self.list.articles = Arc::new(Vec::new());
         self.list.has_more = false;
@@ -78,6 +79,10 @@ impl ReaderWindow {
                                 .unwrap_or_else(|| article.summary.clone());
                         }
                         this.queue_title_translations(&newly_loaded, cx);
+                        if !append && this.startup_sync_pending {
+                            this.startup_sync_pending = false;
+                            this.refresh(cx);
+                        }
                     }
                     Err(error) => this.set_error(error),
                 }

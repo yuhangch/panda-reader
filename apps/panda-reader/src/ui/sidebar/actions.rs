@@ -1,6 +1,6 @@
 use crate::services::Command;
 use crate::services::favicon::{feed_host, local_favicon_path};
-use crate::ui::components::tty_icon;
+use crate::ui::components::{BundledIcon, bundled_icon};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::*;
@@ -124,11 +124,11 @@ impl ReaderWindow {
 
     pub(in crate::ui) fn folder_icon_element(icon_key: &str) -> Icon {
         match icon_key {
-            "star" => tty_icon("star").small(),
+            "star" => bundled_icon(BundledIcon::Star).small(),
             "book" => Icon::new(IconName::BookOpen).small(),
             "globe" => Icon::new(IconName::Globe).small(),
-            "bookmark" => tty_icon("bookmark").small(),
-            _ => tty_icon("folder").small(),
+            "bookmark" => bundled_icon(BundledIcon::Bookmark).small(),
+            _ => bundled_icon(BundledIcon::Folder).small(),
         }
     }
 

@@ -48,6 +48,7 @@ pub enum CommandKind {
     CopyLink,
     CopyTitle,
     Refresh,
+    ForceRefreshArticle,
     AddFeed,
     MarkAllRead,
     LoadMoreArticles,
@@ -160,6 +161,13 @@ pub fn catalog() -> &'static [CommandItem] {
             title: "Extract full text",
             aliases: &["extract", "fulltext", "readability"],
             chord: None,
+        },
+        CommandItem {
+            kind: CommandKind::ForceRefreshArticle,
+            group: CommandGroup::Article,
+            title: "Re-fetch current article",
+            aliases: &["force refresh", "refresh article", "re-fetch"],
+            chord: Some("Shift+Ctrl/Cmd+R"),
         },
         CommandItem {
             kind: CommandKind::Translate,

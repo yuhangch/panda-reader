@@ -87,6 +87,18 @@ impl ReaderWindow {
                 }
             }
             CommandKind::Refresh => self.refresh(cx),
+            CommandKind::ForceRefreshArticle => {
+                if let Some(id) = self
+                    .reader
+                    .article
+                    .as_ref()
+                    .map(|article| article.summary.id)
+                {
+                    self.extract(id, true, cx);
+                } else {
+                    self.set_flash(self.t("Select an article first"), cx);
+                }
+            }
             CommandKind::AddFeed => {
                 self.settings.open = true;
                 self.settings.page = SettingsPage::General;

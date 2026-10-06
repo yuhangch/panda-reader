@@ -1,6 +1,6 @@
 use super::Settings;
 use crate::app::preferences::LibrarySource;
-use crate::ui::components::{text_input, tty_icon};
+use crate::ui::components::{BundledIcon, bundled_icon, text_input};
 use crate::ui::i18n;
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
@@ -236,14 +236,14 @@ impl Settings {
                     .child(
                         Button::new("settings-add-feed").small()
                             .primary()
-                            .icon(tty_icon("plus"))
+                            .icon(bundled_icon(BundledIcon::Plus))
                             .label(owner.t("Add feed"))
                             .on_click(cx.listener(|this, _, window, cx| this.add_feed(window, cx))),
                     )
                     .child(
                         Button::new("settings-refresh").small()
                             .ghost()
-                            .icon(tty_icon("refresh"))
+                            .icon(bundled_icon(BundledIcon::Refresh))
                             .label(owner.t("Sync now"))
                             .loading(owner.sidebar.is_refreshing)
                             .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
