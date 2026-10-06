@@ -23,17 +23,19 @@ static POSTER_FONT_DB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::D
 pub(in crate::ui) struct QuotePoster {
     pub image: Image,
     pub png: Vec<u8>,
+    pub scale: f32,
 }
 
 #[cfg(not(test))]
 impl QuotePoster {
-    pub fn generate(
+    fn generate(
         quote: String,
         title: String,
         source: String,
         url: Option<String>,
         context_html: String,
         feed_icon: Option<Vec<u8>>,
+        palette: PosterPalette,
     ) -> Result<Self, String> {
         let (before, after) = context_around_selection(&context_html, &quote);
         let svg = poster_svg(
@@ -44,11 +46,25 @@ impl QuotePoster {
             &before,
             &after,
             feed_icon.as_deref(),
+            palette,
         )?;
         let png = render_svg_png(&svg)?;
         let image = Image::from_bytes(ImageFormat::Png, png.clone());
-        Ok(Self { image, png })
+        Ok(Self {
+            image,
+            png,
+            scale: 1.0,
+        })
     }
+}
+
+#[derive(Clone, Copy)]
+struct PosterPalette {
+    background: u32,
+    foreground: u32,
+    accent: u32,
+    muted: u32,
+    border: u32,
 }
 
 fn render_svg_png(svg: &str) -> Result<Vec<u8>, String> {
@@ -84,14 +100,15 @@ fn poster_svg(
     before: &str,
     after: &str,
     feed_icon: Option<&[u8]>,
+    palette: PosterPalette,
 ) -> Result<String, String> {
     let before_lines = fit_context_lines(wrap_text(before, 20.0), true);
-    let quote_lines = wrap_text(quote, 16.0);
+    let quote_lines = wrap_text(quote, 18.0);
     let after_lines = fit_context_lines(wrap_text(after, 20.0), false);
     let before_start = 330_u32;
     let before_height = before_lines.len() as u32 * 62;
     let quote_start = before_start + before_height + if before_lines.is_empty() { 80 } else { 30 };
-    let quote_line_height = 82_u32;
+    let quote_line_height = 68_u32;
     let after_start = quote_start + quote_lines.len() as u32 * quote_line_height + 30;
     let after_height = after_lines.len() as u32 * 62;
     let body_end = after_start + after_height;
@@ -100,44 +117,50 @@ fn poster_svg(
     let font = "Noto Sans SC";
     let app_icon_data = base64::engine::general_purpose::STANDARD
         .encode(include_bytes!("../../assets/app-icon.png"));
+    let background = color_hex(palette.background);
+    let foreground = color_hex(palette.foreground);
+    let accent = color_hex(palette.accent);
+    let muted = color_hex(palette.muted);
+    let border = color_hex(palette.border);
+    let render_width = POSTER_WIDTH * 2;
+    let render_height = height * 2;
     let mut svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{POSTER_WIDTH}" height="{height}" viewBox="0 0 {POSTER_WIDTH} {height}">
-<rect width="100%" height="100%" fill="#fff"/>
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{render_width}" height="{render_height}" viewBox="0 0 {POSTER_WIDTH} {height}">
+<rect width="100%" height="100%" fill="{background}"/>
 <image x="120" y="118" width="42" height="42" preserveAspectRatio="xMidYMid meet" href="data:image/png;base64,{app_icon_data}"/>
-<text x="178" y="151" fill="#77736f" stroke="#77736f" stroke-width="0.45" paint-order="stroke fill" font-size="23" font-weight="700" letter-spacing="3" font-family="{font}">PANDA READER · 引文</text>
+<text x="178" y="151" fill="{accent}" stroke="{accent}" stroke-width="0.3" paint-order="stroke fill" font-size="23" font-weight="800" letter-spacing="3" font-family="{font}">PANDA READER · BAMBOO LEAF</text>
 "##,
     );
     for (index, line) in before_lines.iter().enumerate() {
         svg.push_str(&format!(
-            "<text x=\"120\" y=\"{}\" fill=\"#c6c6c6\" stroke=\"#c6c6c6\" stroke-width=\"0.6\" paint-order=\"stroke fill\" font-size=\"42\" font-weight=\"500\" font-family=\"{font}\">{}</text>\n",
+            "<text x=\"120\" y=\"{}\" fill=\"{muted}\" stroke=\"{muted}\" stroke-width=\"0.35\" paint-order=\"stroke fill\" font-size=\"42\" font-weight=\"700\" font-family=\"{font}\">{}</text>\n",
             before_start + index as u32 * 62,
             xml_escape(line),
         ));
     }
     for (index, line) in quote_lines.iter().enumerate() {
         svg.push_str(&format!(
-            "<text x=\"120\" y=\"{}\" fill=\"#111111\" stroke=\"#111111\" stroke-width=\"1.2\" paint-order=\"stroke fill\" font-size=\"52\" font-weight=\"700\" font-family=\"{font}\">{}</text>\n",
+            "<text x=\"120\" y=\"{}\" fill=\"{foreground}\" stroke=\"{foreground}\" stroke-width=\"0.7\" paint-order=\"stroke fill\" font-size=\"40\" font-weight=\"900\" font-family=\"{font}\">{}</text>\n",
             quote_start + index as u32 * quote_line_height,
             xml_escape(line),
         ));
     }
     for (index, line) in after_lines.iter().enumerate() {
         svg.push_str(&format!(
-            "<text x=\"120\" y=\"{}\" fill=\"#c6c6c6\" stroke=\"#c6c6c6\" stroke-width=\"0.6\" paint-order=\"stroke fill\" font-size=\"42\" font-weight=\"500\" font-family=\"{font}\">{}</text>\n",
+            "<text x=\"120\" y=\"{}\" fill=\"{muted}\" stroke=\"{muted}\" stroke-width=\"0.35\" paint-order=\"stroke fill\" font-size=\"42\" font-weight=\"700\" font-family=\"{font}\">{}</text>\n",
             after_start + index as u32 * 62,
             xml_escape(line),
         ));
     }
 
-    let feed_lines = wrap_text(source, 24.0);
-    let title_lines = wrap_text(title, 28.0);
+    let qr_left = 850.0_f32;
     let qr = url
         .filter(|url| !url.trim().is_empty())
         .map(|url| qrcodegen::QrCode::encode_text(url, qrcodegen::QrCodeEcc::Medium))
         .transpose()
         .map_err(|_| "Article link is too long for a QR code".to_owned())?;
     svg.push_str(&format!(
-        r##"<line x1="96" y1="{footer_top}" x2="984" y2="{footer_top}" stroke="#eeeeee" stroke-width="2"/>
+        r##"<line x1="96" y1="{footer_top}" x2="984" y2="{footer_top}" stroke="{border}" stroke-width="2"/>
 "##,
     ));
     let text_x = if let Some(icon) = feed_icon {
@@ -153,10 +176,13 @@ fn poster_svg(
     } else {
         120
     };
+    let footer_text_width = ((qr_left - text_x as f32 - 28.0) / 23.0).max(1.0);
+    let feed_lines = fit_text_lines(source, footer_text_width, 1);
+    let title_lines = fit_text_lines(title, footer_text_width, 2);
     svg.push_str(&format!(
-        r##"<text x="{text_x}" y="{}" fill="#242424" stroke="#242424" stroke-width="0.55" paint-order="stroke fill" font-size="29" font-weight="700" font-family="{font}">{}</text>
-<text x="{text_x}" y="{}" fill="#4c4945" stroke="#4c4945" stroke-width="0.45" paint-order="stroke fill" font-size="23" font-weight="600" font-family="{font}">{}</text>
-<text x="{text_x}" y="{}" fill="#77736f" stroke="#77736f" stroke-width="0.4" paint-order="stroke fill" font-size="23" font-weight="600" font-family="{font}">{}</text>
+        r##"<text x="{text_x}" y="{}" fill="{foreground}" stroke="{foreground}" stroke-width="0.5" paint-order="stroke fill" font-size="32" font-weight="800" font-family="{font}">{}</text>
+<text x="{text_x}" y="{}" fill="{foreground}" stroke="{foreground}" stroke-width="0.3" paint-order="stroke fill" font-size="23" font-weight="700" font-family="{font}">{}</text>
+<text x="{text_x}" y="{}" fill="{muted}" stroke="{muted}" stroke-width="0.3" paint-order="stroke fill" font-size="23" font-weight="700" font-family="{font}">{}</text>
 "##,
         footer_top + 89,
         xml_escape(feed_lines.first().map(String::as_str).unwrap_or("")),
@@ -173,7 +199,7 @@ fn poster_svg(
         let qr_x = 862.0_f32;
         let qr_y = footer_top as f32 + 36.0;
         svg.push_str(&format!(
-            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"10\" fill=\"#fff\" stroke=\"#eeeeee\" stroke-width=\"2\"/>\n<path fill=\"#171717\" d=\"",
+            "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"10\" fill=\"{background}\" stroke=\"{border}\" stroke-width=\"2\"/>\n<path fill=\"{foreground}\" d=\"",
             qr_x - quiet_zone,
             qr_y - quiet_zone,
             qr_size + quiet_zone * 2.0,
@@ -276,12 +302,37 @@ fn wrap_text(text: &str, max_width: f32) -> Vec<String> {
     lines
 }
 
+fn fit_text_lines(text: &str, max_width: f32, max_lines: usize) -> Vec<String> {
+    let mut lines = wrap_text(text, max_width);
+    if lines.len() <= max_lines {
+        return lines;
+    }
+    lines.truncate(max_lines);
+    if let Some(last) = lines.last_mut() {
+        while !last.is_empty() && estimated_text_width(&format!("{last}…")) > max_width {
+            last.pop();
+        }
+        last.push('…');
+    }
+    lines
+}
+
+fn estimated_text_width(text: &str) -> f32 {
+    text.chars()
+        .map(|character| if character.is_ascii() { 0.52 } else { 1.0 })
+        .sum()
+}
+
 fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn color_hex(color: u32) -> String {
+    format!("#{color:06x}")
 }
 
 #[cfg(not(test))]
@@ -296,7 +347,15 @@ impl ReaderWindow {
         feed_icon: Option<Vec<u8>>,
         cx: &mut Context<Self>,
     ) {
-        match QuotePoster::generate(quote, title, source, url, context_html, feed_icon) {
+        let theme = crate::ui::theme::preset(&self.preferences.theme);
+        let palette = PosterPalette {
+            background: theme.content,
+            foreground: theme.foreground,
+            accent: theme.accent,
+            muted: theme.muted,
+            border: theme.border,
+        };
+        match QuotePoster::generate(quote, title, source, url, context_html, feed_icon, palette) {
             Ok(poster) => self.quote_poster = Some(poster),
             Err(error) => self.set_error(error),
         }
@@ -312,6 +371,7 @@ impl ReaderWindow {
         };
         let scrim = cx.theme().background.opacity(0.62);
         let preview_image = poster.image.clone();
+        let preview_width = px(360. * poster.scale);
         div()
             .absolute()
             .inset_0()
@@ -326,10 +386,11 @@ impl ReaderWindow {
                     cx.notify();
                 }),
             )
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 v_flex()
                     .w(px(520.))
-                    .max_h(px(760.))
+                    .max_h(px(700.))
                     .gap_3()
                     .p_5()
                     .rounded(px(10.))
@@ -342,12 +403,7 @@ impl ReaderWindow {
                         h_flex()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_lg()
-                                    .font_semibold()
-                                    .child(self.t("Quote poster")),
-                            )
+                            .child(div().text_lg().font_semibold().child(self.t("Bamboo Leaf")))
                             .child(
                                 Button::new("quote-poster-close")
                                     .small()
@@ -360,15 +416,57 @@ impl ReaderWindow {
                             ),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .justify_center()
-                            .max_h(px(570.))
-                            .overflow_y_scrollbar()
+                        v_flex()
+                            .items_center()
+                            .gap_1()
                             .child(
-                                img(std::sync::Arc::new(preview_image))
-                                    .w(px(360.))
-                                    .rounded(px(6.)),
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(self.t("Scroll over the image to zoom")),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .justify_center()
+                                    .w_full()
+                                    .h(px(510.))
+                                    .overflow_y_scrollbar()
+                                    .child(
+                                        div()
+                                            .on_scroll_wheel(cx.listener(
+                                                |this, event: &ScrollWheelEvent, _, cx| {
+                                                    let direction = match event.delta {
+                                                        ScrollDelta::Lines(delta) => {
+                                                            delta.y.signum()
+                                                        }
+                                                        ScrollDelta::Pixels(delta) => {
+                                                            if delta.y > px(0.) {
+                                                                1.
+                                                            } else if delta.y < px(0.) {
+                                                                -1.
+                                                            } else {
+                                                                0.
+                                                            }
+                                                        }
+                                                    };
+                                                    if direction != 0.
+                                                        && let Some(poster) = &mut this.quote_poster
+                                                    {
+                                                        poster.scale = (poster.scale
+                                                            + direction * 0.1)
+                                                            .clamp(0.5, 1.3);
+                                                        cx.notify();
+                                                    }
+                                                    cx.stop_propagation();
+                                                },
+                                            ))
+                                            .child(
+                                                img(std::sync::Arc::new(preview_image))
+                                                    .w(preview_width)
+                                                    .rounded(px(6.)),
+                                            ),
+                                    ),
                             ),
                     )
                     .child(
@@ -402,7 +500,7 @@ impl ReaderWindow {
                                         let weak = cx.entity().downgrade();
                                         cx.spawn(async move |_, cx| {
                                             if let Some(file) = rfd::AsyncFileDialog::new()
-                                                .set_file_name("panda-reader-quote.png")
+                                                .set_file_name("panda-reader-bamboo-leaf.png")
                                                 .add_filter("PNG image", &["png"])
                                                 .save_file()
                                                 .await
@@ -435,7 +533,15 @@ impl ReaderWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{poster_svg, wrap_text};
+    use super::{PosterPalette, fit_text_lines, poster_svg, wrap_text};
+
+    const BAMBOO_PALETTE: PosterPalette = PosterPalette {
+        background: 0xffffff,
+        foreground: 0x202a36,
+        accent: 0x52775d,
+        muted: 0x6b776f,
+        border: 0xcbd3dc,
+    };
 
     #[test]
     fn poster_escapes_article_text_and_embeds_qr_for_url() {
@@ -447,18 +553,19 @@ mod tests {
             "faded context before",
             "faded context after",
             None,
+            BAMBOO_PALETTE,
         )
         .expect("poster svg should be generated");
         assert!(svg.contains("&lt;hello &amp; goodbye&gt;"));
-        assert!(svg.contains("fill=\"#c6c6c6\""));
-        assert!(svg.contains("<path fill=\"#171717\""));
+        assert!(svg.contains("fill=\"#6b776f\""));
+        assert!(svg.contains("<path fill=\"#202a36\""));
         assert!(svg.contains("width=\"152\""));
         assert!(svg.contains("font-family=\"Noto Sans SC\""));
-        assert!(svg.contains("font-weight=\"600\""));
+        assert!(svg.contains("font-weight=\"900\""));
         let logo_at = svg
             .find("<image x=\"120\" y=\"118\"")
             .expect("Panda Reader logo should be in the header");
-        let brand_at = svg.find("PANDA READER · 引文").unwrap();
+        let brand_at = svg.find("PANDA READER · BAMBOO LEAF").unwrap();
         assert!(logo_at < brand_at);
         assert!(!svg.contains("id=\"feed-icon\""));
         assert!(svg.contains("<text x=\"120\""));
@@ -471,6 +578,39 @@ mod tests {
     }
 
     #[test]
+    fn poster_colors_follow_the_selected_theme_palette() {
+        let palette = PosterPalette {
+            background: 0x1e1e2e,
+            foreground: 0xcdd6f4,
+            accent: 0x89b4fa,
+            muted: 0x9399b2,
+            border: 0x45475a,
+        };
+        let svg = poster_svg(
+            "quote", "title", "source", None, "before", "after", None, palette,
+        )
+        .expect("poster svg should be generated");
+
+        assert!(svg.contains("fill=\"#1e1e2e\""));
+        assert!(svg.contains("fill=\"#cdd6f4\""));
+        assert!(svg.contains("fill=\"#89b4fa\""));
+        assert!(svg.contains("fill=\"#9399b2\""));
+        assert!(svg.contains("stroke=\"#45475a\""));
+    }
+
+    #[test]
+    fn footer_title_is_limited_to_two_lines_and_ellipsized() {
+        let lines = fit_text_lines(&"标题".repeat(40), 10.0, 2);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].ends_with('…'));
+        assert!(
+            lines
+                .iter()
+                .all(|line| super::estimated_text_width(line) <= 10.0)
+        );
+    }
+
+    #[test]
     fn poster_renders_as_a_png_image() {
         let svg = poster_svg(
             "中国铁路西安局集团有限公司联合安康市文旅局推出高铁文旅优惠活动",
@@ -480,6 +620,7 @@ mod tests {
             "又有浸润岁月的人文古迹，一起来看看吧。",
             "即日起至2026年12月31日，安康市所辖景区均可享受优惠。",
             Some(include_bytes!("../../assets/app-icon.png")),
+            BAMBOO_PALETTE,
         )
         .expect("poster svg should be generated");
         let icon_at = svg.find("id=\"feed-icon\"").unwrap();

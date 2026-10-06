@@ -215,7 +215,7 @@ impl ReaderWindow {
             let poster_app = app.clone();
             menu = menu
                 .item(
-                    PopupMenuItem::new(i18n::text(language, "Create quote poster")).on_click({
+                    PopupMenuItem::new(i18n::text(language, "Create Bamboo Leaf")).on_click({
                         move |_, _, cx| {
                             let _ = poster_app.update(cx, |this, cx| {
                                 let context_html = this.reader.body_html.to_string();
