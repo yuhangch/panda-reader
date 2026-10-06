@@ -17,6 +17,7 @@ fn worker_routes_local_reads_and_checks_provider_operations() {
         dir.path().join("library.sqlite3"),
         dir.path().join("providers.json"),
         dir.path().join("translator.json"),
+        dir.path().join("plugins"),
         "local",
         panda_providers::ProviderSettingsMap::new(),
     );

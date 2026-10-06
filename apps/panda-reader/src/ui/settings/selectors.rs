@@ -99,5 +99,6 @@ pub(in crate::ui) enum SettingsPage {
     Appearance,
     Reading,
     Translation,
+    Plugins,
     About,
 }

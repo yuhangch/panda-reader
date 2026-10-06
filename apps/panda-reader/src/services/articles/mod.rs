@@ -6,6 +6,7 @@ use super::worker::{WorkerState, job};
 use panda_core::{
     ArticleCursor, MarkField, PreparedArticle, ReaderSnapshot, Scope, TranslationLayout,
 };
+use panda_plugins::{PluginRegistry, PluginStage};
 use panda_providers::ProviderClient;
 use panda_store::Store;
 use panda_translate::TranslatorConfig;
@@ -22,18 +23,94 @@ pub fn prepare_article(
     show_translation: bool,
     translation_layout: TranslationLayout,
     hide_images: bool,
+    paragraph_indent: bool,
+    plugins: &PluginRegistry,
 ) -> Result<PreparedArticle, String> {
-    let article = store.article(id).map_err(|e| e.to_string())?;
-    let key =
-        BodyPrepKey::from_article(&article, show_translation, translation_layout, hide_images);
-    let body_html = cache.lock().map_err(|e| e.to_string())?.get_or_insert(
+    let mut article = store.article(id).map_err(|e| e.to_string())?;
+    let reading_progress = store.reading_progress(id).map_err(|e| e.to_string())?;
+    article.effective_html = Some(effective_article_body(store, &article, plugins)?);
+    let key = BodyPrepKey::from_article(
+        &article,
+        show_translation,
+        translation_layout,
+        hide_images,
+        paragraph_indent,
+    );
+    let body = cache.lock().map_err(|e| e.to_string())?.get_or_insert(
         key,
         &article,
         show_translation,
         translation_layout,
         hide_images,
+        paragraph_indent,
     );
-    Ok(PreparedArticle { article, body_html })
+    Ok(PreparedArticle {
+        article,
+        body_html: body.html,
+        body_markdown: body.markdown,
+        reading_progress,
+        image_urls: body.image_urls,
+    })
+}
+
+fn effective_article_body(
+    store: &Store,
+    article: &panda_core::Article,
+    plugins: &PluginRegistry,
+) -> Result<String, String> {
+    let source = article
+        .extracted_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+        .or(article.source_html.as_deref())
+        .unwrap_or(&article.content_html);
+    let source_url = article
+        .url
+        .as_deref()
+        .or(article.summary.url.as_deref())
+        .unwrap_or("");
+    let pipeline = plugins.cache_key();
+    if let Some(cached) = store
+        .processed_content(
+            article.summary.id,
+            source,
+            source_url,
+            &article.summary.title,
+            &pipeline,
+        )
+        .map_err(|error| format!("could not read processed article cache: {error:#}"))?
+    {
+        return Ok(cached);
+    }
+    let processed = plugins.process(
+        source,
+        source_url,
+        &article.summary.title,
+        PluginStage::Cleanup,
+    );
+    for diagnostic in &processed.diagnostics {
+        eprintln!(
+            "article plugin {} failed: {}",
+            diagnostic.plugin_id, diagnostic.message
+        );
+    }
+    let body = if article.extracted_html.is_some() {
+        panda_content::remove_leading_duplicate_title(&processed.html, &article.summary.title)
+    } else {
+        processed.html
+    };
+    let effective = panda_content::sanitize_html(&body, Some(source_url));
+    store
+        .save_processed_content(
+            article.summary.id,
+            source,
+            source_url,
+            &article.summary.title,
+            &pipeline,
+            &effective,
+        )
+        .map_err(|error| format!("could not save processed article cache: {error:#}"))?;
+    Ok(effective)
 }
 
 pub(super) fn snapshot(
@@ -60,14 +137,19 @@ pub(super) fn article(
     show_translation: bool,
     translation_layout: TranslationLayout,
     hide_images: bool,
+    paragraph_indent: bool,
     reply: oneshot::Sender<Result<PreparedArticle, String>>,
     state: &WorkerState,
 ) {
     let path = state.path.clone();
     let workspace = state.workspace();
     let cache = state.body_cache.clone();
+    let plugins = state.plugin_registry.clone();
     job(reply, move |_| {
         let store = Store::open_workspace(&path, &workspace).map_err(|e| e.to_string())?;
+        let plugins = plugins
+            .read()
+            .map_err(|_| "plugin registry lock poisoned".to_string())?;
         prepare_article(
             &store,
             &cache,
@@ -75,8 +157,22 @@ pub(super) fn article(
             show_translation,
             translation_layout,
             hide_images,
+            paragraph_indent,
+            &plugins,
         )
     });
+}
+
+pub(super) fn save_reading_progress(
+    id: i64,
+    progress: f32,
+    reply: oneshot::Sender<Result<(), String>>,
+    state: &WorkerState,
+) {
+    let result = Store::open_workspace(&state.path, &state.workspace())
+        .and_then(|store| store.save_reading_progress(id, progress))
+        .map_err(|error| error.to_string());
+    let _ = reply.send(result);
 }
 
 pub(super) fn mark_all_read(
@@ -139,10 +235,31 @@ pub(super) fn extract(
     let path = state.path.clone();
     let workspace = state.workspace();
     let cache = state.body_cache.clone();
+    let plugins = state.plugin_registry.clone();
     job(reply, move |runtime| {
         let mut store = Store::open_workspace(&path, &workspace).map_err(|e| e.to_string())?;
+        let plugins = plugins
+            .read()
+            .map_err(|_| "plugin registry lock poisoned".to_string())?;
+        let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
         let result = runtime
-            .block_on(store.extract(id, force, extractor))
+            .block_on(store.extract_using(
+                id,
+                force,
+                extractor,
+                &pipeline_hash,
+                |raw, url, title| {
+                    let prepared = plugins.process(raw, url, title, PluginStage::Prepare);
+                    for diagnostic in &prepared.diagnostics {
+                        eprintln!(
+                            "article plugin {} failed: {}",
+                            diagnostic.plugin_id, diagnostic.message
+                        );
+                    }
+                    Ok((!prepared.matched_plugins.is_empty())
+                        .then_some((prepared.html, prepared.body_selected)))
+                },
+            ))
             .map_err(|e| e.to_string());
         if result.is_ok() {
             if let Ok(mut cache) = cache.lock() {
@@ -158,6 +275,7 @@ pub(super) fn translate(
     target_lang: String,
     translation_layout: TranslationLayout,
     hide_images: bool,
+    paragraph_indent: bool,
     reply: oneshot::Sender<Result<PreparedArticle, String>>,
     state: &WorkerState,
 ) {
@@ -165,22 +283,49 @@ pub(super) fn translate(
     let workspace = state.workspace();
     let translator_path = state.translator_path.clone();
     let cache = state.body_cache.clone();
+    let plugins = state.plugin_registry.clone();
     job(reply, move |runtime| {
         let config = TranslatorConfig::load(&translator_path).map_err(|e| e.to_string())?;
         let translator = panda_translate::build(&config).map_err(|e| e.to_string())?;
         let mut store = Store::open_workspace(&path, &workspace).map_err(|e| e.to_string())?;
-        let article = runtime
-            .block_on(store.translate(id, &target_lang, &translator))
+        let mut article = store.article(id).map_err(|e| e.to_string())?;
+        let registry = plugins
+            .read()
+            .map_err(|_| "plugin registry lock poisoned".to_string())?;
+        let effective = effective_article_body(&store, &article, &registry)?;
+        drop(registry);
+        article = runtime
+            .block_on(store.translate_with_source(id, &target_lang, &effective, &translator))
             .map_err(|e| e.to_string())?;
+        article.effective_html = Some(effective);
         if let Ok(mut cache) = cache.lock() {
             cache.invalidate_article(id);
         }
-        let body_html = {
+        let body = {
             let mut guard = cache.lock().map_err(|e| e.to_string())?;
-            let key = BodyPrepKey::from_article(&article, true, translation_layout, hide_images);
-            guard.get_or_insert(key, &article, true, translation_layout, hide_images)
+            let key = BodyPrepKey::from_article(
+                &article,
+                true,
+                translation_layout,
+                hide_images,
+                paragraph_indent,
+            );
+            guard.get_or_insert(
+                key,
+                &article,
+                true,
+                translation_layout,
+                hide_images,
+                paragraph_indent,
+            )
         };
-        Ok(PreparedArticle { article, body_html })
+        Ok(PreparedArticle {
+            article,
+            body_html: body.html,
+            body_markdown: body.markdown,
+            reading_progress: store.reading_progress(id).map_err(|e| e.to_string())?,
+            image_urls: body.image_urls,
+        })
     });
 }
 
@@ -449,7 +594,10 @@ fn test_article() -> panda_core::Article {
         },
         url: None,
         content_html: "<p>Original</p><img src=\"https://example.com/image.png\">".into(),
+        source_html: None,
+        source_page_html: None,
         extracted_html: None,
+        effective_html: None,
         translated_html: Some("<p>译文</p>".into()),
         translated_title: None,
         translated_lang: None,

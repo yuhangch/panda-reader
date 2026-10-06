@@ -1,0 +1,9 @@
+id = "example.json-recovery"
+name = "Example JSON article recovery"
+version = "1.0.0"
+api_version = 1
+kind = "wasm"
+domains = ["example.com"]
+stage = "prepare"
+priority = 50
+capabilities = ["document_read", "article_body_write"]

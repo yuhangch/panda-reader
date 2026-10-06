@@ -10,10 +10,47 @@ use panda_translate::TranslatorConfig;
 
 use super::selectors::{LanguageOption, TranslatorProvider};
 
+#[derive(Clone, Copy)]
+pub(super) enum ReaderSetting {
+    FontSize,
+    LineHeight,
+    ContentWidth,
+    ParagraphSpacing,
+}
+
 impl ReaderWindow {
+    pub(super) fn adjust_reader_setting(
+        &mut self,
+        setting: ReaderSetting,
+        delta: f32,
+        cx: &mut Context<Self>,
+    ) {
+        match setting {
+            ReaderSetting::FontSize => {
+                self.preferences.reader_font_size =
+                    (self.preferences.reader_font_size + delta).clamp(14., 30.);
+            }
+            ReaderSetting::LineHeight => {
+                self.preferences.reader_line_height =
+                    (self.preferences.reader_line_height + delta).clamp(1.2, 2.2);
+            }
+            ReaderSetting::ContentWidth => {
+                self.preferences.reader_content_width =
+                    (self.preferences.reader_content_width + delta).clamp(520., 1000.);
+            }
+            ReaderSetting::ParagraphSpacing => {
+                self.preferences.reader_paragraph_spacing =
+                    (self.preferences.reader_paragraph_spacing + delta).clamp(0.5, 2.5);
+            }
+        }
+        self.save_preferences();
+        cx.notify();
+    }
+
     pub(in crate::ui) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
         self.update_status = UpdateStatus::Checking;
         updater::start_check(self.data_dir.clone(), self.update_events.clone());
+        self.settings.check_community_plugins(cx);
         cx.notify();
     }
 
@@ -266,10 +303,14 @@ impl ReaderWindow {
         cx.notify();
     }
 
-    pub(in crate::ui) fn toggle_auto_translate_titles(&mut self, cx: &mut Context<Self>) {
-        self.preferences.auto_translate_titles = !self.preferences.auto_translate_titles;
+    pub(in crate::ui) fn set_auto_translate_titles(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.preferences.auto_translate_titles = enabled;
         self.save_preferences();
-        if self.preferences.auto_translate_titles {
+        if enabled {
             let rows = self.list.articles.as_ref().clone();
             self.queue_title_translations(&rows, cx);
         }

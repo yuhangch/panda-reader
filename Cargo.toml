@@ -2,6 +2,9 @@
 members = [
     "apps/panda-reader",
     "crates/panda-core",
+    "crates/panda-content",
+    "crates/panda-plugins",
+    "crates/panda-plugin-sdk",
     "crates/panda-store",
     "crates/panda-miniflux",
     "crates/panda-providers",
@@ -26,13 +29,17 @@ dom_smoothie = "0.18"
 decruft = "0.2"
 rs-trafilatura = "0.2"
 feed-rs = "2"
+flate2 = "1"
 gpui-kit = "=0.7.0"
 hex = "0.4"
+ego-tree = "0.9.0"
+html5ever = "0.29.1"
 hmac = "0.12"
 image = "0.25"
 reqwest_client = { package = "gpui-pre-reqwest-client", version = "=0.3.7" }
 semver = "1"
 opml = "1"
+quick_html2md = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "charset", "gzip", "brotli", "json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled", "functions"] }
 rfd = "0.15"
@@ -41,6 +48,8 @@ serde_json = "1"
 scraper = "0.21"
 sha2 = "0.10"
 tempfile = "3"
+toml = "0.8"
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 libc = "0.2"
 url = "2"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }

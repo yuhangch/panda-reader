@@ -1,0 +1,10 @@
+id = "community.ithome"
+name = "IT之家"
+version = "1.0.0"
+api_version = 1
+min_app_version = "0.2.0"
+kind = "rules"
+domains = ["*.ithome.com"]
+stage = "cleanup"
+priority = 20
+capabilities = ["document_read", "document_write"]

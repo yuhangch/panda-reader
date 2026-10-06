@@ -1,0 +1,20 @@
+[[rules]]
+op = "remove"
+selector = "img[src*='qbitai-logo']"
+
+# Some QbitAI article feeds escape this logo image tag into a paragraph instead of emitting an img element.
+[[rules]]
+op = "remove_text"
+selector = "p"
+text = "< img id=\"wx_img\" src=\"https://www.qbitai.com/wp-content/uploads/imgs/qbitai-logo-1.png\" width=\"400\" height=\"400\">"
+
+# QbitAI also appends this standalone copyright warning to some article bodies.
+[[rules]]
+op = "remove_text"
+selector = "p"
+text = "版权所有，未经授权不得以任何形式转载及使用，违者必究。"
+
+# Article metadata is useful in the feed list but redundant in the extracted article body.
+[[rules]]
+op = "remove"
+selector = ".article_info .date, .article_info .time, .article_info .from"

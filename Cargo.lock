@@ -5565,6 +5565,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "panda-content"
+version = "0.2.0"
+dependencies = [
+ "ammonia",
+ "anyhow",
+ "decruft",
+ "dom_smoothie",
+ "hex",
+ "panda-core",
+ "rs-trafilatura",
+ "scraper 0.21.0",
+ "sha2 0.10.9",
+ "url",
+]
+
+[[package]]
 name = "panda-core"
 version = "0.2.0"
 dependencies = [
@@ -5581,6 +5597,36 @@ dependencies = [
  "serde_json",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "panda-plugin-sdk"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "panda-plugins"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "ego-tree 0.9.0",
+ "flate2",
+ "hex",
+ "html5ever 0.29.1",
+ "panda-content",
+ "scraper 0.21.0",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "toml 0.8.23",
+ "url",
+ "wasmi",
+ "zip",
 ]
 
 [[package]]
@@ -5614,12 +5660,15 @@ dependencies = [
  "gpui-pre-reqwest-client",
  "image",
  "libc",
+ "panda-content",
  "panda-core",
  "panda-miniflux",
+ "panda-plugins",
  "panda-providers",
  "panda-store",
  "panda-translate",
  "qrcodegen",
+ "quick_html2md",
  "reqwest",
  "resvg 0.45.1",
  "rfd",
@@ -5630,6 +5679,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "url",
  "windows-sys 0.61.2",
 ]
 
@@ -5642,7 +5692,10 @@ dependencies = [
  "decruft",
  "dom_smoothie",
  "feed-rs",
+ "flate2",
+ "hex",
  "opml",
+ "panda-content",
  "panda-core",
  "panda-miniflux",
  "panda-providers",
@@ -5652,6 +5705,7 @@ dependencies = [
  "rusqlite",
  "scraper 0.21.0",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "url",
@@ -5665,6 +5719,7 @@ dependencies = [
  "chrono",
  "hex",
  "hmac",
+ "panda-content",
  "reqwest",
  "serde",
  "serde_json",
@@ -7630,6 +7685,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "string-interner"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23de088478b31c349c9ba67816fa55d9355232d63c3afea8bf513e31f0f1d2c0"
+dependencies = [
+ "hashbrown 0.15.5",
+ "serde",
+]
+
+[[package]]
 name = "string_cache"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8448,6 +8513,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8897,6 +8968,56 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "wasmi"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78693fcdd618e0fc34af59c6b8efa9ac5d58c68df940beff4bedddb6acfe7c27"
+dependencies = [
+ "spin 0.9.9",
+ "wasmi_collections",
+ "wasmi_core",
+ "wasmi_ir",
+ "wasmparser",
+]
+
+[[package]]
+name = "wasmi_collections"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a8be2aa467cf2d29e96ff759472c36eeb44a3c81c67fc9cb76c9a24c519c557"
+dependencies = [
+ "string-interner",
+]
+
+[[package]]
+name = "wasmi_core"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69372d5fda3ea3d1e0aa6603c7888110e0187e88ea17cd8fc2e2df0a0e1f37fa"
+dependencies = [
+ "libm",
+]
+
+[[package]]
+name = "wasmi_ir"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f17b774caa13c618c7244f1ee51fe23c5e7b8538a471fa46d9949779758aed6"
+dependencies = [
+ "wasmi_core",
+]
+
+[[package]]
+name = "wasmparser"
+version = "0.228.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4abf1132c1fdf747d56bbc1bb52152400c70f336870f968b85e89ea422198ae3"
+dependencies = [
+ "bitflags 2.13.2",
+ "indexmap",
 ]
 
 [[package]]
@@ -10374,6 +10495,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "zip"
+version = "8.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap",
+ "memchr",
+ "typed-path",
 ]
 
 [[package]]

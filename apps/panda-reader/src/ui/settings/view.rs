@@ -1,4 +1,4 @@
-use crate::ui::components::{sidebar_font, tty_icon};
+use crate::ui::components::{BundledIcon, bundled_icon, sidebar_font};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, v_flex};
@@ -23,6 +23,7 @@ impl Settings {
             SettingsPage::Translation => self
                 .render_translation_settings(owner, cx)
                 .into_any_element(),
+            SettingsPage::Plugins => self.render_plugins_settings(owner, cx).into_any_element(),
             SettingsPage::About => self.render_about_settings(owner, cx).into_any_element(),
         };
         let build_label = if cfg!(debug_assertions) {
@@ -84,7 +85,7 @@ impl Settings {
                                 owner,
                                 "settings-general",
                                 "General",
-                                tty_icon("settings"),
+                                bundled_icon(BundledIcon::Settings),
                                 SettingsPage::General,
                                 cx,
                             ))
@@ -108,15 +109,23 @@ impl Settings {
                                 owner,
                                 "settings-appearance",
                                 "Appearance",
-                                tty_icon("appearance"),
+                                bundled_icon(BundledIcon::Appearance),
                                 SettingsPage::Appearance,
+                                cx,
+                            ))
+                            .child(self.settings_nav_row(
+                                owner,
+                                "settings-plugins",
+                                "Plugins",
+                                bundled_icon(BundledIcon::Plugins),
+                                SettingsPage::Plugins,
                                 cx,
                             ))
                             .child(self.settings_nav_row(
                                 owner,
                                 "settings-about",
                                 "About",
-                                tty_icon("about"),
+                                bundled_icon(BundledIcon::About),
                                 SettingsPage::About,
                                 cx,
                             )),
@@ -192,6 +201,9 @@ impl Settings {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.settings.page = page;
                 this.settings.theme_picker_open = false;
+                if page == SettingsPage::Plugins {
+                    this.settings.refresh_plugin_list(cx);
+                }
                 cx.notify();
             }))
     }

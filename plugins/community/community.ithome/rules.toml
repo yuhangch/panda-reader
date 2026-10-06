@@ -1,0 +1,11 @@
+# Remove IT Home's standalone ticket-promotion paragraph from the article body.
+[[rules]]
+op = "remove_text"
+selector = "p"
+text = "IT之家小伙伴记得用最会买购买电影票，享受折扣价的同时还可以获得返利，预计每张票可以节省 5~15 元！"
+
+# Remove IT Home's standalone external-link advertising disclosure.
+[[rules]]
+op = "remove_text"
+selector = "p"
+text = "广告声明：文内含有的对外跳转链接（包括不限于超链接、二维码、口令等形式），用于传递更多信息，节省甄选时间，结果仅供参考，IT之家包含外链的文章均包含本声明。"

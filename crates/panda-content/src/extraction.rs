@@ -1,12 +1,13 @@
 //! Article extraction engines and the ordered cleanup pipeline.
 
+use crate::html::split_blocks;
 use ammonia::{Builder as Sanitizer, UrlRelative};
 use panda_core::ContentExtractor;
 use scraper::{Html, Selector};
 use url::Url;
 
 /// Extract, normalize, sanitize, and validate an article body.
-pub(crate) fn extract_article_html(
+pub fn extract_article_html(
     raw: &str,
     base: &str,
     article_title: &str,
@@ -28,7 +29,7 @@ pub(crate) fn extract_article_html(
 }
 
 /// Convert HTML text to a normalized representation for comparisons.
-pub(crate) fn plain_text(html: &str) -> String {
+pub fn plain_text(html: &str) -> String {
     Html::parse_fragment(html)
         .root_element()
         .text()
@@ -40,8 +41,7 @@ pub(crate) fn plain_text(html: &str) -> String {
 }
 
 /// Apply the same safety and URL-rewriting policy to RSS content and extracted pages.
-pub(crate) fn sanitize_html(html: &str, base: Option<&str>) -> String {
-    let html = strip_boilerplate_images(html);
+pub fn sanitize_html(html: &str, base: Option<&str>) -> String {
     let lower = html.to_ascii_lowercase();
     let has_embedded_media =
         lower.contains("<video") || lower.contains("<iframe") || lower.contains("<audio");
@@ -50,7 +50,6 @@ pub(crate) fn sanitize_html(html: &str, base: Option<&str>) -> String {
         sanitizer.url_relative(UrlRelative::RewriteWithBase(base));
     }
     let mut safe = sanitizer.clean(&html).to_string();
-    safe = strip_boilerplate_images(&safe);
     if has_embedded_media {
         safe.push_str("<p><em>Embedded media is unavailable here. Open the original article to view it.</em></p>");
     }
@@ -63,7 +62,7 @@ pub(crate) fn sanitize_html(html: &str, base: Option<&str>) -> String {
 /// include their page headline as the first body block even though Panda Reader
 /// already displays the feed title above the body. Only an exact match is safe:
 /// later mentions and paragraphs that continue after the headline are content.
-fn remove_leading_duplicate_title(html: &str, article_title: &str) -> String {
+pub fn remove_leading_duplicate_title(html: &str, article_title: &str) -> String {
     let title = comparable_text(article_title);
     if title.is_empty() {
         return html.to_owned();
@@ -71,7 +70,7 @@ fn remove_leading_duplicate_title(html: &str, article_title: &str) -> String {
 
     // The duplicate can be wrapped in a table or div, so compare the first
     // complete HTML block instead of assuming the page uses a heading tag.
-    let Some(block) = panda_translate::html::split_blocks(html)
+    let Some(block) = split_blocks(html)
         .into_iter()
         .find(|block| !plain_text(block).trim().is_empty())
     else {
@@ -139,7 +138,7 @@ fn trafilatura_article_html(raw: &str, base: &str) -> Option<String> {
     Some(content.to_owned())
 }
 
-fn heuristic_article_html(raw: &str) -> String {
+pub fn heuristic_article_html(raw: &str) -> String {
     let document = Html::parse_document(raw);
     let selectors = [
         "article",
@@ -208,62 +207,4 @@ fn heuristic_article_html(raw: &str) -> String {
     }
     best.map(|(_, html)| html)
         .unwrap_or_else(|| document.root_element().inner_html())
-}
-
-/// Drop site logos / WeChat share images that Readability often leaves behind.
-fn strip_boilerplate_images(html: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let mut out = String::with_capacity(html.len());
-    let mut index = 0;
-    while index < html.len() {
-        let rest_lower = &lower[index..];
-        if rest_lower.starts_with("<img") {
-            if let Some(rel) = rest_lower.find('>') {
-                let end = index + rel + 1;
-                let tag_lower = &lower[index..end];
-                if is_boilerplate_img_tag(tag_lower) {
-                    index = end;
-                    continue;
-                }
-                out.push_str(&html[index..end]);
-                index = end;
-                continue;
-            }
-        }
-        let ch = html[index..].chars().next().unwrap();
-        out.push(ch);
-        index += ch.len_utf8();
-    }
-    out
-}
-
-fn is_boilerplate_img_tag(tag_lower: &str) -> bool {
-    tag_lower.contains("wx_img")
-        || attr_contains_any(tag_lower, "id", &["logo", "qrcode", "qr-code"])
-        || attr_contains_any(tag_lower, "class", &["logo", "qrcode", "qr-code"])
-        || attr_contains_any(tag_lower, "src", &["logo", "qrcode", "qr-code"])
-}
-
-fn attr_contains_any(tag_lower: &str, name: &str, needles: &[&str]) -> bool {
-    let Some(value) = attr_value(tag_lower, name) else {
-        return false;
-    };
-    needles.iter().any(|needle| value.contains(needle))
-}
-
-fn attr_value<'a>(tag_lower: &'a str, name: &str) -> Option<&'a str> {
-    let key = format!("{name}=");
-    let start = tag_lower.find(&key)? + key.len();
-    let bytes = tag_lower.as_bytes();
-    let quote = *bytes.get(start)?;
-    if quote == b'"' || quote == b'\'' {
-        let close = tag_lower[start + 1..].find(quote as char)? + start + 1;
-        Some(&tag_lower[start + 1..close])
-    } else {
-        let end = tag_lower[start..]
-            .find(|ch: char| ch.is_whitespace() || ch == '>')
-            .map(|rel| start + rel)
-            .unwrap_or(tag_lower.len());
-        Some(&tag_lower[start..end])
-    }
 }

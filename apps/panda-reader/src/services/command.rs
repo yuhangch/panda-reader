@@ -1,6 +1,7 @@
 use panda_core::{
     ArticleCursor, MarkField, PreparedArticle, ReaderSnapshot, Scope, TranslationLayout,
 };
+use panda_plugins::{CommunityPlugin, PluginSummary};
 use panda_providers::ProviderKind;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -29,6 +30,32 @@ pub enum TitleTranslationStatus {
 }
 
 pub enum Command {
+    CommunityPluginCatalog {
+        reply: oneshot::Sender<Result<Vec<CommunityPlugin>, String>>,
+    },
+    InstallCommunityPlugin {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
+    PluginList {
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
+    ReloadPlugins {
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
+    SetPluginEnabled {
+        id: String,
+        enabled: bool,
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
+    ImportPlugin {
+        source: String,
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
+    RemovePlugin {
+        id: String,
+        reply: oneshot::Sender<Result<Vec<PluginSummary>, String>>,
+    },
     Snapshot {
         scope: Scope,
         search: String,
@@ -42,7 +69,13 @@ pub enum Command {
         show_translation: bool,
         translation_layout: TranslationLayout,
         hide_images: bool,
+        paragraph_indent: bool,
         reply: oneshot::Sender<Result<PreparedArticle, String>>,
+    },
+    SaveReadingProgress {
+        id: i64,
+        progress: f32,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     EnsureFavicon {
         host: String,
@@ -111,6 +144,7 @@ pub enum Command {
         target_lang: String,
         translation_layout: TranslationLayout,
         hide_images: bool,
+        paragraph_indent: bool,
         reply: oneshot::Sender<Result<PreparedArticle, String>>,
     },
     TranslateTitles {

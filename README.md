@@ -1,6 +1,7 @@
 # Panda Reader
 
 [![Website](https://img.shields.io/badge/Website-GitHub%20Pages-4b6b56)](https://yuhangch.github.io/panda-reader/)
+[![CI](https://github.com/yuhangch/panda-reader/actions/workflows/ci.yml/badge.svg)](https://github.com/yuhangch/panda-reader/actions/workflows/ci.yml)
 [![GPUI Kit](https://img.shields.io/badge/UI-GPUI%20Kit-0A7EA4)](https://gpui-kit.com/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#installation)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -18,6 +19,7 @@ Under the hood, Panda Reader is a desktop RSS reader built with [GPUI](https://w
 - Provider sync with [Miniflux](https://miniflux.app/) and [FreshRSS](https://freshrss.org/) ([setup](docs/providers.md))
 - Unread, starred, and read-later scopes; provider read/star state synchronization
 - Full-text extraction from the original page (manual or automatic)
+- Local article plugins for publisher-specific extraction and cleanup ([development guide](docs/plugins/README.md))
 - Extensible article translation with pluggable providers
 - Theme presets and a multilingual interface
 

@@ -1,7 +1,8 @@
-use crate::extraction::{extract_article_html, plain_text, sanitize_html};
 use anyhow::Context as _;
 use feed_rs::model::{Entry, Feed as ParsedFeed};
+use flate2::{Compression, read::ZlibDecoder, write::ZlibEncoder};
 use opml::{Head, OPML, Outline};
+use panda_content::{extract_article_html, plain_text, sanitize_html};
 use panda_core::{
     Article, ArticleCursor, ArticleSummary, ContentExtractor, Feed, MarkField, ParsedArticle,
     ReaderSnapshot, Scope,
@@ -10,6 +11,7 @@ use panda_miniflux::{Entry as RemoteEntry, Feed as RemoteFeed, Miniflux};
 use panda_providers::{ProviderClient, ProviderKind};
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
@@ -32,7 +34,11 @@ impl Store {
         }
         let connection = Connection::open(path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS feeds (
                 id INTEGER PRIMARY KEY,
@@ -58,7 +64,13 @@ impl Store {
                 published_at TEXT,
                 snippet TEXT NOT NULL DEFAULT '',
                 content_html TEXT NOT NULL DEFAULT '',
+                source_html BLOB,
+                source_page_html BLOB,
+                extraction_pipeline_hash TEXT,
                 extracted_html TEXT,
+                processed_html TEXT,
+                processed_source_hash TEXT,
+                processed_pipeline_hash TEXT,
                 is_read INTEGER NOT NULL DEFAULT 0,
                 is_starred INTEGER NOT NULL DEFAULT 0,
                 read_later INTEGER NOT NULL DEFAULT 0,
@@ -74,7 +86,32 @@ impl Store {
                 value INTEGER NOT NULL,
                 PRIMARY KEY(workspace,remote_id,field)
             );
+            CREATE TABLE IF NOT EXISTS article_reading_positions (
+                workspace TEXT NOT NULL,
+                article_id INTEGER NOT NULL,
+                progress REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(workspace,article_id)
+            );
             PRAGMA foreign_keys = ON;",
+        )?;
+        connection.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS article_fts USING fts5(
+                title, author, content_text, translated_text, tokenize='unicode61'
+             );
+             CREATE TABLE IF NOT EXISTS article_fts_state (
+                id INTEGER PRIMARY KEY CHECK(id=1), last_article_id INTEGER NOT NULL DEFAULT 0,
+                complete INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TRIGGER IF NOT EXISTS articles_fts_delete AFTER DELETE ON articles BEGIN
+                DELETE FROM article_fts WHERE rowid=old.id;
+             END;",
+        )?;
+        // A missing state row means the index may be newly created or left
+        // incomplete by a prior crash, so conservatively schedule a rebuild.
+        connection.execute(
+            "INSERT OR IGNORE INTO article_fts_state(id,last_article_id,complete) VALUES(1,0,0)",
+            [],
         )?;
         ensure_column(
             &connection,
@@ -92,6 +129,12 @@ impl Store {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(&connection, "articles", "remote_id", "INTEGER")?;
+        ensure_column(&connection, "articles", "source_html", "BLOB")?;
+        ensure_column(&connection, "articles", "source_page_html", "BLOB")?;
+        ensure_column(&connection, "articles", "extraction_pipeline_hash", "TEXT")?;
+        ensure_column(&connection, "articles", "processed_html", "TEXT")?;
+        ensure_column(&connection, "articles", "processed_source_hash", "TEXT")?;
+        ensure_column(&connection, "articles", "processed_pipeline_hash", "TEXT")?;
         ensure_column(&connection, "articles", "translated_html", "TEXT")?;
         ensure_column(&connection, "articles", "translated_title", "TEXT")?;
         ensure_column(&connection, "articles", "translated_lang", "TEXT")?;
@@ -182,7 +225,7 @@ impl Store {
             Scope::Feed(id) => ("a.feed_id=?", ScopeBind::FeedId(id)),
             Scope::Folder(name) => ("f.folder=?", ScopeBind::Folder(name)),
         };
-        let needle = format!("%{}%", search.trim());
+        let search_query = fts_query(search);
         let limit = limit.max(1);
         let cursor_pub = after
             .map(|cursor| cursor.published_at.clone().unwrap_or_default())
@@ -195,11 +238,11 @@ impl Store {
         } else {
             ""
         };
-        // Search title/author/snippet only -- never scan full HTML blobs.
+        // FTS stores sanitized plain text, keeping HTML parsing out of the read path.
         let sql = format!(
             "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles
              FROM articles a JOIN feeds f ON f.id=a.feed_id
-                 WHERE f.workspace=? AND {filter} AND (?='' OR a.title LIKE ? OR IFNULL(a.author,'') LIKE ? OR a.snippet LIKE ?)
+                 WHERE f.workspace=? AND {filter} AND (?='' OR a.id IN (SELECT rowid FROM article_fts WHERE article_fts MATCH ?))
              {cursor_filter}
              ORDER BY COALESCE(a.published_at,'') DESC,a.id DESC LIMIT {limit}"
         );
@@ -224,10 +267,8 @@ impl Store {
             })
         };
         let bind_search = |params: &mut Vec<rusqlite::types::Value>| {
-            params.push(search.trim().to_string().into());
-            params.push(needle.clone().into());
-            params.push(needle.clone().into());
-            params.push(needle.clone().into());
+            params.push(search_query.clone().into());
+            params.push(search_query.clone().into());
         };
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
         params.push(self.workspace.clone().into());
@@ -253,18 +294,67 @@ impl Store {
         })
     }
 
+    /// Index a bounded batch so an older library can become searchable without
+    /// holding up application startup or monopolizing the SQLite connection.
+    pub fn index_search_batch(&mut self, batch_size: usize) -> anyhow::Result<bool> {
+        let transaction = self.connection.transaction()?;
+        let (last_id, complete): (i64, bool) = transaction.query_row(
+            "SELECT last_article_id,complete FROM article_fts_state WHERE id=1",
+            [],
+            |row| Ok((row.get(0)?, row.get::<_, i64>(1)? != 0)),
+        )?;
+        if complete {
+            return Ok(true);
+        }
+        let rows = {
+            let mut statement =
+                transaction.prepare("SELECT id FROM articles WHERE id>?1 ORDER BY id LIMIT ?2")?;
+            statement
+                .query_map(params![last_id, batch_size.max(1) as i64], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            transaction.execute("UPDATE article_fts_state SET complete=1 WHERE id=1", [])?;
+            transaction.commit()?;
+            return Ok(true);
+        }
+        for article_id in &rows {
+            sync_article_fts(&transaction, *article_id)?;
+        }
+        transaction.execute(
+            "UPDATE article_fts_state SET last_article_id=?1 WHERE id=1",
+            [rows.last().copied().unwrap_or(last_id)],
+        )?;
+        transaction.commit()?;
+        Ok(false)
+    }
+
     pub fn article(&self, id: i64) -> anyhow::Result<Article> {
         let summary = self.summary_by_id(id)?;
         let (
             url,
             content_html,
+            source_html,
+            source_page_html,
             extracted_html,
             translated_html,
             translated_title,
             translated_lang,
             translation_source_hash,
+        ): (
+            Option<String>,
+            String,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
         ) = self.connection.query_row(
-                "SELECT url,content_html,extracted_html,translated_html,translated_title,translated_lang,translation_source_hash FROM articles WHERE id=?1",
+                "SELECT url,content_html,source_html,source_page_html,extracted_html,translated_html,translated_title,translated_lang,translation_source_hash FROM articles WHERE id=?1",
                 [id],
                 |row| {
                     Ok((
@@ -275,6 +365,8 @@ impl Store {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )?;
@@ -282,12 +374,78 @@ impl Store {
             summary,
             url,
             content_html,
+            source_html: source_html
+                .map(|bytes| decompress_html(&bytes))
+                .transpose()?,
+            source_page_html: source_page_html
+                .map(|bytes| decompress_html(&bytes))
+                .transpose()?,
             extracted_html,
+            effective_html: None,
             translated_html,
             translated_title,
             translated_lang,
             translation_source_hash,
         })
+    }
+
+    pub fn reading_progress(&self, article_id: i64) -> anyhow::Result<f32> {
+        self.connection
+            .query_row(
+                "SELECT progress FROM article_reading_positions WHERE workspace=?1 AND article_id=?2",
+                params![self.workspace, article_id],
+                |row| row.get::<_, f32>(0),
+            )
+            .optional()
+            .map(|progress| progress.unwrap_or(0.).clamp(0., 1.))
+            .map_err(Into::into)
+    }
+
+    pub fn save_reading_progress(&self, article_id: i64, progress: f32) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO article_reading_positions(workspace,article_id,progress,updated_at)
+             VALUES(?1,?2,?3,CURRENT_TIMESTAMP)
+             ON CONFLICT(workspace,article_id) DO UPDATE SET
+               progress=excluded.progress, updated_at=CURRENT_TIMESTAMP",
+            params![self.workspace, article_id, progress.clamp(0., 1.)],
+        )?;
+        Ok(())
+    }
+
+    pub fn processed_content(
+        &self,
+        article_id: i64,
+        source: &str,
+        url: &str,
+        title: &str,
+        pipeline: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let source_hash = processed_source_hash(source, url, title);
+        self.connection
+            .query_row(
+                "SELECT processed_html FROM articles WHERE id=?1 AND processed_source_hash=?2 AND processed_pipeline_hash=?3",
+                params![article_id, source_hash, pipeline],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn save_processed_content(
+        &self,
+        article_id: i64,
+        source: &str,
+        url: &str,
+        title: &str,
+        pipeline: &str,
+        processed: &str,
+    ) -> anyhow::Result<()> {
+        let source_hash = processed_source_hash(source, url, title);
+        self.connection.execute(
+            "UPDATE articles SET processed_html=?1,processed_source_hash=?2,processed_pipeline_hash=?3 WHERE id=?4",
+            params![processed, source_hash, pipeline, article_id],
+        )?;
+        Ok(())
     }
 
     pub async fn translate(
@@ -298,10 +456,27 @@ impl Store {
     ) -> anyhow::Result<Article> {
         let article = self.article(article_id)?;
         let source = article
-            .extracted_html
+            .effective_html
             .as_deref()
-            .filter(|html| !html.trim().is_empty())
-            .unwrap_or(article.content_html.as_str());
+            .or(article
+                .extracted_html
+                .as_deref()
+                .filter(|html| !html.trim().is_empty()))
+            .or(article.source_html.as_deref())
+            .unwrap_or(article.content_html.as_str())
+            .to_owned();
+        self.translate_with_source(article_id, target_lang, &source, translator)
+            .await
+    }
+
+    pub async fn translate_with_source(
+        &mut self,
+        article_id: i64,
+        target_lang: &str,
+        source: &str,
+        translator: &panda_translate::AnyTranslator,
+    ) -> anyhow::Result<Article> {
+        let article = self.article(article_id)?;
         let title = article.summary.title.trim();
         let source_hash = panda_translate::translation_cache_hash(source, title, translator.id());
         let has_body = article
@@ -348,6 +523,7 @@ impl Store {
             "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4 WHERE id=?5",
             params![result.html, result.title, target_lang, source_hash, article_id],
         )?;
+        sync_article_fts(&self.connection, article_id)?;
         if let Some(translated_title) = result
             .title
             .as_deref()
@@ -760,38 +936,49 @@ impl Store {
         entries: &[RemoteEntry],
         feed_ids: &HashMap<i64, i64>,
     ) -> anyhow::Result<usize> {
-        let transaction = self.connection.transaction()?;
         let mut saved = 0;
-        for entry in entries {
-            let Some(feed_id) = feed_ids.get(&entry.feed_id) else {
-                continue;
-            };
-            if entry.status == "removed" {
+        for batch in entries.chunks(100) {
+            let transaction = self.connection.transaction()?;
+            for entry in batch {
+                let Some(feed_id) = feed_ids.get(&entry.feed_id) else {
+                    continue;
+                };
+                if entry.status == "removed" {
+                    transaction.execute(
+                        "DELETE FROM articles WHERE remote_id=?1 AND feed_id=?2",
+                        params![entry.id, feed_id],
+                    )?;
+                    continue;
+                }
+                let source_html = compress_html(&entry.content)?;
+                let html = sanitize_html(&entry.content, entry.url.as_deref());
+                let snippet = plain_text(&html).chars().take(280).collect::<String>();
                 transaction.execute(
-                    "DELETE FROM articles WHERE remote_id=?1 AND feed_id=?2",
-                    params![entry.id, feed_id],
-                )?;
-                continue;
-            }
-            let html = sanitize_html(&entry.content, entry.url.as_deref());
-            let snippet = plain_text(&html).chars().take(280).collect::<String>();
-            transaction.execute(
-                "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,is_read,is_starred,remote_id)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+                    "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,source_html,is_read,is_starred,remote_id)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
                  ON CONFLICT(feed_id,guid) DO UPDATE SET
                     title=excluded.title,url=excluded.url,author=excluded.author,
                     published_at=excluded.published_at,snippet=excluded.snippet,
-                    content_html=excluded.content_html,is_read=excluded.is_read,
+                    content_html=excluded.content_html,
+                    source_html=CASE WHEN excluded.content_html='' THEN articles.source_html ELSE excluded.source_html END,
+                    is_read=excluded.is_read,
                     is_starred=excluded.is_starred,remote_id=excluded.remote_id",
-                params![
-                    feed_id, format!("miniflux:{}", entry.id), entry.title, entry.url,
-                    entry.author, entry.published_at, snippet, html,
-                    entry.status == "read", entry.starred, entry.id
-                ],
-            )?;
-            saved += 1;
+                    params![
+                        feed_id, format!("miniflux:{}", entry.id), entry.title, entry.url,
+                        entry.author, entry.published_at, snippet, html, source_html,
+                        entry.status == "read", entry.starred, entry.id
+                    ],
+                )?;
+                let article_id: i64 = transaction.query_row(
+                    "SELECT id FROM articles WHERE feed_id=?1 AND guid=?2",
+                    params![feed_id, format!("miniflux:{}", entry.id)],
+                    |row| row.get(0),
+                )?;
+                sync_article_fts(&transaction, article_id)?;
+                saved += 1;
+            }
+            transaction.commit()?;
         }
-        transaction.commit()?;
         Ok(saved)
     }
 
@@ -946,21 +1133,34 @@ impl Store {
             self.connection.execute("INSERT INTO feeds(feed_url,title,site_url,etag,last_modified,workspace) VALUES(?1,?2,?3,?4,?5,?6)", params![url,title,site_url,etag,modified,self.workspace])?;
             self.connection.last_insert_rowid()
         };
-        let transaction = self.connection.transaction()?;
-        for entry in feed.entries {
-            let Some(parsed) = map_entry(entry, url, site_url.as_deref()) else {
-                continue;
-            };
-            transaction.execute(
-                "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+        let mut entries = feed.entries.into_iter().peekable();
+        while entries.peek().is_some() {
+            let transaction = self.connection.transaction()?;
+            for _ in 0..100 {
+                let Some(entry) = entries.next() else {
+                    break;
+                };
+                let Some(parsed) = map_entry(entry, url, site_url.as_deref()) else {
+                    continue;
+                };
+                transaction.execute(
+                    "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,source_html)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
                  ON CONFLICT(feed_id,guid) DO UPDATE SET title=excluded.title,url=excluded.url,author=excluded.author,
                  published_at=COALESCE(excluded.published_at,articles.published_at),snippet=excluded.snippet,
-                 content_html=CASE WHEN excluded.content_html='' THEN articles.content_html ELSE excluded.content_html END",
-                params![id,parsed.guid,parsed.title,parsed.url,parsed.author,parsed.published_at,parsed.snippet,parsed.content_html],
-            )?;
+                 content_html=CASE WHEN excluded.content_html='' THEN articles.content_html ELSE excluded.content_html END,
+                 source_html=CASE WHEN excluded.source_html IS NULL OR excluded.source_html=X'' THEN articles.source_html ELSE excluded.source_html END",
+                    params![id,parsed.guid,parsed.title,parsed.url,parsed.author,parsed.published_at,parsed.snippet,parsed.content_html,compress_html(&parsed.source_html)?],
+                )?;
+                let article_id: i64 = transaction.query_row(
+                    "SELECT id FROM articles WHERE feed_id=?1 AND guid=?2",
+                    params![id, parsed.guid],
+                    |row| row.get(0),
+                )?;
+                sync_article_fts(&transaction, article_id)?;
+            }
+            transaction.commit()?;
         }
-        transaction.commit()?;
         Ok(())
     }
 
@@ -970,15 +1170,29 @@ impl Store {
         force: bool,
         extractor: ContentExtractor,
     ) -> anyhow::Result<()> {
-        let existing: Option<String> = self.connection.query_row(
-            "SELECT extracted_html FROM articles WHERE id=?1",
+        self.extract_using(article_id, force, extractor, "legacy", |_, _, _| Ok(None))
+            .await
+    }
+
+    pub async fn extract_using(
+        &mut self,
+        article_id: i64,
+        force: bool,
+        extractor: ContentExtractor,
+        pipeline_hash: &str,
+        prepare: impl FnOnce(&str, &str, &str) -> anyhow::Result<Option<(String, bool)>>,
+    ) -> anyhow::Result<()> {
+        let (existing, existing_hash, cached_page): (Option<String>, Option<String>, Option<Vec<u8>>) = self.connection.query_row(
+            "SELECT extracted_html,extraction_pipeline_hash,source_page_html FROM articles WHERE id=?1",
             [article_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         if !force
             && existing
                 .as_deref()
                 .is_some_and(|html| !html.trim().is_empty())
+            && existing_hash.is_none()
+            && cached_page.is_none()
         {
             return Ok(());
         }
@@ -987,22 +1201,59 @@ impl Store {
             [article_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let resolved = resolve_readable_url(&self.client, &url).await?;
+        let (resolved, raw) = if !force && let Some(cached) = cached_page {
+            (url.clone(), decompress_html(&cached)?)
+        } else {
+            let resolved = resolve_readable_url(&self.client, &url).await?;
+            let raw = fetch_html(&self.client, &resolved, Some("https://news.google.com/")).await?;
+            (resolved, raw)
+        };
+        let mut cache_hasher = Sha256::new();
+        cache_hasher.update(pipeline_hash.as_bytes());
+        cache_hasher.update(Sha256::digest(raw.as_bytes()));
+        let pipeline_hash = hex::encode(cache_hasher.finalize());
+        if !force
+            && existing
+                .as_deref()
+                .is_some_and(|html| !html.trim().is_empty())
+            && existing_hash.as_deref() == Some(pipeline_hash.as_str())
+        {
+            return Ok(());
+        }
         if resolved != url {
             self.connection.execute(
                 "UPDATE articles SET url=?1 WHERE id=?2",
                 params![resolved, article_id],
             )?;
         }
-        let raw = fetch_html(&self.client, &resolved, Some("https://news.google.com/")).await?;
-        let sanitized = extract_article_html(&raw, &resolved, &title, extractor);
+        let compressed_raw = compress_html(&raw)?;
+        let prepared = prepare(&raw, &resolved, &title)?;
+        let (sanitized, body_selected) = match prepared {
+            Some((html, true)) => (panda_content::sanitize_html(&html, Some(&resolved)), true),
+            Some((html, false)) => (
+                extract_article_html(&html, &resolved, &title, extractor),
+                false,
+            ),
+            None => (
+                extract_article_html(&raw, &resolved, &title, extractor),
+                false,
+            ),
+        };
+        // A selected body still needs a basic content-quality check before it can
+        // bypass the regular extractor; short or empty plugin output falls back.
+        let sanitized = if body_selected && plain_text(&sanitized).trim().len() < 80 {
+            extract_article_html(&raw, &resolved, &title, extractor)
+        } else {
+            sanitized
+        };
         if plain_text(&sanitized).trim().len() < 80 {
             anyhow::bail!("No extractable article content found on this page");
         }
         self.connection.execute(
-            "UPDATE articles SET extracted_html=?1, translated_html=NULL, translated_title=NULL, translated_lang=NULL, translation_source_hash=NULL WHERE id=?2",
-            params![sanitized, article_id],
+            "UPDATE articles SET source_page_html=?1, extracted_html=?2, extraction_pipeline_hash=?3, processed_html=NULL, processed_source_hash=NULL, processed_pipeline_hash=NULL, translated_html=NULL, translated_title=NULL, translated_lang=NULL, translation_source_hash=NULL WHERE id=?4",
+            params![compressed_raw, sanitized, pipeline_hash, article_id],
         )?;
+        sync_article_fts(&self.connection, article_id)?;
         Ok(())
     }
 
@@ -1094,6 +1345,115 @@ impl Store {
         }
         Ok(document.to_string()?)
     }
+}
+
+fn compress_html(html: &str) -> anyhow::Result<Vec<u8>> {
+    if html.len() > 8 * 1024 * 1024 {
+        anyhow::bail!("article source exceeds the 8 MiB limit");
+    }
+    use std::io::Write as _;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(html.as_bytes())?;
+    Ok(encoder.finish()?)
+}
+
+fn processed_source_hash(source: &str, url: &str, title: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.update([0]);
+    hasher.update(url.as_bytes());
+    hasher.update([0]);
+    hasher.update(title.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn decompress_html(compressed: &[u8]) -> anyhow::Result<String> {
+    use std::io::Read as _;
+    let mut decoder = ZlibDecoder::new(compressed);
+    let mut bytes = Vec::new();
+    decoder
+        .by_ref()
+        .take(8 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        anyhow::bail!("stored article source exceeds the 8 MiB limit");
+    }
+    String::from_utf8(bytes).context("stored article source is not UTF-8")
+}
+
+fn sync_article_fts(connection: &Connection, article_id: i64) -> anyhow::Result<()> {
+    let article = connection
+        .query_row(
+            "SELECT title,author,content_html,extracted_html,translated_html FROM articles WHERE id=?1",
+            [article_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((title, author, content_html, extracted_html, translated_html)) = article else {
+        connection.execute("DELETE FROM article_fts WHERE rowid=?1", [article_id])?;
+        return Ok(());
+    };
+    let source_html = extracted_html
+        .filter(|html| !html.trim().is_empty())
+        .unwrap_or(content_html);
+    let content_text = plain_text(&source_html);
+    let translated_text = translated_html
+        .as_deref()
+        .filter(|html| !html.trim().is_empty())
+        .map(plain_text)
+        .unwrap_or_default();
+    connection.execute("DELETE FROM article_fts WHERE rowid=?1", [article_id])?;
+    connection.execute(
+        "INSERT INTO article_fts(rowid,title,author,content_text,translated_text) VALUES(?1,?2,?3,?4,?5)",
+        params![
+            article_id,
+            cjk_token_text(&title),
+            cjk_token_text(author.as_deref().unwrap_or_default()),
+            cjk_token_text(&content_text),
+            cjk_token_text(&translated_text),
+        ],
+    )?;
+    Ok(())
+}
+
+fn fts_query(search: &str) -> String {
+    let normalized = cjk_token_text(search.trim());
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("\"{}\"", normalized.replace('"', "\"\""))
+    }
+}
+
+// Separate adjacent Han characters for unicode61 so CJK searches can match
+// short phrases instead of requiring the entire uninterrupted run to match.
+fn cjk_token_text(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut previous_was_han = false;
+    for character in value.chars() {
+        let is_han = matches!(
+            character as u32,
+            0x3400..=0x4DBF
+                | 0x4E00..=0x9FFF
+                | 0xF900..=0xFAFF
+                | 0x20000..=0x2FA1F
+                | 0x30000..=0x323AF
+        );
+        if is_han && previous_was_han {
+            output.push(' ');
+        }
+        output.push(character);
+        previous_was_han = is_han;
+    }
+    output
 }
 
 fn ensure_column(
@@ -1229,6 +1589,7 @@ fn map_entry(entry: Entry, feed_url: &str, site_url: Option<&str>) -> Option<Par
                 .map(|summary| summary.content.clone())
         })
         .unwrap_or_default();
+    let source_html = raw_html.clone();
     let safe_html = sanitize_html(&raw_html, Some(base));
     let snippet = entry
         .summary
@@ -1252,6 +1613,7 @@ fn map_entry(entry: Entry, feed_url: &str, site_url: Option<&str>) -> Option<Par
         published_at,
         snippet,
         content_html: safe_html,
+        source_html,
     })
 }
 
@@ -1462,6 +1824,111 @@ mod tests {
         let store = Store::open_workspace(&directory.path().join("reader.sqlite3"), workspace)
             .expect("open test database");
         (directory, store)
+    }
+
+    #[test]
+    fn full_text_search_covers_metadata_body_translation_and_cjk_then_tracks_changes() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(id,feed_id,guid,title,author,content_html,translated_html) VALUES(1,1,'one','湖南大学找到植物生长开关','Ada Lovelace','<p>the original article body contains quantum foam</p>','<p>译文里有月球基地</p>')",
+                [],
+            )
+            .unwrap();
+        sync_article_fts(&store.connection, 1).unwrap();
+
+        for query in ["湖南大学", "quantum foam", "月球基地", "Ada Lovelace"] {
+            assert_eq!(
+                store
+                    .snapshot(Scope::All, query, 20, None, false)
+                    .unwrap()
+                    .articles
+                    .len(),
+                1,
+                "query should match: {query}"
+            );
+        }
+
+        store
+            .connection
+            .execute(
+                "UPDATE articles SET extracted_html='<p>replacement body about ocean currents</p>' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        sync_article_fts(&store.connection, 1).unwrap();
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "quantum foam", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "ocean currents", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            1
+        );
+        store
+            .connection
+            .execute("DELETE FROM articles WHERE id=1", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "ocean currents", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn historical_search_index_is_built_in_batches() {
+        let (directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(id,feed_id,guid,title,content_html) VALUES(1,1,'one','A title','<p>historical material</p>')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute_batch("DROP TABLE article_fts; DROP TABLE article_fts_state;")
+            .unwrap();
+        drop(store);
+        let mut store =
+            Store::open_workspace(&directory.path().join("reader.sqlite3"), "local").unwrap();
+        assert!(!store.index_search_batch(1).unwrap());
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "historical material", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            1
+        );
+        assert!(store.index_search_batch(1).unwrap());
     }
 
     #[test]
@@ -1916,20 +2383,6 @@ mod tests {
     }
 
     #[test]
-    fn strips_site_logo_and_wechat_share_images() {
-        let source = r#"<p>Body</p>
-<img id="wx_img" src="https://www.qbitai.com/wp-content/uploads/imgs/qbitai-logo-1.png" width="400" height="400">
-<img src="https://cdn.example.com/photos/article-hero.jpg" alt="hero">
-<img class="site-logo" src="https://cdn.example.com/brand.png">"#;
-        let safe = sanitize_html(source, Some("https://www.qbitai.com/post"));
-        assert!(safe.contains("article-hero.jpg"));
-        assert!(!safe.contains("wx_img"));
-        assert!(!safe.contains("qbitai-logo"));
-        assert!(!safe.contains("site-logo"));
-        assert!(!safe.contains("brand.png"));
-    }
-
-    #[test]
     fn article_search_and_smart_views_follow_saved_state() {
         let (_directory, store) = test_store();
         store
@@ -1942,7 +2395,7 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO articles(feed_id,guid,title,snippet,is_starred,read_later) VALUES(1,'a','Rust 阅读器','GPUI 和文章搜索',1,0)",
+                "INSERT INTO articles(feed_id,guid,title,snippet,content_html,is_starred,read_later) VALUES(1,'a','Rust 阅读器','GPUI 和文章搜索','<p>GPUI 和文章搜索</p>',1,0)",
                 [],
             )
             .unwrap();
@@ -1953,6 +2406,17 @@ mod tests {
                 [],
             )
             .unwrap();
+        let ids = store
+            .connection
+            .prepare("SELECT id FROM articles")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for id in ids {
+            sync_article_fts(&store.connection, id).unwrap();
+        }
 
         let all = store.snapshot(Scope::All, "搜索", 500, None, true).unwrap();
         assert_eq!(all.articles.len(), 1);
@@ -2084,6 +2548,171 @@ mod tests {
             "https://example.com/feed.xml"
         );
         assert!(normalize_http_url("file:///etc/passwd").is_err());
+    }
+
+    #[test]
+    fn raw_feed_html_is_compressed_and_available_for_offline_processing() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/feed.xml','Example')",
+                [],
+            )
+            .unwrap();
+        let original = "<article><p>Raw source kept for plugins</p></article>";
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(feed_id,guid,title,content_html,source_html) VALUES(1,'entry','Title','<p>sanitized</p>',?1)",
+                [compress_html(original).unwrap()],
+            )
+            .unwrap();
+
+        let article = store.article(1).unwrap();
+        assert_eq!(article.source_html.as_deref(), Some(original));
+        assert_eq!(article.content_html, "<p>sanitized</p>");
+    }
+
+    #[test]
+    fn processed_content_cache_invalidates_on_source_url_title_or_pipeline_change() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/feed.xml','Example')",
+                [],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(feed_id,guid,title) VALUES(1,'entry','Title')",
+                [],
+            )
+            .unwrap();
+        assert!(
+            store
+                .processed_content(
+                    1,
+                    "<p>raw</p>",
+                    "https://example.com/1",
+                    "Title",
+                    "plugins-v1"
+                )
+                .unwrap()
+                .is_none()
+        );
+        store
+            .save_processed_content(
+                1,
+                "<p>raw</p>",
+                "https://example.com/1",
+                "Title",
+                "plugins-v1",
+                "<p>cleaned</p>",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .processed_content(
+                    1,
+                    "<p>raw</p>",
+                    "https://example.com/1",
+                    "Title",
+                    "plugins-v1"
+                )
+                .unwrap()
+                .as_deref(),
+            Some("<p>cleaned</p>")
+        );
+        assert!(
+            store
+                .processed_content(
+                    1,
+                    "<p>raw</p>",
+                    "https://example.com/2",
+                    "Title",
+                    "plugins-v1"
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .processed_content(
+                    1,
+                    "<p>raw</p>",
+                    "https://example.com/1",
+                    "Title",
+                    "plugins-v2"
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_page_can_be_reprocessed_offline_and_skips_unchanged_pipeline() {
+        let (_directory, mut store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/feed.xml','Example')",
+                [],
+            )
+            .unwrap();
+        let text = "A recovered article paragraph with enough detail for the standard full-text quality threshold. ".repeat(2);
+        let raw = format!("<html><body><nav>Page chrome</nav><p>{text}</p></body></html>");
+        let selected = format!("<p>{text}</p>");
+        store
+            .connection
+            .execute(
+                "INSERT INTO articles(feed_id,guid,title,url,content_html,source_page_html,extracted_html,extraction_pipeline_hash) VALUES(1,'entry','Title','https://127.0.0.1:1/story','<p>old</p>',?1,'<p>old extracted</p>','old-pipeline')",
+                [compress_html(&raw).unwrap()],
+            )
+            .unwrap();
+
+        store
+            .extract_using(
+                1,
+                false,
+                ContentExtractor::DomSmoothie,
+                "new-pipeline",
+                |source, _, _| {
+                    assert_eq!(source, raw);
+                    Ok(Some((selected.clone(), true)))
+                },
+            )
+            .await
+            .unwrap();
+        let updated = store.article(1).unwrap();
+        assert!(
+            updated
+                .extracted_html
+                .unwrap()
+                .contains("recovered article paragraph")
+        );
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "recovered article paragraph", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            1,
+            "a completed full-text extraction must refresh the FTS row"
+        );
+
+        store
+            .extract_using(
+                1,
+                false,
+                ContentExtractor::DomSmoothie,
+                "new-pipeline",
+                |_, _, _| panic!("unchanged pipeline should reuse the stored extraction"),
+            )
+            .await
+            .unwrap();
     }
 
     #[test]

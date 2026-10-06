@@ -4,15 +4,21 @@ use panda_core::{Article, TranslationLayout};
 use panda_translate::html::split_blocks;
 use std::collections::{HashMap, HashSet};
 
+pub const TRANSLATION_MARKER_START: &str = "PANDA_READER_TRANSLATION_START_7D3A";
+pub const TRANSLATION_MARKER_END: &str = "PANDA_READER_TRANSLATION_END_7D3A";
+
 pub fn prepare_body(
     article: &Article,
     show_translation: bool,
     layout: TranslationLayout,
     hide_images: bool,
+    paragraph_indent: bool,
 ) -> String {
     let original = article
-        .extracted_html
+        .effective_html
         .as_deref()
+        .or(article.extracted_html.as_deref())
+        .or(article.source_html.as_deref())
         .unwrap_or(&article.content_html);
     let translated = article
         .translated_html
@@ -40,7 +46,7 @@ pub fn prepare_body(
         body
     };
     let flat = flatten_reader_html(&prepared);
-    with_paragraph_indent(&flat)
+    with_paragraph_indent(&flat, paragraph_indent)
 }
 
 pub fn bilingual_html(original: &str, translated: &str) -> String {
@@ -96,18 +102,9 @@ fn repair_cached_translation(original: &str, translated: &str) -> String {
 }
 
 fn as_translation_follow(block: &str) -> String {
-    let inner = inner_html(block).unwrap_or(block);
-    format!("<blockquote>{inner}</blockquote>")
-}
-
-fn inner_html(block: &str) -> Option<&str> {
-    let trimmed = block.trim();
-    let open_end = trimmed.find('>')?;
-    let close_start = trimmed.rfind("</")?;
-    if close_start <= open_end + 1 {
-        return None;
-    }
-    Some(&trimmed[open_end + 1..close_start])
+    format!(
+        "<p>{TRANSLATION_MARKER_START}</p>{block}<p>{TRANSLATION_MARKER_END}</p>"
+    )
 }
 
 fn strip_images(html: &str) -> String {
@@ -194,7 +191,7 @@ fn flatten_reader_html(html: &str) -> String {
         .to_string()
 }
 
-fn with_paragraph_indent(html: &str) -> String {
+fn with_paragraph_indent(html: &str, enabled: bool) -> String {
     const INDENT: &str = "\u{3000}\u{3000}";
     let bytes = html.as_bytes();
     let mut out = String::with_capacity(html.len() + 64);
@@ -224,7 +221,7 @@ fn with_paragraph_indent(html: &str) -> String {
                     || content.starts_with("<h2")
                     || content.starts_with("<h3")
                     || content.starts_with("<h4");
-                if !skip {
+                if !skip && enabled {
                     out.push_str(INDENT);
                 }
                 i = end + indent_len;
@@ -289,29 +286,32 @@ mod tests {
     fn pairs_paragraphs_bilingually() {
         let html = bilingual_html("<p>Hello</p><p>World</p>", "<p>你好</p><p>世界</p>");
         assert!(html.contains("<p>Hello</p>"));
-        assert!(html.contains("<blockquote>你好</blockquote>"));
+        assert!(html.contains("<p>你好</p>"));
+        assert!(!html.contains("<blockquote>"));
+        assert!(html.contains(TRANSLATION_MARKER_START));
     }
 
     #[test]
     fn strips_leading_spaces_before_indent() {
-        let html = with_paragraph_indent("<p>  hello</p>");
+        let html = with_paragraph_indent("<p>  hello</p>", true);
         assert!(html.starts_with("<p>\u{3000}\u{3000}hello</p>"));
     }
 
     #[test]
     fn reading_modes_keep_the_expected_original_and_translation() {
         let article = test_article();
-        let original = prepare_body(&article, false, TranslationLayout::Immersive, false);
+        let original = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
         assert!(original.contains("Original"));
         assert!(!original.contains("译文"));
         assert!(original.contains("<img"));
 
-        let bilingual = prepare_body(&article, true, TranslationLayout::Immersive, true);
+        let bilingual = prepare_body(&article, true, TranslationLayout::Immersive, true, true);
         assert!(bilingual.contains("Original"));
-        assert!(bilingual.contains("<blockquote>译文</blockquote>"));
+        assert!(bilingual.contains("<p>译文</p>"));
+        assert!(!bilingual.contains("<blockquote>"));
         assert!(!bilingual.contains("<img"));
 
-        let replaced = prepare_body(&article, true, TranslationLayout::Replaced, false);
+        let replaced = prepare_body(&article, true, TranslationLayout::Replaced, false, true);
         assert!(!replaced.contains("Original"));
         assert!(replaced.contains("译文"));
     }
@@ -321,7 +321,7 @@ mod tests {
         let mut article = test_article();
         article.extracted_html = Some("<p>Full article</p>".into());
         article.translated_html = None;
-        let prepared = prepare_body(&article, true, TranslationLayout::Replaced, false);
+        let prepared = prepare_body(&article, true, TranslationLayout::Replaced, false, true);
         assert!(prepared.contains("Full article"));
         assert!(!prepared.contains("Original"));
     }
@@ -330,11 +330,11 @@ mod tests {
     fn empty_content_escapes_the_preview_and_unsafe_html_is_removed() {
         let mut article = test_article();
         article.content_html.clear();
-        let empty = prepare_body(&article, false, TranslationLayout::Immersive, false);
+        let empty = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
         assert!(empty.contains("&lt;example&gt; &amp; preview"));
 
         article.content_html = "<p onclick=\"evil()\">Read me</p><script>evil()</script>".into();
-        let prepared = prepare_body(&article, false, TranslationLayout::Immersive, false);
+        let prepared = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
         assert!(prepared.contains("Read me"));
         assert!(!prepared.contains("onclick"));
         assert!(!prepared.contains("script"));

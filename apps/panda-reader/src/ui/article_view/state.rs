@@ -6,6 +6,12 @@ use panda_core::{Article, TranslationLayout};
 pub(in crate::ui) struct ArticleView {
     pub(in crate::ui) article: Option<Article>,
     pub(in crate::ui) body_html: SharedString,
+    pub(in crate::ui) body_markdown: SharedString,
+    pub(in crate::ui) image_urls: Vec<String>,
+    pub(in crate::ui) image_viewer_url: Option<String>,
+    pub(in crate::ui) scroll: ScrollHandle,
+    pub(in crate::ui) restore_progress: Option<f32>,
+    pub(in crate::ui) progress_epoch: u64,
     pub(in crate::ui) showing_translation: bool,
     pub(in crate::ui) request_epoch: RequestEpoch,
     pub(in crate::ui) is_extracting: bool,

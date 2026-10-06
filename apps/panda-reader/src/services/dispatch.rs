@@ -2,6 +2,31 @@ use super::{command::Command, worker::WorkerState};
 
 pub(super) fn handle(command: Command, state: &WorkerState) {
     match command {
+        Command::CommunityPluginCatalog { reply } => {
+            super::worker::community_plugin_catalog(reply);
+        }
+        Command::InstallCommunityPlugin { id, reply } => {
+            super::worker::install_community_plugin(id, reply, state);
+        }
+        Command::PluginList { reply } => {
+            let _ = reply.send(state.plugin_list().map_err(|error| error.to_string()));
+        }
+        Command::ReloadPlugins { reply } => {
+            let _ = reply.send(state.reload_plugins().map_err(|error| error.to_string()));
+        }
+        Command::SetPluginEnabled { id, enabled, reply } => {
+            let _ = reply.send(
+                state
+                    .set_plugin_enabled(&id, enabled)
+                    .map_err(|error| error.to_string()),
+            );
+        }
+        Command::ImportPlugin { source, reply } => {
+            super::worker::import_plugin(source, reply, state);
+        }
+        Command::RemovePlugin { id, reply } => {
+            let _ = reply.send(state.remove_plugin(&id).map_err(|error| error.to_string()));
+        }
         Command::Snapshot {
             scope,
             search,
@@ -15,15 +40,22 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
             show_translation,
             translation_layout,
             hide_images,
+            paragraph_indent,
             reply,
         } => super::articles::article(
             id,
             show_translation,
             translation_layout,
             hide_images,
+            paragraph_indent,
             reply,
             state,
         ),
+        Command::SaveReadingProgress {
+            id,
+            progress,
+            reply,
+        } => super::articles::save_reading_progress(id, progress, reply, state),
         Command::MarkAllRead { scope, reply } => {
             super::articles::mark_all_read(scope, reply, state)
         }
@@ -44,12 +76,14 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
             target_lang,
             translation_layout,
             hide_images,
+            paragraph_indent,
             reply,
         } => super::articles::translate(
             id,
             target_lang,
             translation_layout,
             hide_images,
+            paragraph_indent,
             reply,
             state,
         ),

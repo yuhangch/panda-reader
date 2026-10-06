@@ -1,0 +1,10 @@
+# ScienceNet places its page headline in row three of the outer header table.
+[[rules]]
+op = "remove"
+selector = "body > div > div > table:first-of-type > tbody > tr:nth-child(3)"
+
+# ScienceNet repeats this legal notice in article HTML; inline styles are stripped before cleanup.
+[[rules]]
+op = "remove_text"
+selector = "*"
+text = "特别声明：本文转载仅仅是出于传播信息的需要，并不意味着代表本网站观点或证实其内容的真实性；如其他媒体、网站或个人从本网站转载使用，须保留本网站注明的“来源”，并自负版权等法律责任；作者如果不希望被转载或者联系转载稿费等事宜，请与我们接洽。"

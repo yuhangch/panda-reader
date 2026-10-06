@@ -4,6 +4,7 @@ mod about;
 mod actions;
 mod appearance;
 mod general;
+mod plugins;
 mod reading;
 mod selectors;
 mod state;

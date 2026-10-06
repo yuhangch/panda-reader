@@ -1,0 +1,7 @@
+[[rules]]
+op = "remove"
+selector = ".content_left_time"
+
+[[rules]]
+op = "remove"
+selector = ".change_font_size"

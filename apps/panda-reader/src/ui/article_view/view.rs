@@ -1,7 +1,8 @@
-use crate::ui::components::{article_font, preview_text, tty_icon};
+use crate::app::preferences::ReaderFontFamily;
+use crate::ui::components::{BundledIcon, article_font_family, bundled_icon, preview_text};
 use crate::ui::window::ReaderWindow;
-use chrono::DateTime;
 use gpui_kit::base::StyledExt as _;
+use gpui_kit::base::text::{MarkdownNode, MarkdownPlugin, markdown_ast};
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -32,6 +33,7 @@ impl ArticleView {
             let summary = &article.summary;
             let id = summary.id;
             let menu_app = cx.entity().downgrade();
+            let image_viewer_app = cx.entity().downgrade();
             let menu_article = summary.clone();
             let language = owner.preferences.language;
             let star_label = owner.t(if summary.is_starred {
@@ -66,7 +68,11 @@ impl ArticleView {
                     Button::new("toggle-star")
                         .small()
                         .ghost()
-                        .icon(tty_icon(if starred { "star-fill" } else { "star" }))
+                        .icon(bundled_icon(if starred {
+                            BundledIcon::StarFill
+                        } else {
+                            BundledIcon::Star
+                        }))
                         .tooltip(star_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.mark(id, MarkField::Starred, next_starred, cx)
@@ -76,10 +82,10 @@ impl ArticleView {
                     Button::new("toggle-hide-images")
                         .small()
                         .ghost()
-                        .icon(tty_icon(if owner.preferences.hide_images {
-                            "image-off"
+                        .icon(bundled_icon(if owner.preferences.hide_images {
+                            BundledIcon::ImageOff
                         } else {
-                            "image"
+                            BundledIcon::Image
                         }))
                         .tooltip(owner.t(if owner.preferences.hide_images {
                             "Show images"
@@ -92,10 +98,10 @@ impl ArticleView {
                     Button::new("toggle-later")
                         .small()
                         .ghost()
-                        .icon(tty_icon(if read_later {
-                            "bookmark-check"
+                        .icon(bundled_icon(if read_later {
+                            BundledIcon::BookmarkCheck
                         } else {
-                            "bookmark"
+                            BundledIcon::Bookmark
                         }))
                         .tooltip(later_label)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -155,7 +161,7 @@ impl ArticleView {
                     Button::new("share-article")
                         .small()
                         .ghost()
-                        .icon(tty_icon("share"))
+                        .icon(bundled_icon(BundledIcon::Share))
                         .tooltip(owner.t("Share link"))
                         .on_click(cx.listener(|this, _, _, cx| this.share_article(cx))),
                 );
@@ -170,11 +176,9 @@ impl ArticleView {
                         .on_click(move |_, _, cx| cx.open_url(&url)),
                 );
             }
-            let published = summary
-                .published_at
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.format("%Y-%m-%d").to_string());
+            let published = summary.published_at.as_deref().and_then(|value| {
+                super::super::date::format_published_at(value, owner.preferences.language, true)
+            });
             let mut meta = summary.feed_title.clone();
             if let Some(author) = summary
                 .author
@@ -192,14 +196,14 @@ impl ArticleView {
                 color: Some(cx.theme().foreground),
                 ..Default::default()
             });
-            article_style = article_style.paragraph_gap(rems(1.35)).heading_font_size(
-                |level, base| match level {
+            article_style = article_style
+                .paragraph_gap(rems(owner.preferences.reader_paragraph_spacing))
+                .heading_font_size(|level, base| match level {
                     1 => base * 1.55,
                     2 => base * 1.35,
                     3 => base * 1.2,
                     _ => base,
-                },
-            );
+                });
             let heading = v_flex()
                 .gap_2()
                 .pt_4()
@@ -215,7 +219,9 @@ impl ArticleView {
                     .selectable(true)
                     .text_3xl()
                     .font_semibold()
-                    .font(article_font()),
+                    .font(article_font_family(
+                        owner.preferences.reader_font_family == ReaderFontFamily::Serif,
+                    )),
                 )
                 .when_some(
                     self.display_translated_title(article, &owner.preferences),
@@ -224,7 +230,9 @@ impl ArticleView {
                             TextView::html("article-translated-title", escape_html_text(&title))
                                 .selectable(true)
                                 .text_xl()
-                                .font(article_font())
+                                .font(article_font_family(
+                                    owner.preferences.reader_font_family == ReaderFontFamily::Serif,
+                                ))
                                 .text_color(cx.theme().muted_foreground),
                         )
                     },
@@ -312,24 +320,75 @@ impl ArticleView {
                                 .left_0(),
                             )
                             .child(
-                                v_flex()
-                                    .size_full()
-                                    .max_w(px(680.))
-                                    .mx_auto()
-                                    .px(px(48.))
-                                    .child(heading)
+                                div()
+                                    .id("article-body-scroll")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .w_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.scroll)
+                                    .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                                        this.schedule_reading_progress_save(cx);
+                                    }))
                                     .child(
-                                        div().flex_1().min_h_0().w_full().child(
-                                            TextView::html("article-body", self.body_html.clone())
-                                                .scrollable(true)
-                                                // Scrollbar is overlaid (absolute inset); keep
-                                                // text clear of the ~16px thumb track.
-                                                .pr(px(20.))
-                                                .font(article_font())
+                                        v_flex()
+                                            .w_full()
+                                            .max_w(px(owner.preferences.reader_content_width))
+                                            .mx_auto()
+                                            .px(px(48.))
+                                            .child(heading)
+                                            .child(
+                                                TextView::markdown(
+                                                    "article-body",
+                                                    self.body_markdown.clone(),
+                                                )
+                                                .plugin(TranslationMarkdown {
+                                                    style: article_style.clone(),
+                                                    font: article_font_family(
+                                                        owner.preferences.reader_font_family
+                                                            == ReaderFontFamily::Serif,
+                                                    ),
+                                                    font_size: px(
+                                                        owner.preferences.reader_font_size,
+                                                    ),
+                                                    line_height: rems(
+                                                        owner.preferences.reader_line_height,
+                                                    ),
+                                                })
+                                                .scrollable(false)
+                                                .w_full()
+                                                .font(article_font_family(
+                                                    owner.preferences.reader_font_family
+                                                        == ReaderFontFamily::Serif,
+                                                ))
+                                                .text_size(px(owner.preferences.reader_font_size))
+                                                .line_height(rems(
+                                                    owner.preferences.reader_line_height,
+                                                ))
                                                 .style(article_style)
                                                 .pb_12()
-                                                .on_link_click(|url, _, _, cx| cx.open_url(url)),
-                                        ),
+                                                .on_link_click(move |url, _, _, cx| {
+                                                    if let Some(index) =
+                                                        url.strip_prefix("panda-image://").and_then(
+                                                            |index| index.parse::<usize>().ok(),
+                                                        )
+                                                    {
+                                                        let _ = image_viewer_app.update(
+                                                            cx,
+                                                            |this, cx| {
+                                                                this.reader.image_viewer_url = this
+                                                                    .reader
+                                                                    .image_urls
+                                                                    .get(index)
+                                                                    .cloned();
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    } else {
+                                                        cx.open_url(url);
+                                                    }
+                                                }),
+                                            ),
                                     ),
                             ),
                     ),
@@ -355,6 +414,56 @@ impl ArticleView {
             );
         }
         reader
+    }
+}
+
+struct TranslationMarkdown {
+    style: TextViewStyle,
+    font: gpui::Font,
+    font_size: gpui::Pixels,
+    line_height: gpui::Rems,
+}
+
+impl MarkdownPlugin for TranslationMarkdown {
+    fn is_block(&self) -> bool {
+        true
+    }
+
+    fn name(&self) -> &str {
+        "panda-translation"
+    }
+
+    fn parse(
+        &self,
+        node: &markdown_ast::Node,
+        _cx: &gpui_kit::base::text::MarkdownParseContext<'_>,
+    ) -> Option<MarkdownNode> {
+        let markdown_ast::Node::Code(code) = node else {
+            return None;
+        };
+        (code.lang.as_deref() == Some("panda-translation")).then(|| {
+            MarkdownNode::new("panda-translation", ())
+                .text(code.value.clone())
+                .markdown(code.value.clone())
+        })
+    }
+
+    fn render(
+        &self,
+        node: &MarkdownNode,
+        _window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> impl IntoElement {
+        let id = node
+            .source_range()
+            .map(|range| format!("article-translation-{}", range.start))
+            .unwrap_or_else(|| "article-translation".to_owned());
+        TextView::markdown(id, node.as_markdown().to_owned())
+            .font(self.font.clone())
+            .text_size(self.font_size)
+            .line_height(self.line_height)
+            .style(self.style.clone())
+            .text_color(cx.theme().muted_foreground)
     }
 }
 

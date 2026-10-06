@@ -1,0 +1,9 @@
+id = "example.article-cleanup"
+name = "Example article cleanup"
+version = "1.0.0"
+api_version = 1
+kind = "rules"
+domains = ["example.com"]
+stage = "cleanup"
+priority = 10
+capabilities = ["document_read", "document_write"]

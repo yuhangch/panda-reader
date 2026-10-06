@@ -1,0 +1,10 @@
+id = "community.sciencenet"
+name = "ScienceNet"
+version = "1.1.2"
+api_version = 1
+min_app_version = "0.2.0"
+kind = "rules"
+domains = ["*.sciencenet.cn"]
+stage = "cleanup"
+priority = 20
+capabilities = ["document_read", "document_write"]

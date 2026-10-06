@@ -69,6 +69,23 @@ impl Settings {
                     ),
             )
             .child(update_status(owner, cx))
+            .when(self.community_plugins_checked && self.community_plugin_error.is_none(), |view| {
+                let available = self.community_update_count();
+                view.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if available == 0 {
+                            owner.t("Community plugins are up to date.").to_owned()
+                        } else {
+                            i18n::format(
+                                owner.preferences.language,
+                                "{} community plugin update(s) available. Open Plugins to update.",
+                                &available.to_string(),
+                            )
+                        }),
+                )
+            })
             .child(
                 h_flex()
                     .gap_2()

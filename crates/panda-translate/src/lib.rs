@@ -4,7 +4,9 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 mod azure;
-pub mod html;
+pub mod html {
+    pub use panda_content::html::*;
+}
 mod volcengine;
 
 pub use azure::AzureTranslator;

@@ -24,3 +24,7 @@ The GitHub Actions workflow additionally builds the desktop app on Windows, macO
 ## Adding a provider
 
 Implement the provider in `crates/panda-providers`, document supported operations and limitations, and add mock HTTP tests for authentication, pagination, state updates, feed changes, and API errors. Ensure its data is stored in a distinct workspace.
+
+## Adding a community article plugin
+
+Use the repository [Panda Reader plugin skill](.agents/skills/panda-reader-plugin/SKILL.md) when authoring a site-specific rule. Community plugins live under `plugins/community/community.<site>/`. Bump the plugin version when its behavior changes, then regenerate the catalog with `python scripts/generate_community_plugin_index.py`. CI checks the generated `index.json` and payload hashes.

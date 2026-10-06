@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "plugins": [
+    {
+      "id": "community.chinanews",
+      "name": "中国新闻网",
+      "version": "1.0.0",
+      "api_version": 1,
+      "min_app_version": "0.2.0",
+      "kind": "rules",
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.chinanews/manifest.toml",
+          "sha256": "c06ee6ac502d6b043f9dbe5f47e85b3cb0e82019790ce6d02376daaf37bdad67"
+        },
+        "rules.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.chinanews/rules.toml",
+          "sha256": "f133a2e858f216897875cb00803de367cf62ee7ea5a21f7b231b6c594fa65b73"
+        }
+      }
+    },
+    {
+      "id": "community.ithome",
+      "name": "IT之家",
+      "version": "1.0.0",
+      "api_version": 1,
+      "min_app_version": "0.2.0",
+      "kind": "rules",
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.ithome/manifest.toml",
+          "sha256": "c0041c71981ccce298e3549933ca8a82900a1e8968ef0eabe23c245e6fa8aad9"
+        },
+        "rules.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.ithome/rules.toml",
+          "sha256": "36a8afccfe5f686edbf42dfe99d8c0138c4a2173bfc36e248bf1550c736bc908"
+        }
+      }
+    },
+    {
+      "id": "community.qbitai",
+      "name": "QbitAI",
+      "version": "1.0.2",
+      "api_version": 1,
+      "min_app_version": "0.2.0",
+      "kind": "rules",
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.qbitai/manifest.toml",
+          "sha256": "972567e1a95d3c3840920dcc798e4ad6a1f7911af30feedd4ffed88e1f76fec9"
+        },
+        "rules.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.qbitai/rules.toml",
+          "sha256": "834943d7d0a9c0fc752761117180c45148fc860fbd05c69783bc100972b68d8a"
+        }
+      }
+    },
+    {
+      "id": "community.sciencenet",
+      "name": "ScienceNet",
+      "version": "1.1.2",
+      "api_version": 1,
+      "min_app_version": "0.2.0",
+      "kind": "rules",
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.sciencenet/manifest.toml",
+          "sha256": "ce80c46e4408c0232e4e49d9b7512e1f0d33168c243cbb9c51e26743fffc83fb"
+        },
+        "rules.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.sciencenet/rules.toml",
+          "sha256": "299c43e19d8061d2309e1746ff3f608bd3246b8ffa14a46288d326fae44595cb"
+        }
+      }
+    },
+    {
+      "id": "community.wechat",
+      "name": "WeChat",
+      "version": "1.0.0",
+      "api_version": 1,
+      "min_app_version": "0.2.0",
+      "kind": "rules",
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.wechat/manifest.toml",
+          "sha256": "b877a6a43a5a32b9362802a6b006680882825380dd5a8e192409138be4d98357"
+        },
+        "rules.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.wechat/rules.toml",
+          "sha256": "e0ed2a45577682d4633199c15773e41b88be5cfe89e2bdf8d4d34814b83a4596"
+        }
+      }
+    }
+  ]
+}

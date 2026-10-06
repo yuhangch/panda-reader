@@ -31,7 +31,13 @@ impl ReaderWindow {
     }
 
     pub(in crate::ui) fn open_article(&mut self, id: i64, cx: &mut Context<Self>) {
+        self.save_current_reading_progress();
         let revision = self.reader.request_epoch.next();
+        self.reader.progress_epoch = self.reader.progress_epoch.wrapping_add(1);
+        self.reader.restore_progress = None;
+        self.reader.image_viewer_url = None;
+        self.reader.image_urls.clear();
+        self.reader.scroll.set_offset(point(px(0.), px(0.)));
         self.reader.is_extracting = false;
         let (reply, response) = oneshot::channel();
         self.services.send(Command::Article {
@@ -39,6 +45,7 @@ impl ReaderWindow {
             show_translation: false,
             translation_layout: self.preferences.translation_layout,
             hide_images: self.preferences.hide_images,
+            paragraph_indent: self.preferences.paragraph_indent,
             reply,
         });
         let services = self.services.clone();
@@ -61,6 +68,7 @@ impl ReaderWindow {
         }
         self.reader.showing_translation = false;
         self.reader.body_html = SharedString::default();
+        self.reader.body_markdown = SharedString::default();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = response
@@ -72,14 +80,21 @@ impl ReaderWindow {
                 }
                 match result {
                     Ok(prepared) => {
+                        let reading_progress = prepared.reading_progress;
                         let mut article = prepared.article;
                         article.summary.is_read = true;
                         this.reader.showing_translation = false;
                         this.reader.body_html = prepared.body_html.into();
+                        this.reader.body_markdown = prepared.body_markdown.into();
+                        this.reader.image_urls = prepared.image_urls;
                         let should_auto_extract = this.preferences.auto_extract_full_text
                             && article.extracted_html.is_none()
                             && article.url.is_some();
                         this.reader.article = Some(article);
+                        if this.preferences.remember_reading_position && reading_progress > 0. {
+                            this.reader.restore_progress = Some(reading_progress);
+                            this.restore_reading_progress(id, reading_progress, cx);
+                        }
                         let (reply, _) = oneshot::channel();
                         services.send(Command::Mark {
                             id,
@@ -99,6 +114,85 @@ impl ReaderWindow {
         .detach();
     }
 
+    pub(in crate::ui) fn schedule_reading_progress_save(&mut self, cx: &mut Context<Self>) {
+        if !self.preferences.remember_reading_position || self.reader.article.is_none() {
+            return;
+        }
+        self.reader.progress_epoch = self.reader.progress_epoch.wrapping_add(1);
+        let epoch = self.reader.progress_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(700))
+                .await;
+            let _ = this.update(cx, |this, _| {
+                if this.reader.progress_epoch == epoch {
+                    this.save_current_reading_progress();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn save_current_reading_progress(&self) {
+        if !self.preferences.remember_reading_position {
+            return;
+        }
+        let Some(article) = &self.reader.article else {
+            return;
+        };
+        let max = self.reader.scroll.max_offset().y;
+        if max <= px(0.) {
+            return;
+        }
+        let progress = (-self.reader.scroll.offset().y / max).clamp(0., 1.);
+        let (reply, _response) = oneshot::channel();
+        self.services
+            .send(crate::services::Command::SaveReadingProgress {
+                id: article.summary.id,
+                progress,
+                reply,
+            });
+    }
+
+    fn restore_reading_progress(&mut self, id: i64, progress: f32, cx: &mut Context<Self>) {
+        self.reader.progress_epoch = self.reader.progress_epoch.wrapping_add(1);
+        let epoch = self.reader.progress_epoch;
+        let scroll = self.reader.scroll.clone();
+        cx.spawn(async move |this, cx| {
+            for _ in 0..20 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let restored = this
+                    .update(cx, |this, cx| {
+                        if this.reader.progress_epoch != epoch
+                            || this
+                                .reader
+                                .article
+                                .as_ref()
+                                .is_none_or(|article| article.summary.id != id)
+                        {
+                            return true;
+                        }
+                        let max = scroll.max_offset().y;
+                        if max > px(0.) {
+                            scroll.set_offset(point(px(0.), -max * progress));
+                            this.reader.restore_progress = None;
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(true);
+                if restored {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     pub(in crate::ui) fn request_prepared_body(&mut self, cx: &mut Context<Self>) {
         let Some(article) = &self.reader.article else {
             return;
@@ -111,6 +205,7 @@ impl ReaderWindow {
             show_translation: self.reader.showing_translation,
             translation_layout: self.preferences.translation_layout,
             hide_images: self.preferences.hide_images,
+            paragraph_indent: self.preferences.paragraph_indent,
             reply,
         });
         cx.spawn(async move |this, cx| {
@@ -125,6 +220,8 @@ impl ReaderWindow {
                     Ok(prepared) => {
                         this.reader.article = Some(prepared.article);
                         this.reader.body_html = prepared.body_html.into();
+                        this.reader.body_markdown = prepared.body_markdown.into();
+                        this.reader.image_urls = prepared.image_urls;
                     }
                     Err(error) => this.set_error(error),
                 }
@@ -223,6 +320,7 @@ impl ReaderWindow {
         let show_translation = self.reader.showing_translation;
         let translation_layout = self.preferences.translation_layout;
         let hide_images = self.preferences.hide_images;
+        let paragraph_indent = self.preferences.paragraph_indent;
         let revision = self.reader.request_epoch.next();
         self.services.send(Command::Extract {
             id,
@@ -245,6 +343,7 @@ impl ReaderWindow {
                     show_translation,
                     translation_layout,
                     hide_images,
+                    paragraph_indent,
                     reply: article_reply,
                 });
             }
@@ -267,6 +366,8 @@ impl ReaderWindow {
                                             .is_some_and(|current| current.summary.id == id)
                                     {
                                         this.reader.body_html = prepared.body_html.into();
+                                        this.reader.body_markdown = prepared.body_markdown.into();
+                                        this.reader.image_urls = prepared.image_urls;
                                         this.reader.article = Some(prepared.article);
                                         cx.notify();
                                     }
@@ -317,6 +418,7 @@ impl ReaderWindow {
         let target_lang = self.translation_target_code().to_owned();
         let translation_layout = self.preferences.translation_layout;
         let hide_images = self.preferences.hide_images;
+        let paragraph_indent = self.preferences.paragraph_indent;
         let revision = self.reader.request_epoch.next();
         let (reply, response) = oneshot::channel();
         self.services.send(Command::Translate {
@@ -324,6 +426,7 @@ impl ReaderWindow {
             target_lang,
             translation_layout,
             hide_images,
+            paragraph_indent,
             reply,
         });
         self.set_busy(self.t("Translating…"));
@@ -345,6 +448,8 @@ impl ReaderWindow {
                         {
                             this.reader.showing_translation = true;
                             this.reader.body_html = prepared.body_html.into();
+                            this.reader.body_markdown = prepared.body_markdown.into();
+                            this.reader.image_urls = prepared.image_urls;
                             if let Some(row) = Arc::make_mut(&mut this.list.articles)
                                 .iter_mut()
                                 .find(|row| {

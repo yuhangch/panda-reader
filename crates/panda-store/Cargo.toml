@@ -12,7 +12,10 @@ dom_smoothie.workspace = true
 decruft.workspace = true
 rs-trafilatura.workspace = true
 feed-rs.workspace = true
+flate2.workspace = true
+hex.workspace = true
 opml.workspace = true
+panda-content = { path = "../panda-content" }
 panda-core = { path = "../panda-core" }
 panda-miniflux = { path = "../panda-miniflux" }
 panda-providers = { path = "../panda-providers" }
@@ -20,6 +23,7 @@ panda-translate = { path = "../panda-translate" }
 reqwest.workspace = true
 rusqlite.workspace = true
 scraper.workspace = true
+sha2.workspace = true
 serde_json.workspace = true
 url.workspace = true
 

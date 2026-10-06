@@ -1,4 +1,5 @@
 use crate::app::preferences::{LibrarySource, Preferences};
+use crate::services::AppServices;
 use crate::ui::i18n;
 use crate::ui::window::ReaderWindow;
 use gpui_kit::component::{
@@ -8,6 +9,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::*;
 use panda_core::Scope;
+use panda_plugins::{CommunityPlugin, PluginSummary};
 use panda_providers::ProviderSettingsMap;
 use panda_translate::TranslatorConfig;
 use std::sync::Arc;
@@ -31,6 +33,17 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) azure_region_input: Entity<InputState>,
     pub(in crate::ui) volcengine_ak_input: Entity<InputState>,
     pub(in crate::ui) volcengine_sk_input: Entity<InputState>,
+    pub(in crate::ui) plugin_path_input: Entity<InputState>,
+    pub(in crate::ui) plugins: Vec<PluginSummary>,
+    pub(in crate::ui) plugins_checked: bool,
+    pub(in crate::ui) plugin_list_loading: bool,
+    pub(in crate::ui) community_plugins: Vec<CommunityPlugin>,
+    pub(in crate::ui) plugins_loading: bool,
+    pub(in crate::ui) community_plugins_loading: bool,
+    pub(in crate::ui) community_plugins_checked: bool,
+    pub(in crate::ui) plugin_error: Option<String>,
+    pub(in crate::ui) community_plugin_error: Option<String>,
+    pub(in crate::ui) services: AppServices,
     pub(in crate::ui) added_feeds_search: String,
     pub(in crate::ui) is_connecting: bool,
     pub(in crate::ui) provider_settings: ProviderSettingsMap,
@@ -48,6 +61,7 @@ impl Settings {
         preferences: &Preferences,
         translator_config: &TranslatorConfig,
         provider_settings: ProviderSettingsMap,
+        services: AppServices,
     ) -> Self {
         let library_source = preferences.library_source;
         let selected_settings = library_source
@@ -133,6 +147,9 @@ impl Settings {
                 .placeholder("Secret Access Key")
                 .masked(true)
                 .default_value(translator_config.volcengine_secret_key.as_str())
+        });
+        let plugin_path_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Plugin folder, ZIP path, or HTTPS ZIP URL")
         });
         let added_feeds_search_for_events = added_feeds_search_input.clone();
         let mut _subscriptions = Vec::new();
@@ -228,6 +245,7 @@ impl Settings {
                     this.reader.is_extracting = false;
                     this.reader.article = None;
                     this.reader.body_html = SharedString::default();
+                    this.reader.body_markdown = SharedString::default();
                     this.reader.showing_translation = false;
                     this.list.articles = Arc::new(Vec::new());
                     this.sidebar.feeds.clear();
@@ -251,6 +269,17 @@ impl Settings {
             azure_region_input,
             volcengine_ak_input,
             volcengine_sk_input,
+            plugin_path_input,
+            plugins: Vec::new(),
+            plugins_checked: false,
+            plugin_list_loading: false,
+            community_plugins: Vec::new(),
+            plugins_loading: false,
+            community_plugins_loading: false,
+            community_plugins_checked: false,
+            plugin_error: None,
+            community_plugin_error: None,
+            services,
             added_feeds_search: String::new(),
             is_connecting: false,
             provider_settings,

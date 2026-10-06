@@ -1,0 +1,10 @@
+id = "community.chinanews"
+name = "中国新闻网"
+version = "1.0.0"
+api_version = 1
+min_app_version = "0.2.0"
+kind = "rules"
+domains = ["*.chinanews.com.cn"]
+stage = "cleanup"
+priority = 20
+capabilities = ["document_read", "document_write"]

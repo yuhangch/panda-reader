@@ -1,0 +1,7 @@
+[[rules]]
+op = "remove"
+selector = ".share-tools, .advertisement"
+
+[[rules]]
+op = "lazy_images"
+attributes = ["data-src", "data-original"]

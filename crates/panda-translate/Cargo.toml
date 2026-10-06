@@ -6,6 +6,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+panda-content = { path = "../panda-content" }
 anyhow.workspace = true
 chrono.workspace = true
 hex.workspace = true

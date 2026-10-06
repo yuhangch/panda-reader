@@ -103,7 +103,13 @@ pub struct Article {
     pub summary: ArticleSummary,
     pub url: Option<String>,
     pub content_html: String,
+    /// Unmodified RSS or provider body, used as the input to content plugins.
+    pub source_html: Option<String>,
+    /// Unmodified downloaded page, retained for offline plugin reprocessing.
+    pub source_page_html: Option<String>,
     pub extracted_html: Option<String>,
+    /// Canonical body after the currently enabled content pipeline.
+    pub effective_html: Option<String>,
     pub translated_html: Option<String>,
     pub translated_title: Option<String>,
     pub translated_lang: Option<String>,
@@ -156,6 +162,9 @@ pub struct ReaderSnapshot {
 pub struct PreparedArticle {
     pub article: Article,
     pub body_html: String,
+    pub body_markdown: String,
+    pub reading_progress: f32,
+    pub image_urls: Vec<String>,
 }
 
 pub struct ParsedArticle {
@@ -166,4 +175,5 @@ pub struct ParsedArticle {
     pub published_at: Option<String>,
     pub snippet: String,
     pub content_html: String,
+    pub source_html: String,
 }

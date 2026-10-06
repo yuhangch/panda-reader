@@ -1,0 +1,3 @@
+[[rules]]
+op = "remove"
+selector = "img#wx_img"

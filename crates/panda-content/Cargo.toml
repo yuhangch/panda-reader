@@ -1,0 +1,18 @@
+[package]
+name = "panda-content"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ammonia.workspace = true
+anyhow.workspace = true
+dom_smoothie.workspace = true
+decruft.workspace = true
+rs-trafilatura.workspace = true
+panda-core = { path = "../panda-core" }
+scraper.workspace = true
+url.workspace = true
+sha2.workspace = true
+hex.workspace = true
