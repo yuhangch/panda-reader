@@ -32,7 +32,9 @@ rm -rf "$APPDIR"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/doc/panda-reader/THIRD_PARTY_ASSET_LICENSES/fonts" dist
 
 cp "target/${TARGET}/release/panda-reader" "$APPDIR/usr/bin/panda-reader"
+cp "target/${TARGET}/release/panda-reader-updater" "$APPDIR/usr/bin/panda-reader-updater"
 chmod +x "$APPDIR/usr/bin/panda-reader"
+chmod +x "$APPDIR/usr/bin/panda-reader-updater"
 cp LICENSE "$APPDIR/usr/share/doc/panda-reader/LICENSE"
 cp README.md "$APPDIR/usr/share/doc/panda-reader/README.md"
 cp THIRD_PARTY_NOTICES.md "$APPDIR/usr/share/doc/panda-reader/THIRD_PARTY_NOTICES.md"
@@ -58,6 +60,7 @@ convert apps/panda-reader/assets/app-icon.png -resize 256x256 "$TOOLS/panda-read
 "$LINUXDEPLOY" \
   --appdir "$APPDIR" \
   --executable "$APPDIR/usr/bin/panda-reader" \
+  --executable "$APPDIR/usr/bin/panda-reader-updater" \
   --desktop-file "$TOOLS/panda-reader.desktop" \
   --icon-file "$TOOLS/panda-reader.png"
 
@@ -66,6 +69,7 @@ chmod +x "dist/${NAME}.AppImage"
 test -s "dist/${NAME}.AppImage"
 "dist/${NAME}.AppImage" --appimage-extract >/dev/null
 test -x squashfs-root/usr/bin/panda-reader
+test -x squashfs-root/usr/bin/panda-reader-updater
 rm -rf squashfs-root
 rm -rf "$APPDIR" "$TOOLS"
 echo "OK dist/${NAME}.AppImage"

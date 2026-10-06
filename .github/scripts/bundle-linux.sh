@@ -15,7 +15,9 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE"
 
 cp "target/${TARGET}/release/panda-reader" "$STAGE/panda-reader"
+cp "target/${TARGET}/release/panda-reader-updater" "$STAGE/panda-reader-updater"
 chmod +x "$STAGE/panda-reader"
+chmod +x "$STAGE/panda-reader-updater"
 strip "$STAGE/panda-reader" || echo "strip unavailable — shipping unstripped binary"
 cp LICENSE "$STAGE/LICENSE"
 cp README.md "$STAGE/README.md"
@@ -28,6 +30,7 @@ cp apps/panda-reader/assets/fonts/*LICENSE* "$STAGE/THIRD_PARTY_ASSET_LICENSES/f
 mkdir -p dist
 tar -C dist -czf "dist/${NAME}.tar.gz" "$NAME"
 tar -tzf "dist/${NAME}.tar.gz" | grep -Fx "${NAME}/panda-reader" >/dev/null
+tar -tzf "dist/${NAME}.tar.gz" | grep -Fx "${NAME}/panda-reader-updater" >/dev/null
 test -s "dist/${NAME}.tar.gz"
 rm -rf "$STAGE"
 echo "OK dist/${NAME}.tar.gz"

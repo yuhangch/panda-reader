@@ -59,7 +59,7 @@ jobs:
 
       - name: Build
         shell: bash
-        run: cargo build --release --locked --target "${{ matrix.target }}" -p panda-reader
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p panda-reader --bin panda-reader --bin panda-reader-updater
 
       - name: Install license report tool
         run: cargo install --locked --features cli cargo-about

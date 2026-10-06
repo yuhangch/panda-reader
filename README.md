@@ -25,6 +25,8 @@ Under the hood, Panda Reader is a desktop RSS reader built with [GPUI](https://w
 
 Download the latest Windows, macOS, or Linux build from [Releases](../../releases). Checksums are included; macOS releases include a note with their signing status.
 
+After installing the Windows per-user setup, macOS app, or Linux AppImage, Panda Reader checks for stable updates and can install them in the background. The portable Windows ZIP and Linux tarball are updated manually from Releases. The first update from an older build also requires installing the new package once.
+
 ## Development
 
 Run the app locally with:

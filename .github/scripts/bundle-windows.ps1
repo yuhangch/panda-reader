@@ -18,6 +18,7 @@ Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage, dist | Out-Null
 
 Copy-Item "target/$Target/release/panda-reader.exe" "$Stage/panda-reader.exe"
+Copy-Item "target/$Target/release/panda-reader-updater.exe" "$Stage/panda-reader-updater.exe"
 Copy-Item LICENSE "$Stage/LICENSE.txt"
 Copy-Item README.md "$Stage/README.md"
 Copy-Item THIRD_PARTY_NOTICES.md "$Stage/THIRD_PARTY_NOTICES.md"
@@ -33,10 +34,16 @@ if (-not (Test-Path "dist/$Name.zip") -or (Get-Item "dist/$Name.zip").Length -eq
 if (-not (Test-Path "$Stage/panda-reader.exe") -or (Get-Item "$Stage/panda-reader.exe").Length -eq 0) {
     throw "Staged executable is missing"
 }
+if (-not (Test-Path "$Stage/panda-reader-updater.exe") -or (Get-Item "$Stage/panda-reader-updater.exe").Length -eq 0) {
+    throw "Staged updater helper is missing"
+}
 $ZipCheck = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist/$Name.zip").Path)
 try {
     if (-not ($ZipCheck.Entries | Where-Object { $_.FullName -eq 'panda-reader.exe' })) {
         throw "Portable archive does not contain panda-reader.exe"
+    }
+    if (-not ($ZipCheck.Entries | Where-Object { $_.FullName -eq 'panda-reader-updater.exe' })) {
+        throw "Portable archive does not contain panda-reader-updater.exe"
     }
 } finally {
     $ZipCheck.Dispose()

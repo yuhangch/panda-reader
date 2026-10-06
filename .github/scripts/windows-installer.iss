@@ -41,6 +41,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#StageDir}\panda-reader.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\panda-reader-updater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion

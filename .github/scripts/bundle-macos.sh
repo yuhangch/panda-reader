@@ -19,7 +19,9 @@ rm -rf dist
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Third-Party-Asset-Licenses/fonts"
 
 cp "target/${TARGET}/release/panda-reader" "$APP/Contents/MacOS/panda-reader"
+cp "target/${TARGET}/release/panda-reader-updater" "$APP/Contents/MacOS/panda-reader-updater"
 chmod +x "$APP/Contents/MacOS/panda-reader"
+chmod +x "$APP/Contents/MacOS/panda-reader-updater"
 cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
 cp README.md "$APP/Contents/Resources/README.md"
 cp THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
@@ -97,6 +99,7 @@ test -s "dist/${NAME}.zip"
 ZIP_CHECK="$(mktemp -d)"
 ditto -x -k "dist/${NAME}.zip" "$ZIP_CHECK"
 test -x "$ZIP_CHECK/Panda Reader.app/Contents/MacOS/panda-reader"
+test -x "$ZIP_CHECK/Panda Reader.app/Contents/MacOS/panda-reader-updater"
 rm -rf "$ZIP_CHECK"
 
 DMG_STAGE="$(mktemp -d)"
