@@ -102,9 +102,7 @@ fn repair_cached_translation(original: &str, translated: &str) -> String {
 }
 
 fn as_translation_follow(block: &str) -> String {
-    format!(
-        "<p>{TRANSLATION_MARKER_START}</p>{block}<p>{TRANSLATION_MARKER_END}</p>"
-    )
+    format!("<p>{TRANSLATION_MARKER_START}</p>{block}<p>{TRANSLATION_MARKER_END}</p>")
 }
 
 fn strip_images(html: &str) -> String {

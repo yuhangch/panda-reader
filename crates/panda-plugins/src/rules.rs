@@ -467,5 +467,4 @@ mod tests {
         );
         assert!(!document.serialize().contains("remove"));
     }
-
 }

@@ -1,8 +1,6 @@
 //! Bounded cache for prepared article bodies.
 
-use super::content::{
-    TRANSLATION_MARKER_END, TRANSLATION_MARKER_START, prepare_body,
-};
+use super::content::{TRANSLATION_MARKER_END, TRANSLATION_MARKER_START, prepare_body};
 use panda_core::{Article, TranslationLayout};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;

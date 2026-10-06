@@ -348,9 +348,9 @@ impl ArticleView {
                                                         owner.preferences.reader_font_family
                                                             == ReaderFontFamily::Serif,
                                                     ),
-                                                    font_size: px(
-                                                        owner.preferences.reader_font_size,
-                                                    ),
+                                                    font_size: px(owner
+                                                        .preferences
+                                                        .reader_font_size),
                                                     line_height: rems(
                                                         owner.preferences.reader_line_height,
                                                     ),
