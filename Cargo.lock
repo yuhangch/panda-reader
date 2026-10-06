@@ -5566,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "panda-content"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -5582,14 +5582,14 @@ dependencies = [
 
 [[package]]
 name = "panda-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "panda-miniflux"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -5601,7 +5601,7 @@ dependencies = [
 
 [[package]]
 name = "panda-plugin-sdk"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -5609,7 +5609,7 @@ dependencies = [
 
 [[package]]
 name = "panda-plugins"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ego-tree 0.9.0",
@@ -5631,7 +5631,7 @@ dependencies = [
 
 [[package]]
 name = "panda-providers"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5647,7 +5647,7 @@ dependencies = [
 
 [[package]]
 name = "panda-reader"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -5685,7 +5685,7 @@ dependencies = [
 
 [[package]]
 name = "panda-store"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ammonia",
  "anyhow",
@@ -5713,7 +5713,7 @@ dependencies = [
 
 [[package]]
 name = "panda-translate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
