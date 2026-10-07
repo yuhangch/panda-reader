@@ -626,10 +626,20 @@ capabilities = ["document_read", "document_write"]
             .iter()
             .find(|plugin| plugin.id == "community.wechat")
             .unwrap();
+        // Git checkouts may use CRLF on Windows while catalog hashes are
+        // generated from LF-normalized repository contents.
         let manifest = include_bytes!("../../../plugins/community/community.wechat/manifest.toml");
+        let manifest = String::from_utf8_lossy(manifest).replace("\r\n", "\n");
         let payload = include_bytes!("../../../plugins/community/community.wechat/rules.toml");
+        let payload = String::from_utf8_lossy(payload).replace("\r\n", "\n");
         let temp = tempfile::tempdir().unwrap();
-        PluginRegistry::install_community_plugin(plugin, manifest, payload, temp.path()).unwrap();
+        PluginRegistry::install_community_plugin(
+            plugin,
+            manifest.as_bytes(),
+            payload.as_bytes(),
+            temp.path(),
+        )
+        .unwrap();
 
         let registry = PluginRegistry::load(temp.path(), &PluginSettings::default(), 1);
         let result = registry.process(

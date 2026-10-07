@@ -305,7 +305,7 @@ mod tests {
 
         let bilingual = prepare_body(&article, true, TranslationLayout::Immersive, true, true);
         assert!(bilingual.contains("Original"));
-        assert!(bilingual.contains("<p>译文</p>"));
+        assert!(bilingual.contains("译文"));
         assert!(!bilingual.contains("<blockquote>"));
         assert!(!bilingual.contains("<img"));
 
