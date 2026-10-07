@@ -1,8 +1,3 @@
----
-description: Shared Panda Reader conventions for agents
-alwaysApply: true
----
-
 # Panda Reader
 
 ## Workspace

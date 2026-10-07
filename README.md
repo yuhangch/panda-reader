@@ -1,7 +1,7 @@
 # Panda Reader
 
 [![Website](https://img.shields.io/badge/Website-GitHub%20Pages-4b6b56)](https://yuhangch.github.io/panda-reader/)
-[![CI](https://github.com/yuhangch/panda-reader/actions/workflows/ci.yml/badge.svg)](https://github.com/yuhangch/panda-reader/actions/workflows/ci.yml)
+[![Release](https://github.com/yuhangch/panda-reader/actions/workflows/release.yml/badge.svg)](https://github.com/yuhangch/panda-reader/actions/workflows/release.yml)
 [![GPUI Kit](https://img.shields.io/badge/UI-GPUI%20Kit-0A7EA4)](https://gpui-kit.com/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)](#installation)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
