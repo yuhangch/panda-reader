@@ -16,10 +16,10 @@ Under the hood, Panda Reader is a desktop RSS reader built with [GPUI](https://w
 
 - Three-column layout: feeds / article list / reader
 - Local subscription management with OPML import/export and offline article storage
-- Provider sync with [Miniflux](https://miniflux.app/) and [FreshRSS](https://freshrss.org/) ([setup](docs/providers.md))
+- Provider sync with [Miniflux](https://miniflux.app/) and [FreshRSS](https://freshrss.org/) ([setup](https://yuhangch.github.io/panda-reader/docs/providers/))
 - Unread, starred, and read-later scopes; provider read/star state synchronization
 - Full-text extraction from the original page (manual or automatic)
-- Local article plugins for publisher-specific extraction and cleanup ([development guide](docs/plugins/README.md))
+- Local article plugins for publisher-specific extraction and cleanup ([plugin guide](https://yuhangch.github.io/panda-reader/docs/plugins/))
 - Extensible article translation with pluggable providers
 - Theme presets and a multilingual interface
 
@@ -44,6 +44,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. Report vuln
 ## License
 
 MIT. See [LICENSE](LICENSE). Bundled fonts (Inter, Source Sans 3, Source Serif 4, and Noto Sans SC) are under the SIL Open Font License. Their license texts and the TTY7 icon license are included in `apps/panda-reader/assets/`.
+The documentation site embeds [IBM Plex Serif](https://github.com/IBM/plex) for headings and [iA Writer Quattro](https://ia.net/writer) for body text; their license files are included in `docs/public/fonts/`.
 
 The generated [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) lists Rust dependency licenses and is included in release packages. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for bundled asset attributions.
 

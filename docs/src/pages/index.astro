@@ -1,4 +1,6 @@
 ---
+import '../styles/typography.css';
+
 const base = import.meta.env.BASE_URL.endsWith('/')
   ? import.meta.env.BASE_URL
   : `${import.meta.env.BASE_URL}/`;
@@ -15,17 +17,18 @@ const repository = 'https://github.com/yuhangch/panda-reader';
     <title>Panda Reader — just an RSS reader</title>
     <link rel="icon" type="image/png" href={`${base}app-icon.png`} />
   </head>
-  <body>
+  <body class="landing">
     <main id="top" class="layout wrap">
       <div class="copy">
       <section class="introduction" aria-labelledby="intro-title">
         <img src={`${base}app-icon.png`} alt="" width="80" height="80" />
         <div class="intro-copy">
           <h1 id="intro-title">
-            <span class="product-name">Panda Reader</span>
+            <span class="product-name brand-wordmark"><span class="brand-word-panda">Panda</span> <span class="brand-word-reader">Reader</span></span>
           </h1>
-          <p class="intro-description">An RSS reader for your desktop, built with <a href="https://gpui-kit.com/">gpui-kit</a>.</p>
-          <p class="source-note">Manage feeds locally, or sync with Miniflux and FreshRSS.</p>
+          <p class="intro-description">A desktop RSS reader you can make your own.</p>
+          <p class="source-note">Local · Miniflux · FreshRSS · and more</p>
+          <p class="kit-note">Built with <a href="https://gpui-kit.com/">gpui-kit</a>.</p>
         </div>
       </section>
 
@@ -44,59 +47,110 @@ const repository = 'https://github.com/yuhangch/panda-reader';
         <p class="invitation">It won’t suit everyone. Use it, change it, fork it. That’s why it’s open source.</p>
       </section>
 
-      <div class="download">
-        <a class="button" href={`${repository}/releases/latest`}>Download Panda Reader <span aria-hidden="true">↗</span></a>
-        <span class="platforms">Windows · macOS · Linux</span>
+      <div class="hero-actions" aria-label="Explore Panda Reader">
+        <a class="action-button" href={`${repository}/releases/latest`}>Download <span aria-hidden="true">↗</span></a>
+        <a class="action-button" href={`${base}docs/`}>Documentation <span aria-hidden="true">↗</span></a>
       </div>
+      <p class="platforms">Available for Windows, macOS, and Linux</p>
       </div>
 
       <figure class="screenshot" id="reading">
-        <img src={`${base}reader-window.webp`} alt="Panda Reader showing feed categories, a news article list, and a Guardian World article in the reading pane" width="1661" height="1085" />
+        <img src={`${base}reader-window.png`} alt="Panda Reader showing a bilingual Hacker News article with the feed list and reader pane" width="1744" height="1142" />
       </figure>
     </main>
 
+    <section class="capabilities wrap" aria-label="What Panda Reader can do">
+      <article class="capability" id="read">
+        <span class="eyebrow">01 · Read</span>
+        <h2>Stay with the story.</h2>
+        <p>Less time managing the feed. More room for what you came to read.</p>
+        <ul class="read-details" aria-label="Reading features">
+          <li><span>01</span><strong>Full text</strong><small>Extracted from the original page</small></li>
+          <li><span>02</span><strong>Offline</strong><small>Saved with your local library</small></li>
+          <li><span>03</span><strong>Find your way back</strong><small>Search, translate, and navigate by keyboard</small></li>
+        </ul>
+      </article>
+      <article class="capability" id="sync">
+        <span class="eyebrow">02 · Sync</span>
+        <h2>Your library, your setup.</h2>
+        <p>Keep a library on this device, or use Panda Reader as a desktop client for Miniflux or FreshRSS. Choose the setup that fits how you already read.</p>
+        <p class="sync-options"><span>Local</span><span>Miniflux</span><span>FreshRSS</span><span>More</span></p>
+      </article>
+      <article class="capability plugin-capability" id="plugins">
+        <span class="eyebrow">03 · Plugins</span>
+        <h2>Make broken feeds readable.</h2>
+        <p>Plugins can turn a short RSS summary into a clean full article, tailored to the publisher.</p>
+        <p class="plugin-flow" aria-label="RSS summary, original page, article plugin, clean full article">RSS summary <span aria-hidden="true">→</span> Original page <span aria-hidden="true">→</span> Plugin <span aria-hidden="true">→</span> <strong>Full article</strong></p>
+        <p class="plugin-examples">ScienceNet · WeChat · IT Home · QbitAI · China News</p>
+      </article>
+    </section>
+
     <footer class="footer wrap">
-      <p>Made by <a href="https://github.com/yuhangch">yuhangch</a> with <a href="https://gpui-kit.com/">gpui-kit</a>. Inspired by <a href="https://github.com/l0ng-ai/tty7">tty7</a>.</p>
+      <p>Made by <a href="https://github.com/yuhangch">yuhangch</a>. Built with <a href="https://gpui-kit.com/">gpui-kit</a>; inspired by <a href="https://github.com/l0ng-ai/tty7">tty7</a> and <a href="https://github.com/l0ng-ai/papr">Papr</a>.</p>
       <div class="footer-links">
+        <a href={`${repository}/releases/latest`}>Download</a>
+        <a href={`${base}docs/`}>Documentation</a>
+        <a href={`${base}docs/plugins/`}>Plugins</a>
         <a href={repository}>GitHub</a>
-        <a href={`${repository}/blob/main/LICENSE`}>MIT License</a>
       </div>
     </footer>
   </body>
 </html>
 
 <style>
-  :global(*) { box-sizing: border-box; }
-  :global(html) { background: #f5f4ee; }
-  :global(body) { margin: 0; color: #20281f; background: #f5f4ee; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
-  :global(a) { color: inherit; text-decoration: none; }
+  :global(body.landing *) { box-sizing: border-box; }
+  :global(body.landing) { margin: 0; color: #20281f; background: #f5f4ee; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+  .wrap a { color: inherit; text-decoration: none; }
   .wrap { width: min(1320px, calc(100% - 80px)); margin: 0 auto; }
   .layout { display: grid; grid-template-columns: minmax(0, .9fr) minmax(0, 1.1fr); gap: clamp(28px, 4vw, 56px); align-items: center; padding: 48px 0; }
   .copy { min-width: 0; container-type: inline-size; }
-  a:hover { color: #315d47; }
-  a:focus-visible { outline: 2px solid #315d47; outline-offset: 4px; }
+  .wrap a:hover { color: #315d47; }
+  .wrap a:focus-visible { outline: 2px solid #315d47; outline-offset: 4px; }
   .introduction { display: flex; align-items: center; gap: 18px; padding: 0 0 28px; }
   .introduction img { display: block; width: 80px; height: 80px; flex: 0 0 80px; object-fit: contain; }
   .intro-copy { min-width: 0; }
-  h1 { margin: 0 0 8px; font-family: Georgia, "Times New Roman", serif; font-size: 23px; font-weight: 400; letter-spacing: -.035em; line-height: 1.25; }
-  h1 span { display: block; }
-  h1 .product-name { margin-bottom: 5px; color: #315d47; font-size: clamp(26px, 7cqi, 34px); letter-spacing: -.045em; white-space: nowrap; }
+  h1 { margin: 0 0 8px; font-family: 'IBM Plex Serif', Georgia, serif; font-size: 23px; font-weight: 400; letter-spacing: -.035em; line-height: 1.25; }
+  h1 > span { display: block; }
+  h1 .product-name { margin-bottom: 5px; font-size: clamp(25px, 6.5cqi, 32px); white-space: nowrap; }
+  h1 .product-name span { display: inline; }
+  .brand-word-panda { color: #315d47; }
+  .brand-word-reader { color: #111; }
   .introduction p { margin: 0; color: #73796f; font-size: 13px; line-height: 1.6; }
-  .introduction .intro-description { margin-bottom: 6px; color: #20281f; font-family: Georgia, "Times New Roman", serif; font-size: 14px; letter-spacing: -.02em; line-height: 1.5; }
+  .introduction .intro-description { margin-bottom: 6px; color: #20281f; font-family: 'iA Writer Quattro', Georgia, serif; font-size: 16px; letter-spacing: -.02em; line-height: 1.5; }
+  .introduction .kit-note { margin-top: 4px; font-size: 11px; }
+  .kit-note a { text-decoration: underline; text-decoration-color: #c9cdbf; text-underline-offset: 2px; }
   .manifesto { padding: 0 0 30px; }
-  h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: clamp(26px, 9cqi, 52px); font-weight: 400; line-height: 1.1; letter-spacing: -.055em; }
-  h2 span { display: block; }
+  h2 { margin: 0; font-family: 'IBM Plex Serif', Georgia, serif; font-size: clamp(23px, 7.5cqi, 46px); font-weight: 400; line-height: 1.1; letter-spacing: -.055em; }
+  h2 span { display: block; white-space: nowrap; }
   h2 em { color: #547257; font-weight: 400; }
-  .manifesto p { margin: 16px 0 0; color: #8d7260; font-size: 13px; }
+  .manifesto p { margin: 16px 0 0; color: #8d7260; font-family: 'iA Writer Quattro', Georgia, serif; font-size: 14px; }
   .personal { max-width: 640px; padding: 24px 0 0; border-top: 1px solid #dcded3; }
-  .personal p { margin: 0 0 14px; font-size: 14px; line-height: 1.75; color: #536052; }
+  .personal p { margin: 0 0 14px; color: #536052; font-family: 'iA Writer Quattro', Georgia, serif; font-size: 15px; line-height: 1.8; }
   .personal .invitation { margin-bottom: 0; color: #73796f; font-size: 13px; }
-  .download { display: flex; flex-wrap: wrap; gap: 16px 20px; align-items: center; margin: 28px 0 0; }
-  .button { display: inline-flex; gap: 24px; align-items: center; min-height: 44px; padding: 0 18px; border-radius: 4px; background: #315d47; color: #fbfaf5; font-size: 12px; font-weight: 600; }
-  .button:hover { background: #264b39; color: #fbfaf5; }
-  .platforms { color: #73796f; font-size: 11px; }
+  .hero-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 28px 0 0; }
+  .wrap a.action-button { display: inline-flex; justify-content: space-between; gap: 28px; align-items: center; min-width: 154px; min-height: 50px; padding: 0 16px; border: 1px solid #244b38; border-radius: 2px; background: #244b38; color: #fff; font-size: 13px; font-weight: 600; transition: background-color 140ms ease, border-color 140ms ease; }
+  .wrap a.action-button:hover { border-color: #173b2a; background: #173b2a; color: #fff; }
+  .action-button span { color: #d7eadc; }
+  .platforms { margin: 11px 0 0; color: #73796f; font-size: 11px; }
   .screenshot { min-width: 0; margin: 0; overflow: hidden; border: 1px solid #dcded3; border-radius: 8px; background: #f1f3f6; }
   .screenshot img { width: calc(100% + 2px); max-width: none; height: auto; display: block; margin: -1px; }
+  .capabilities { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 8px 0 68px; border-top: 1px solid #d9ddd6; }
+  .capability { min-width: 0; padding: 24px 26px 10px 0; }
+  .capability + .capability { padding-left: 26px; border-left: 1px solid #d9ddd6; }
+  .eyebrow { color: #55745e; font-size: 11px; font-weight: 600; letter-spacing: .02em; }
+  .capability h2 { margin: 17px 0 10px; font-size: clamp(22px, 2.5vw, 30px); letter-spacing: -.04em; }
+  .capability p { margin: 0; color: #626b5f; font-family: 'iA Writer Quattro', Georgia, serif; font-size: 14px; line-height: 1.75; }
+  .read-details { margin: 22px 0 0; padding: 0; list-style: none; }
+  .read-details li { display: grid; grid-template-columns: 24px 1fr; gap: 2px 10px; padding: 10px 0; border-top: 1px solid #e3e5df; }
+  .read-details li > span { grid-row: span 2; color: #81887e; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .read-details strong { color: #29322a; font-size: 12px; font-weight: 600; }
+  .read-details small { color: #7b8279; font-size: 11px; line-height: 1.5; }
+  .sync-options { display: flex; flex-wrap: wrap; gap: 0; margin-top: 22px !important; color: #29322a !important; font-size: 12px !important; }
+  .sync-options span + span::before { padding: 0 9px; color: #a0a69d; content: '·'; }
+  .plugin-flow { margin-top: 22px !important; color: #626b5f; font-size: 11px !important; }
+  .plugin-flow span { padding: 0 3px; color: #97a196; }
+  .plugin-flow strong { color: #244b38; font-weight: 600; }
+  .capability .plugin-examples { margin-top: 15px; color: #7c8277; font-size: 10px; }
   .footer { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; padding: 20px 0 28px; border-top: 1px solid #e3e2d8; color: #73796f; font-size: 11px; line-height: 1.7; }
   .footer p { margin: 0; }
   .footer p a { text-decoration: underline; text-decoration-color: #c9cdbf; text-underline-offset: 3px; }
@@ -116,10 +170,17 @@ const repository = 'https://github.com/yuhangch/panda-reader';
     .introduction { grid-template-columns: 64px minmax(0, 1fr); }
     .introduction img { width: 64px; height: 64px; flex-basis: 64px; }
     h1 { font-size: 20px; }
-    h1 .product-name { font-size: 30px; }
-    h2 { font-size: clamp(26px, 9cqi, 46px); }
+    h1 .product-name { font-size: 28px; }
+    h2 { font-size: clamp(22px, 8cqi, 42px); }
+    .manifesto h2 span { white-space: normal; }
     .manifesto { padding-bottom: 26px; }
-    .personal p { font-size: 13px; }
-    .download { margin: 24px 0 0; }
+    .personal p { font-size: 14px; }
+    .hero-actions { margin-top: 22px; }
+    .wrap a.action-button { min-width: min(145px, calc(50% - 5px)); gap: 18px; }
+    .capabilities { grid-template-columns: 1fr; padding-bottom: 42px; }
+    .capability, .capability + .capability { padding: 23px 0; border-left: 0; border-bottom: 1px solid #d9ddd6; }
+    .capability h2 { margin-top: 12px; }
+    .footer { align-items: flex-start; }
+    .footer-links { flex-wrap: wrap; gap: 10px 16px; }
   }
 </style>

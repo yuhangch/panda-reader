@@ -1,0 +1,61 @@
+.site-title {
+  align-items: center;
+  gap: var(--sl-nav-gap);
+  min-width: 0;
+  color: var(--sl-color-text-accent);
+  font-size: var(--sl-text-h4);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.site-title img {
+  width: auto;
+  height: calc(var(--sl-nav-height) - 2 * var(--sl-nav-pad-y));
+  max-width: 100%;
+  flex: 0 0 auto;
+  object-fit: contain;
+  object-position: 0 50%;
+}
+
+.site-wordmark,
+.site-wordmark span {
+  display: inline;
+  overflow: visible;
+  white-space: nowrap;
+}
+
+.site-title .brand-word-panda {
+  color: #315d47;
+}
+
+:root[data-theme='dark'] .site-title .brand-word-panda {
+  color: #9bc2a7;
+}
+
+.site-title .brand-word-reader {
+  color: #111;
+}
+
+:root[data-theme='dark'] .site-title .brand-word-reader {
+  color: #f4f4f4;
+}
+
+.sl-markdown-content {
+  font-family: 'iA Writer Quattro', Georgia, serif;
+}
+
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
+  font-family: 'IBM Plex Serif', Georgia, serif;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #e8efe9;
+  --sl-color-accent: #315d47;
+  --sl-color-accent-high: #203d2e;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #203d2e;
+  --sl-color-accent: #9bc2a7;
+  --sl-color-accent-high: #d8eadc;
+}

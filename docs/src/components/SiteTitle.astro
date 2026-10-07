@@ -1,0 +1,21 @@
+---
+import { logos } from 'virtual:starlight/user-images';
+import config from 'virtual:starlight/user-config';
+
+const { siteTitleHref } = Astro.locals.starlightRoute;
+---
+
+<a href={siteTitleHref} class="site-title sl-flex">
+  {config.logo && logos.dark && (
+    <img
+      alt={config.logo.alt}
+      src={logos.dark.src}
+      width={logos.dark.width}
+      height={logos.dark.height}
+    />
+  )}
+  <span class="site-wordmark brand-wordmark" translate="no">
+    <span class="brand-word-panda">Panda</span>
+    <span class="brand-word-reader"> Reader</span>
+  </span>
+</a>

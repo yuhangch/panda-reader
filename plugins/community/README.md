@@ -14,8 +14,9 @@ source files, bump the plugin version in its manifest when behavior changes, and
 python scripts/generate_community_plugin_index.py
 ```
 
-The script uses the Python 3.11+ standard library. CI checks that the committed catalog is up to
-date. README and fixture files are for maintainers and are not downloaded by the app.
+The script uses the Python 3.11+ standard library. Check that the committed catalog is current
+with `python scripts/generate_community_plugin_index.py --check`. README and fixture files are for
+maintainers and are not downloaded by the app.
 
 - [`community.sciencenet`](community.sciencenet) removes ScienceNet's duplicate header table and
   standalone reposting notice.

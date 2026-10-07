@@ -6,8 +6,8 @@ description: Create a Panda Reader article plugin from a site-specific cleanup o
 # Create a Panda Reader article plugin
 
 Create an importable Panda Reader plugin for the user's requested publisher or article-page
-transformation. Read [`docs/plugins/README.md`](../../../docs/plugins/README.md) for the current
-manifest, rule actions, capabilities, and Wasm SDK details. Use the existing examples in
+transformation. Read the [plugin overview](../../../docs/src/content/docs/docs/plugins/index.md)
+for links to the current manifest, rule actions, capabilities, and Wasm SDK details. Use the examples in
 `docs/plugins/examples/` as working references.
 
 ## Choose the smallest plugin type
@@ -41,7 +41,7 @@ manifest, rule actions, capabilities, and Wasm SDK details. Use the existing exa
 
 - Validate the manifest and rules with the plugin runner when the Panda Reader workspace is
   available. The runner takes a plugin directory, article URL, title, and local fixture; it does
-  not fetch network content. See the command in `docs/plugins/README.md`.
+  not fetch network content. See the [testing guide](../../../docs/src/content/docs/docs/plugins/testing.md).
 - For Wasm, use `docs/plugins/examples/json-recovery` and build for
   `wasm32-unknown-unknown`; name the runtime module `plugin.wasm` in the importable plugin folder.
 - Keep the deliverable limited to the plugin directory (or a ZIP if the user asks for one). Tell

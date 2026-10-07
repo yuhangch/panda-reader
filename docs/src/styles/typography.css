@@ -1,0 +1,31 @@
+@font-face {
+  font-family: 'IBM Plex Serif';
+  src: url('../assets/fonts/ibm-plex-serif-regular-latin.woff2') format('woff2');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'IBM Plex Serif';
+  src: url('../assets/fonts/ibm-plex-serif-semibold-latin.woff2') format('woff2');
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'iA Writer Quattro';
+  src: url('../assets/fonts/ia-writer-quattro-regular.woff2') format('woff2');
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}
+
+.brand-wordmark {
+  font-family: 'IBM Plex Serif', Georgia, serif;
+  font-style: italic;
+  font-weight: 600;
+  letter-spacing: -.045em;
+  line-height: 1.1;
+}

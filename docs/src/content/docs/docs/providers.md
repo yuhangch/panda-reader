@@ -1,4 +1,7 @@
-# Provider setup
+---
+title: Provider setup
+description: Choose a local library or connect Panda Reader to Miniflux or FreshRSS.
+---
 
 Panda Reader has two library sources, selectable in **Settings → General → Subscription source**:
 

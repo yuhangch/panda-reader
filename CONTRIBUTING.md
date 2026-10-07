@@ -12,7 +12,7 @@ cargo test --workspace --locked
 cargo check --workspace --locked
 ```
 
-The GitHub Actions workflow additionally builds the desktop app on Windows, macOS, and Linux. On the maintainer's Windows machine, keep `.cargo/config.toml` unchanged because it places linker output on a local disk.
+The GitHub Actions workflow builds the desktop app on Windows, macOS, and Linux. Community plugin catalog consistency is checked locally with `python scripts/generate_community_plugin_index.py --check`; regenerate it after plugin changes with `python scripts/generate_community_plugin_index.py`. On the maintainer's Windows machine, keep `.cargo/config.toml` unchanged because it places linker output on a local disk.
 
 ## Pull requests
 
@@ -27,4 +27,4 @@ Implement the provider in `crates/panda-providers`, document supported operation
 
 ## Adding a community article plugin
 
-Use the repository [Panda Reader plugin skill](.agents/skills/panda-reader-plugin/SKILL.md) when authoring a site-specific rule. Community plugins live under `plugins/community/community.<site>/`. Bump the plugin version when its behavior changes, then regenerate the catalog with `python scripts/generate_community_plugin_index.py`. CI checks the generated `index.json` and payload hashes.
+Use the repository [Panda Reader plugin skill](.agents/skills/panda-reader-plugin/SKILL.md) when authoring a site-specific rule, and see the [plugin documentation](https://yuhangch.github.io/panda-reader/docs/plugins/) for the format and local testing workflow. Community plugins live under `plugins/community/community.<site>/`. Bump the plugin version when its behavior changes, then regenerate and locally check the catalog with `python scripts/generate_community_plugin_index.py` and `python scripts/generate_community_plugin_index.py --check`.
