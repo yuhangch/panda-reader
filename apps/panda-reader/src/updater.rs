@@ -58,6 +58,16 @@ struct InstallPlan {
     kind: InstallKind,
     target: PathBuf,
     helper: PathBuf,
+    #[cfg(target_os = "windows")]
+    #[serde(default)]
+    windows_scope: Option<WindowsInstallScope>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum WindowsInstallScope {
+    CurrentUser,
+    AllUsers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,25 +316,164 @@ fn package_name(version: &str, kind: InstallKind) -> String {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+fn normalize_windows_path(path: &Path) -> String {
+    path.as_os_str()
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn classify_windows_install_scope(
+    executable_root: &Path,
+    current_user_install: Option<PathBuf>,
+    all_users_install: Option<PathBuf>,
+) -> Result<WindowsInstallScope, String> {
+    let executable_root = normalize_windows_path(executable_root);
+    let matches = [
+        (current_user_install, WindowsInstallScope::CurrentUser),
+        (all_users_install, WindowsInstallScope::AllUsers),
+    ]
+    .into_iter()
+    .filter_map(|(location, scope)| {
+        location
+            .filter(|location| normalize_windows_path(location) == executable_root)
+            .map(|_| scope)
+    })
+    .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [scope] => Ok(*scope),
+        [] => Err("Automatic updates cannot verify this installation's user or all-users scope. Reinstall with the Panda Reader setup package or update manually.".into()),
+        _ => Err("More than one Panda Reader install registration matches this folder. Update manually to avoid changing installation scope.".into()),
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_setup_scope_argument(scope: WindowsInstallScope) -> &'static str {
+    match scope {
+        WindowsInstallScope::CurrentUser => "/CURRENTUSER",
+        WindowsInstallScope::AllUsers => "/ALLUSERS",
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_install_locations() -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY, REG_SZ,
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+    };
+
+    const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{B7E2C4A1-9F38-4D6E-A1C5-8E2F0D47B9C3}_is1";
+
+    fn read_location(root: HKEY, key_name: &[u16]) -> Result<Option<PathBuf>, String> {
+        use std::ptr::{null, null_mut};
+
+        let mut key = null_mut();
+        // SAFETY: key_name is null terminated and key is a valid output pointer.
+        let status = unsafe {
+            RegOpenKeyExW(
+                root,
+                key_name.as_ptr(),
+                0,
+                KEY_READ | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != 0 {
+            return Err(format!(
+                "Could not inspect the Panda Reader installer registration ({status})."
+            ));
+        }
+
+        let value_name = "InstallLocation"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut value_type = 0;
+        let mut byte_len = 0;
+        // SAFETY: key is open; a null data pointer requests the value size.
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                null(),
+                &mut value_type,
+                null_mut(),
+                &mut byte_len,
+            )
+        };
+        if status != 0 {
+            // SAFETY: key was returned successfully by RegOpenKeyExW.
+            unsafe { RegCloseKey(key) };
+            if status == ERROR_FILE_NOT_FOUND {
+                return Ok(None);
+            }
+            return Err(format!(
+                "Could not read the Panda Reader install location ({status})."
+            ));
+        }
+        if value_type != REG_SZ || byte_len < 2 {
+            // SAFETY: key was returned successfully by RegOpenKeyExW.
+            unsafe { RegCloseKey(key) };
+            return Ok(None);
+        }
+
+        let mut value = vec![0_u8; byte_len as usize];
+        // SAFETY: value has byte_len writable bytes and all input pointers remain valid.
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name.as_ptr(),
+                null(),
+                &mut value_type,
+                value.as_mut_ptr(),
+                &mut byte_len,
+            )
+        };
+        // SAFETY: key was returned successfully by RegOpenKeyExW.
+        unsafe { RegCloseKey(key) };
+        if status != 0 {
+            return Err(format!(
+                "Could not read the Panda Reader install location ({status})."
+            ));
+        }
+        let wide = value[..byte_len as usize]
+            .chunks_exact(2)
+            .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect::<Vec<_>>();
+        let path = String::from_utf16(&wide)
+            .map_err(|_| "The Panda Reader install location is not valid UTF-16.".to_owned())?;
+        Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+    }
+
+    let key_name = UNINSTALL_KEY
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let current_user = read_location(HKEY_CURRENT_USER, &key_name)?;
+    let all_users = read_location(HKEY_LOCAL_MACHINE, &key_name)?;
+    Ok((current_user, all_users))
+}
+
 fn detect_installation() -> Result<InstallPlan, String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     #[cfg(target_os = "windows")]
     {
-        let local_app_data = std::env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                "Could not locate this user's Windows application directory.".to_owned()
-            })?;
-        let expected_root = local_app_data.join("Programs").join("Panda Reader");
         let root = executable
             .parent()
             .ok_or_else(|| "Could not locate the Panda Reader installation folder.".to_owned())?;
-        let normalized_root = root.to_string_lossy().to_lowercase();
-        let normalized_expected = expected_root.to_string_lossy().to_lowercase();
-        if !normalized_root.starts_with(&normalized_expected)
-            || !root.join("unins000.exe").is_file()
-        {
-            return Err("Automatic updates support the per-user Windows installer. This copy appears to be a portable or all-users installation.".into());
+        let (current_user_install, all_users_install) = windows_install_locations()?;
+        let scope = classify_windows_install_scope(root, current_user_install, all_users_install)?;
+        if !root.join("unins000.exe").is_file() {
+            return Err("This copy is missing its installer registration and cannot be updated automatically.".into());
         }
         let helper = root.join("panda-reader-updater.exe");
         if !helper.is_file() {
@@ -334,6 +483,7 @@ fn detect_installation() -> Result<InstallPlan, String> {
             kind: InstallKind::WindowsSetup,
             target: executable,
             helper,
+            windows_scope: Some(scope),
         });
     }
     #[cfg(target_os = "macos")]
@@ -488,11 +638,27 @@ pub fn apply_pending_on_launch(data_dir: &Path) -> bool {
         let _ = fs::remove_file(pending_path);
         return false;
     }
-    let Ok(expected_plan) = detect_installation() else {
-        return false;
+    let expected_plan = match detect_installation() {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = fs::remove_file(&pending_path);
+            let _ = fs::write(data_dir.join("update-failure.txt"), error);
+            return false;
+        }
     };
-    if expected_plan.target != update.plan.target || expected_plan.kind != update.plan.kind {
+    #[cfg(target_os = "windows")]
+    let scope_changed = expected_plan.windows_scope != update.plan.windows_scope;
+    #[cfg(not(target_os = "windows"))]
+    let scope_changed = false;
+    if expected_plan.target != update.plan.target
+        || expected_plan.kind != update.plan.kind
+        || scope_changed
+    {
         let _ = fs::remove_file(pending_path);
+        let _ = fs::write(
+            data_dir.join("update-failure.txt"),
+            "The pending update no longer matches this installation. Check for updates again.",
+        );
         return false;
     }
     match spawn_helper(&update, data_dir, std::process::id()) {
@@ -594,26 +760,206 @@ fn apply_windows_setup(
     target: &Path,
     version: &semver::Version,
 ) -> Result<(), String> {
-    let backup = std::env::temp_dir().join(format!("panda-reader-{}-old.exe", std::process::id()));
-    fs::copy(target, &backup)
-        .map_err(|error| format!("Could not back up the current app: {error}"))?;
-    let status = Command::new(package)
-        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
-        .status()
-        .map_err(|error| format!("Could not run the installer: {error}"))?;
+    let root = target
+        .parent()
+        .ok_or_else(|| "Could not locate the Panda Reader installation folder.".to_owned())?;
+    let (current_user_install, all_users_install) = windows_install_locations()?;
+    let scope = classify_windows_install_scope(root, current_user_install, all_users_install)?;
+    let backup = if scope == WindowsInstallScope::CurrentUser {
+        let backup =
+            std::env::temp_dir().join(format!("panda-reader-{}-old.exe", std::process::id()));
+        fs::copy(target, &backup)
+            .map_err(|error| format!("Could not back up the current app: {error}"))?;
+        Some(backup)
+    } else {
+        None
+    };
+    let status = match run_windows_setup(package, scope) {
+        Ok(status) => status,
+        Err(error) => {
+            if let Some(backup) = &backup {
+                let _ = fs::copy(backup, target);
+                let _ = fs::remove_file(backup);
+            }
+            return Err(error);
+        }
+    };
     if !status.success() {
-        let _ = fs::copy(&backup, target);
+        if let Some(backup) = &backup {
+            let _ = fs::copy(backup, target);
+            let _ = fs::remove_file(backup);
+        }
         return Err(format!("The installer exited with {status}."));
     }
     let launch = Command::new(target).spawn();
     if let Err(error) = launch {
-        let _ = fs::copy(&backup, target);
+        if let Some(backup) = &backup {
+            let _ = fs::copy(backup, target);
+            let _ = fs::remove_file(backup);
+        }
         return Err(format!(
             "Could not relaunch Panda Reader {version}: {error}"
         ));
     }
-    let _ = fs::remove_file(backup);
+    if let Some(backup) = backup {
+        let _ = fs::remove_file(backup);
+    }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_setup(
+    package: &Path,
+    scope: WindowsInstallScope,
+) -> Result<std::process::ExitStatus, String> {
+    let mode = windows_setup_scope_argument(scope);
+    let arguments = [
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-",
+        mode,
+    ];
+
+    if scope == WindowsInstallScope::CurrentUser {
+        return Command::new(package)
+            .args(arguments)
+            .status()
+            .map_err(|error| format!("Could not run the installer: {error}"));
+    }
+
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_FAILED};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+
+    let verb = "runas".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let file = package
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let parameters = arguments
+        .join(" ")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the struct is zero-initialized and all strings remain alive through ShellExecuteExW.
+    let mut execute_info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    execute_info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    execute_info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    execute_info.lpVerb = verb.as_ptr();
+    execute_info.lpFile = file.as_ptr();
+    execute_info.lpParameters = parameters.as_ptr();
+    execute_info.nShow = 0;
+    // SAFETY: execute_info points to a fully initialized structure with valid null-terminated strings.
+    if unsafe { ShellExecuteExW(&mut execute_info) } == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            return Err(
+                "Administrator approval was cancelled. Panda Reader was not updated.".into(),
+            );
+        }
+        return Err(format!("Could not start the elevated installer: {error}"));
+    }
+    if execute_info.hProcess.is_null() {
+        return Err("Windows did not return a handle for the elevated installer.".into());
+    }
+
+    // SAFETY: ShellExecuteExW returned a process handle because SEE_MASK_NOCLOSEPROCESS was set.
+    let wait = unsafe { WaitForSingleObject(execute_info.hProcess, INFINITE) };
+    if wait == WAIT_FAILED {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: execute_info.hProcess is an owned process handle.
+        unsafe { CloseHandle(execute_info.hProcess) };
+        return Err(format!(
+            "Could not wait for the elevated installer: {error}"
+        ));
+    }
+    let mut exit_code = 0;
+    // SAFETY: execute_info.hProcess is an owned process handle and exit_code is a valid output pointer.
+    let got_exit_code = unsafe { GetExitCodeProcess(execute_info.hProcess, &mut exit_code) };
+    // SAFETY: execute_info.hProcess is an owned process handle.
+    unsafe { CloseHandle(execute_info.hProcess) };
+    if got_exit_code == 0 {
+        return Err(format!(
+            "Could not read the elevated installer exit code: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    use std::os::windows::process::ExitStatusExt as _;
+    Ok(std::process::ExitStatus::from_raw(exit_code))
+}
+
+#[cfg(test)]
+mod updater_tests {
+    use super::{
+        WindowsInstallScope, classify_windows_install_scope, normalize_windows_path,
+        windows_setup_scope_argument,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn detects_current_user_install_from_matching_registration() {
+        let root = PathBuf::from(r"C:\Users\reader\AppData\Local\Programs\Panda Reader");
+        let scope = classify_windows_install_scope(
+            &root,
+            Some(root.clone()),
+            Some(PathBuf::from(r"C:\Program Files\Panda Reader")),
+        )
+        .unwrap();
+        assert_eq!(scope, WindowsInstallScope::CurrentUser);
+        assert_eq!(windows_setup_scope_argument(scope), "/CURRENTUSER");
+    }
+
+    #[test]
+    fn detects_all_users_install_from_matching_registration() {
+        let root = PathBuf::from(r"C:\Program Files\Panda Reader");
+        let scope = classify_windows_install_scope(
+            &root,
+            Some(PathBuf::from(
+                r"C:\Users\reader\AppData\Local\Programs\Panda Reader",
+            )),
+            Some(root.clone()),
+        )
+        .unwrap();
+        assert_eq!(scope, WindowsInstallScope::AllUsers);
+        assert_eq!(windows_setup_scope_argument(scope), "/ALLUSERS");
+    }
+
+    #[test]
+    fn install_location_matching_is_case_insensitive_and_ignores_trailing_separators() {
+        assert_eq!(
+            normalize_windows_path(PathBuf::from(r"C:/Program Files/PANDA READER/").as_path()),
+            normalize_windows_path(PathBuf::from(r"c:\program files\panda reader").as_path()),
+        );
+    }
+
+    #[test]
+    fn refuses_unregistered_or_ambiguous_installations() {
+        let root = PathBuf::from(r"D:\Portable\Panda Reader");
+        assert!(classify_windows_install_scope(&root, None, None).is_err());
+        assert!(
+            classify_windows_install_scope(&root, Some(root.clone()), Some(root.clone())).is_err()
+        );
+    }
+
+    #[test]
+    fn refuses_registry_entries_for_a_different_install_path() {
+        let root = PathBuf::from(r"C:\Program Files\Panda Reader");
+        let scope = classify_windows_install_scope(
+            &root,
+            Some(PathBuf::from(
+                r"C:\Users\reader\AppData\Local\Programs\Panda Reader",
+            )),
+            Some(PathBuf::from(r"D:\Apps\Panda Reader")),
+        );
+        assert!(scope.is_err());
+    }
 }
 
 #[cfg(target_os = "macos")]
