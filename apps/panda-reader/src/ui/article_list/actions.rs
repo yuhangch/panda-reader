@@ -21,6 +21,17 @@ impl ReaderWindow {
         self.load_snapshot(cx);
     }
 
+    pub(in crate::ui) fn select_scope_preserving_article(
+        &mut self,
+        scope: Scope,
+        cx: &mut Context<Self>,
+    ) {
+        self.list.scope = scope;
+        self.list.articles = Arc::new(Vec::new());
+        self.list.has_more = false;
+        self.load_snapshot(cx);
+    }
+
     pub(in crate::ui) fn load_snapshot(&mut self, cx: &mut Context<Self>) {
         self.list.is_loading_more = false;
         self.load_snapshot_page(false, cx);

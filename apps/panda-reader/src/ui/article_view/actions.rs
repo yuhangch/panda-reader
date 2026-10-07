@@ -3,7 +3,7 @@ use crate::ui::i18n;
 use crate::ui::settings::SettingsPage;
 use crate::ui::window::ReaderWindow;
 use gpui_kit::*;
-use panda_core::{MarkField, TranslationLayout};
+use panda_core::{MarkField, Scope, TranslationLayout};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -86,7 +86,7 @@ impl ReaderWindow {
                         this.reader.showing_translation = false;
                         this.reader.body_html = prepared.body_html.into();
                         this.reader.body_markdown = prepared.body_markdown.into();
-                        this.reader.image_urls = prepared.image_urls;
+                        this.reader.image_urls = prepared.image_urls.to_vec();
                         let should_auto_extract = this.preferences.auto_extract_full_text
                             && article.extracted_html.is_none()
                             && article.url.is_some();
@@ -221,7 +221,7 @@ impl ReaderWindow {
                         this.reader.article = Some(prepared.article);
                         this.reader.body_html = prepared.body_html.into();
                         this.reader.body_markdown = prepared.body_markdown.into();
-                        this.reader.image_urls = prepared.image_urls;
+                        this.reader.image_urls = prepared.image_urls.to_vec();
                     }
                     Err(error) => this.set_error(error),
                 }
@@ -238,6 +238,27 @@ impl ReaderWindow {
         value: bool,
         cx: &mut Context<Self>,
     ) {
+        let current = self
+            .reader
+            .article
+            .as_ref()
+            .filter(|article| article.summary.id == id)
+            .map(|article| (article.summary.feed_id, article.summary.is_read))
+            .or_else(|| {
+                self.list
+                    .articles
+                    .iter()
+                    .find(|article| article.id == id)
+                    .map(|article| (article.feed_id, article.is_read))
+            });
+        let feed_id = current.map(|(feed_id, _)| feed_id);
+        let old_read = current.map(|(_, is_read)| is_read).unwrap_or(!value);
+        let remove_from_scope = matches!(
+            (&self.list.scope, field, value),
+            (Scope::Unread, MarkField::Read, true)
+                | (Scope::Starred, MarkField::Starred, false)
+                | (Scope::Later, MarkField::Later, false)
+        );
         if let Some(article) = &mut self.reader.article {
             if article.summary.id == id {
                 match field {
@@ -256,6 +277,17 @@ impl ReaderWindow {
                 MarkField::Starred => summary.is_starred = value,
                 MarkField::Later => summary.read_later = value,
             }
+        }
+        if field == MarkField::Read
+            && old_read != value
+            && let Some(feed_id) = feed_id
+            && let Some(feed) = self
+                .sidebar
+                .feeds
+                .iter_mut()
+                .find(|feed| feed.id == feed_id)
+        {
+            feed.unread = (feed.unread + if value { -1 } else { 1 }).max(0);
         }
         cx.notify();
 
@@ -291,9 +323,22 @@ impl ReaderWindow {
                             MarkField::Later => summary.read_later = !value,
                         }
                     }
+                    if field == MarkField::Read
+                        && old_read != value
+                        && let Some(feed_id) = feed_id
+                        && let Some(feed) = this
+                            .sidebar
+                            .feeds
+                            .iter_mut()
+                            .find(|feed| feed.id == feed_id)
+                    {
+                        feed.unread = (feed.unread + if old_read { 1 } else { -1 }).max(0);
+                    }
                     this.set_error(error);
+                } else if remove_from_scope {
+                    Arc::make_mut(&mut this.list.articles).retain(|article| article.id != id);
+                    this.load_snapshot(cx);
                 }
-                this.load_snapshot(cx);
                 cx.notify();
             });
         })
@@ -367,7 +412,7 @@ impl ReaderWindow {
                                     {
                                         this.reader.body_html = prepared.body_html.into();
                                         this.reader.body_markdown = prepared.body_markdown.into();
-                                        this.reader.image_urls = prepared.image_urls;
+                                        this.reader.image_urls = prepared.image_urls.to_vec();
                                         this.reader.article = Some(prepared.article);
                                         cx.notify();
                                     }
@@ -449,7 +494,7 @@ impl ReaderWindow {
                             this.reader.showing_translation = true;
                             this.reader.body_html = prepared.body_html.into();
                             this.reader.body_markdown = prepared.body_markdown.into();
-                            this.reader.image_urls = prepared.image_urls;
+                            this.reader.image_urls = prepared.image_urls.to_vec();
                             if let Some(row) = Arc::make_mut(&mut this.list.articles)
                                 .iter_mut()
                                 .find(|row| {
