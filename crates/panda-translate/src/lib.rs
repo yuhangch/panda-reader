@@ -13,6 +13,7 @@ pub use azure::AzureTranslator;
 pub use html::{
     HtmlTranslation, TranslationInput, block_needs_translation, source_hash, split_blocks,
     split_text_for_translate, translate_html_blocks, translation_cache_hash,
+    translation_revision_hash,
 };
 pub use volcengine::VolcengineTranslator;
 

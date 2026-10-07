@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 ammonia.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 dom_smoothie.workspace = true
 decruft.workspace = true
 rs-trafilatura.workspace = true
@@ -17,7 +18,6 @@ hex.workspace = true
 opml.workspace = true
 panda-content = { path = "../panda-content" }
 panda-core = { path = "../panda-core" }
-panda-miniflux = { path = "../panda-miniflux" }
 panda-providers = { path = "../panda-providers" }
 panda-translate = { path = "../panda-translate" }
 reqwest.workspace = true

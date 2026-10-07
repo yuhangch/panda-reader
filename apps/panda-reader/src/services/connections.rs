@@ -1,8 +1,7 @@
-use super::articles::cache::BodyCache;
+use super::articles::cache::RenderCache;
 use super::command::ConnectOutcome;
-use super::worker::{WorkerState, job};
+use super::worker::{WorkerState, job, read_lock, write_lock};
 use panda_providers::{ProviderClient, ProviderKind, ProviderSettings, save_settings};
-use panda_store::Store;
 use tokio::sync::oneshot;
 
 pub(super) fn connect(
@@ -22,6 +21,7 @@ pub(super) fn connect(
     let settings_path = state.provider_settings_path.clone();
     let settings_map = state.provider_settings.clone();
     let cache = state.body_cache.clone();
+    let database = state.database.clone();
     job(reply, move |runtime| {
         let settings = ProviderSettings {
             endpoint,
@@ -32,18 +32,13 @@ pub(super) fn connect(
         let identity = runtime
             .block_on(remote.identity())
             .map_err(|e| e.to_string())?;
-        let mut all = settings_map.read().map_err(|e| e.to_string())?.clone();
+        let mut all = read_lock(&settings_map, "provider settings").clone();
         all.insert(kind, settings);
         save_settings(&settings_path, &all).map_err(|e| e.to_string())?;
-        *settings_map.write().map_err(|e| e.to_string())? = all;
-        if let Ok(mut cache) = cache.lock() {
-            *cache = BodyCache::default();
-        }
-        let mut store = Store::open_workspace(&path, &workspace).map_err(|e| e.to_string())?;
-        let initial_sync_error = runtime
-            .block_on(store.sync_provider(&remote, kind))
-            .err()
-            .map(|error| error.to_string());
+        *write_lock(&settings_map, "provider settings") = all;
+        *RenderCache::lock(&cache) = RenderCache::default();
+        let initial_sync_error =
+            super::sync::sync_provider(&path, &workspace, &database, &remote, kind, runtime).err();
         Ok(ConnectOutcome {
             account_name: identity.name,
             initial_sync_error,
@@ -57,16 +52,12 @@ pub(super) fn disconnect(
     state: &WorkerState,
 ) {
     let result = (|| {
-        let mut all = state
-            .provider_settings
-            .read()
-            .map_err(|e| e.to_string())?
-            .clone();
+        let mut all = read_lock(&state.provider_settings, "provider settings").clone();
         all.remove(&kind);
         state
             .save_provider_settings(&all)
             .map_err(|e| e.to_string())?;
-        *state.provider_settings.write().map_err(|e| e.to_string())? = all;
+        *write_lock(&state.provider_settings, "provider settings") = all;
         Ok(())
     })();
     let _ = reply.send(result);

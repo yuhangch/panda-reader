@@ -24,6 +24,25 @@ pub fn translation_cache_hash(html: &str, title: &str, provider: &str) -> String
     hex::encode(hasher.finalize())
 }
 
+/// Cache identity for a translation derived from a canonical article revision.
+/// The target language is part of the key so switching languages cannot reuse
+/// a translation produced for another target.
+pub fn translation_revision_hash(
+    canonical_revision: &str,
+    provider: &str,
+    target_lang: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"panda-translation-target-v1\0");
+    hasher.update(provider.as_bytes());
+    hasher.update([0]);
+    hasher.update(target_lang.as_bytes());
+    format!(
+        "panda-translation-v1:{canonical_revision}:{}",
+        hex::encode(hasher.finalize())
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TranslationInput {
     Html,
@@ -424,6 +443,27 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_eq!(a, source_hash("<p>hi</p>", "Title"));
+    }
+
+    #[test]
+    fn translation_revision_tracks_canonical_provider_and_target() {
+        let revision = translation_revision_hash("canonical-a", "azure", "zh-Hans");
+        assert_eq!(
+            revision,
+            translation_revision_hash("canonical-a", "azure", "zh-Hans")
+        );
+        assert_ne!(
+            revision,
+            translation_revision_hash("canonical-b", "azure", "zh-Hans")
+        );
+        assert_ne!(
+            revision,
+            translation_revision_hash("canonical-a", "volcengine", "zh-Hans")
+        );
+        assert_ne!(
+            revision,
+            translation_revision_hash("canonical-a", "azure", "ja")
+        );
     }
 
     #[test]

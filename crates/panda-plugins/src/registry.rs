@@ -1,18 +1,19 @@
 use crate::{
-    CommunityPlugin, PluginCapability, PluginKind, PluginManifest, PluginStage,
+    ArticleDocument, CommunityPlugin, PluginCapability, PluginKind, PluginManifest, PluginStage,
     catalog::install_verified,
-    rules::{RuleSet, apply_rules_isolated},
+    rules::{RuleSet, apply_rules_isolated_document},
     wasm,
 };
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::borrow::Cow;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     io::{Cursor, Read},
     path::Path,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 use url::Url;
 use zip::ZipArchive;
@@ -57,9 +58,9 @@ impl PluginSettings {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct PluginResult {
-    pub html: String,
+#[derive(Clone, Debug)]
+pub struct PluginResult<'a> {
+    pub html: Cow<'a, str>,
     pub body_selected: bool,
     pub matched_plugins: Vec<(String, String)>,
     pub diagnostics: Vec<PluginDiagnostic>,
@@ -80,6 +81,19 @@ struct PluginEntry {
 }
 
 impl PluginRegistry {
+    fn lock_runtime_errors(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        match self.runtime_errors.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                self.runtime_errors.clear_poison();
+                eprintln!("plugin runtime error cache recovered after a panic");
+                guard
+            }
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             generation: 0,
@@ -111,15 +125,12 @@ impl PluginRegistry {
         &self.diagnostics
     }
     pub fn plugins(&self) -> Vec<PluginSummary> {
-        let errors = self.runtime_errors.lock().ok();
+        let errors = self.lock_runtime_errors();
         self.plugins
             .iter()
             .map(|entry| {
                 let mut summary = entry.summary.clone();
-                if let Some(error) = errors
-                    .as_ref()
-                    .and_then(|errors| errors.get(&summary.manifest.id))
-                {
+                if let Some(error) = errors.get(&summary.manifest.id) {
                     summary.last_error = Some(error.clone());
                 }
                 summary
@@ -195,16 +206,18 @@ impl PluginRegistry {
         registry
     }
 
-    pub fn process(
+    pub fn process<'a>(
         &self,
-        source: &str,
+        source: &'a str,
         url: &str,
         title: &str,
         stage: PluginStage,
-    ) -> PluginResult {
+    ) -> PluginResult<'a> {
         let mut output = PluginResult {
-            html: source.to_owned(),
-            ..PluginResult::default()
+            html: Cow::Borrowed(source),
+            body_selected: false,
+            matched_plugins: Vec::new(),
+            diagnostics: Vec::new(),
         };
         let Some(parsed_url) = Url::parse(url).ok() else {
             return output;
@@ -212,6 +225,7 @@ impl PluginRegistry {
         let Some(host) = parsed_url.host_str() else {
             return output;
         };
+        let mut rule_document: Option<ArticleDocument> = None;
         for plugin in &self.plugins {
             let manifest = &plugin.summary.manifest;
             if !plugin.summary.enabled
@@ -221,38 +235,85 @@ impl PluginRegistry {
                 continue;
             }
             let applied = match manifest.kind {
-                PluginKind::Rules => plugin
-                    .rules
-                    .as_ref()
-                    .context("rules file was not loaded")
-                    .and_then(|rules| {
-                        let selected_body = rules.selects_body();
-                        apply_rules_isolated(&output.html, rules)
-                            .map(|result| result.map(|html| (html, selected_body)))
-                    }),
-                PluginKind::Wasm => plugin
-                    .wasm
-                    .as_deref()
-                    .context("Wasm module was not loaded")
-                    .and_then(|bytes| {
-                        wasm::process(
-                            bytes,
-                            &output.html,
-                            title,
-                            url,
-                            stage,
-                            &manifest.capabilities,
-                        )
-                    }),
+                PluginKind::Rules => {
+                    let Some(rules) = plugin.rules.as_ref() else {
+                        output.diagnostics.push(PluginDiagnostic {
+                            plugin_id: manifest.id.clone(),
+                            message: "rules file was not loaded".into(),
+                        });
+                        continue;
+                    };
+                    let mut document = match &rule_document {
+                        Some(document) => document.clone(),
+                        None => match ArticleDocument::parse(output.html.as_ref()) {
+                            Ok(document) => document,
+                            Err(error) => {
+                                output.diagnostics.push(PluginDiagnostic {
+                                    plugin_id: manifest.id.clone(),
+                                    message: format!("{error:#}"),
+                                });
+                                continue;
+                            }
+                        },
+                    };
+                    let selected_body = rules.selects_body();
+                    match apply_rules_isolated_document(&mut document, rules) {
+                        Ok(Some(html)) => {
+                            rule_document = Some(document);
+                            Ok(Some((html, selected_body)))
+                        }
+                        Ok(None) => {
+                            rule_document = Some(document);
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                PluginKind::Wasm => {
+                    let document = match &rule_document {
+                        Some(document) => document.clone(),
+                        None => match ArticleDocument::parse(output.html.as_ref()) {
+                            Ok(document) => document,
+                            Err(error) => {
+                                output.diagnostics.push(PluginDiagnostic {
+                                    plugin_id: manifest.id.clone(),
+                                    message: format!("{error:#}"),
+                                });
+                                continue;
+                            }
+                        },
+                    };
+                    let processed = plugin
+                        .wasm
+                        .as_deref()
+                        .context("Wasm module was not loaded")
+                        .and_then(|bytes| {
+                            wasm::process(
+                                bytes,
+                                &plugin.summary.content_hash,
+                                document,
+                                title,
+                                url,
+                                stage,
+                                &manifest.capabilities,
+                            )
+                        });
+                    match processed {
+                        Ok(Some((html, selected_body, document))) => {
+                            rule_document = Some(document);
+                            Ok(Some((html, selected_body)))
+                        }
+                        Ok(None) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                }
             };
             match applied {
                 Ok(result) => {
-                    if let Ok(mut errors) = self.runtime_errors.lock() {
-                        errors.remove(&manifest.id);
-                    }
+                    self.lock_runtime_errors().remove(&manifest.id);
                     if let Some((html, selected_body)) = result {
-                        if html != output.html || selected_body {
-                            output.html = html;
+                        if html != output.html.as_ref() || selected_body {
+                            output.html = Cow::Owned(html);
                             output.body_selected |= selected_body;
                             output
                                 .matched_plugins
@@ -262,9 +323,8 @@ impl PluginRegistry {
                 }
                 Err(error) => {
                     let message = format!("{error:#}");
-                    if let Ok(mut errors) = self.runtime_errors.lock() {
-                        errors.insert(manifest.id.clone(), message.clone());
-                    }
+                    self.lock_runtime_errors()
+                        .insert(manifest.id.clone(), message.clone());
                     output.diagnostics.push(PluginDiagnostic {
                         plugin_id: manifest.id.clone(),
                         message,

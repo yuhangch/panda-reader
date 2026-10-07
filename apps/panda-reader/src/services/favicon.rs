@@ -1,8 +1,11 @@
-use super::worker::{WorkerState, job};
+use super::worker::{WorkerState, job, lock_mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::oneshot;
 
 use std::path::Path;
+
+static FAVICON_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 pub fn sanitize_host(host: &str) -> String {
     host.chars()
@@ -29,11 +32,14 @@ pub async fn fetch_favicon(
     }
     let url = format!("https://www.google.com/s2/favicons?domain={host}&sz=64");
     let _ = site_url;
-    let client = reqwest::Client::builder()
-        .user_agent("PandaReader/0.1")
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| e.to_string())?;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("PandaReader/0.1")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("favicon HTTP client configuration is valid")
+    });
     let bytes = client
         .get(&url)
         .send()
@@ -62,19 +68,40 @@ pub(super) fn ensure_favicon(
 ) {
     let inflight = state.favicon_inflight.clone();
     job(reply, move |runtime| {
-        {
-            let mut guard = inflight.lock().map_err(|e| e.to_string())?;
-            if guard.contains_key(&host) {
-                let safe = sanitize_host(&host);
-                let path = icons_dir.join(format!("{safe}.png"));
-                if path.is_file() {
-                    return Ok(path);
+        let safe = sanitize_host(&host);
+        let path = icons_dir.join(format!("{safe}.png"));
+        loop {
+            let already_running = {
+                let mut guard = lock_mutex(&inflight, "favicon in-flight");
+                if guard.contains_key(&host) {
+                    true
+                } else {
+                    guard.insert(host.clone(), ());
+                    false
                 }
+            };
+            if !already_running {
+                break;
             }
-            guard.insert(host.clone(), ());
+            if path.is_file() {
+                return Ok(path);
+            }
+            runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(40)));
         }
-        let result = runtime.block_on(fetch_favicon(&host, &site_url, &icons_dir));
-        let _ = inflight.lock().map(|mut g| g.remove(&host));
+        let semaphore = FAVICON_LIMIT
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
+            .clone();
+        let request_host = host.clone();
+        let request_site_url = site_url.clone();
+        let request_icons_dir = icons_dir.clone();
+        let result = runtime.block_on(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|error| error.to_string())?;
+            fetch_favicon(&request_host, &request_site_url, &request_icons_dir).await
+        });
+        lock_mutex(&inflight, "favicon in-flight").remove(&host);
         result
     });
 }

@@ -1,6 +1,7 @@
 mod model;
 
 pub use model::{
-    Article, ArticleCursor, ArticleSummary, ContentExtractor, Feed, MarkField, ParsedArticle,
-    PreparedArticle, ReaderSnapshot, Scope, TranslationLayout, TranslationUsage,
+    Article, ArticleCursor, ArticleSummary, CanonicalArticle, CanonicalHtml, ContentExtractor,
+    ContentRevision, Feed, MarkField, ParsedArticle, PreparedArticle, RawHtml, ReaderSnapshot,
+    RenderDocument, RenderOptions, Scope, TranslationLayout, TranslationUsage,
 };

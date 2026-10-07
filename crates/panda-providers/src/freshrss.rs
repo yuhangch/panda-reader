@@ -1,9 +1,12 @@
-use crate::{ProviderIdentity, numeric_id};
+use crate::{
+    ProviderIdentity, RemoteCategory, RemoteEntry, RemoteFeed, SyncCursor, SyncMode, SyncPage,
+    numeric_id,
+};
 use anyhow::{Context as _, bail};
-use panda_miniflux::{Category, Entry, Feed};
 use reqwest::{Client, Method, RequestBuilder};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -43,6 +46,7 @@ impl FreshRssConnection {
 pub struct FreshRss {
     connection: FreshRssConnection,
     client: Client,
+    session_cache: std::sync::Arc<tokio::sync::Mutex<Option<(Session, Instant)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,13 +55,33 @@ struct Session {
     token: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum FreshRssCursor {
+    Full {
+        continuation: Option<String>,
+    },
+    Window {
+        since: i64,
+        until: i64,
+        continuation: Option<String>,
+    },
+    Checkpoint {
+        updated_at: i64,
+    },
+}
+
 impl FreshRss {
     pub(super) fn new(connection: FreshRssConnection) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent("PandaReader/0.1")
             .timeout(Duration::from_secs(30))
             .build()?;
-        Ok(Self { connection, client })
+        Ok(Self {
+            connection,
+            client,
+            session_cache: std::sync::Arc::default(),
+        })
     }
 
     fn url(&self, path: &str) -> anyhow::Result<Url> {
@@ -66,6 +90,11 @@ impl FreshRss {
     }
 
     async fn session(&self) -> anyhow::Result<Session> {
+        if let Some((session, created)) = self.session_cache.lock().await.as_ref()
+            && created.elapsed() < Duration::from_secs(15 * 60)
+        {
+            return Ok(session.clone());
+        }
         let login = self
             .client
             .post(self.url("accounts/ClientLogin")?)
@@ -98,10 +127,12 @@ impl FreshRss {
             .error_for_status()?
             .text()
             .await?;
-        Ok(Session {
+        let session = Session {
             auth: session.auth,
             token: token.trim().to_owned(),
-        })
+        };
+        *self.session_cache.lock().await = Some((session.clone(), Instant::now()));
+        Ok(session)
     }
 
     fn auth_request(
@@ -116,20 +147,40 @@ impl FreshRss {
         ))
     }
 
+    async fn request_with_retry(
+        &self,
+        session: &Session,
+        make_request: impl Fn(&Session) -> anyhow::Result<RequestBuilder>,
+    ) -> anyhow::Result<reqwest::Response> {
+        let response = make_request(session)?.send().await?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response.error_for_status()?);
+        }
+        {
+            let mut cache = self.session_cache.lock().await;
+            if cache.as_ref().is_some_and(|(current, _)| {
+                current.auth == session.auth && current.token == session.token
+            }) {
+                *cache = None;
+            }
+        }
+        let refreshed = self.session().await?;
+        Ok(make_request(&refreshed)?.send().await?.error_for_status()?)
+    }
+
     async fn json(
         &self,
         session: &Session,
         path: &str,
         query: &[(&str, String)],
     ) -> anyhow::Result<Value> {
-        Ok(self
-            .auth_request(session, Method::GET, path)?
-            .query(query)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.request_with_retry(session, |session| {
+            Ok(self.auth_request(session, Method::GET, path)?.query(query))
+        })
+        .await?
+        .json()
+        .await
+        .map_err(Into::into)
     }
 
     async fn mutate(
@@ -138,13 +189,15 @@ impl FreshRss {
         path: &str,
         values: &[(&str, String)],
     ) -> anyhow::Result<()> {
-        let mut form = values.to_vec();
-        form.push(("T", session.token.clone()));
-        self.auth_request(session, Method::POST, path)?
-            .form(&form)
-            .send()
-            .await?
-            .error_for_status()?;
+        let form = values.to_vec();
+        self.request_with_retry(session, |session| {
+            let mut values = form.clone();
+            values.push(("T", session.token.clone()));
+            Ok(self
+                .auth_request(session, Method::POST, path)?
+                .form(&values))
+        })
+        .await?;
         Ok(())
     }
 
@@ -156,7 +209,7 @@ impl FreshRss {
         })
     }
 
-    pub(super) async fn feeds(&self) -> anyhow::Result<Vec<Feed>> {
+    pub(super) async fn feeds(&self) -> anyhow::Result<Vec<RemoteFeed>> {
         let session = self.session().await?;
         let value = self
             .json(
@@ -201,12 +254,12 @@ impl FreshRss {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_owned();
-                        Some(Category {
+                        Some(RemoteCategory {
                             id: 0,
                             title: label,
                         })
                     });
-                Ok(Feed {
+                Ok(RemoteFeed {
                     id,
                     title,
                     feed_url,
@@ -218,7 +271,7 @@ impl FreshRss {
             .collect()
     }
 
-    pub(super) async fn all_entries(&self) -> anyhow::Result<Vec<Entry>> {
+    pub(super) async fn all_entries(&self) -> anyhow::Result<Vec<RemoteEntry>> {
         let session = self.session().await?;
         let mut cursor = String::new();
         let mut output = Vec::new();
@@ -254,6 +307,98 @@ impl FreshRss {
             cursor = next;
         }
         Ok(output)
+    }
+
+    pub(super) async fn entries_page(
+        &self,
+        mode: SyncMode,
+        cursor: Option<&SyncCursor>,
+    ) -> anyhow::Result<SyncPage> {
+        let session = self.session().await?;
+        let stored = cursor
+            .map(|cursor| serde_json::from_str::<FreshRssCursor>(&cursor.value))
+            .transpose()?;
+        let window = match (mode, stored.as_ref()) {
+            (
+                SyncMode::Incremental,
+                Some(FreshRssCursor::Window {
+                    since,
+                    until,
+                    continuation,
+                }),
+            ) => Some((*since, *until, continuation.clone())),
+            (SyncMode::Incremental, Some(FreshRssCursor::Checkpoint { updated_at })) => Some((
+                updated_at.saturating_sub(120),
+                chrono::Utc::now().timestamp(),
+                None,
+            )),
+            (SyncMode::Incremental, None) => Some((0, chrono::Utc::now().timestamp(), None)),
+            _ => None,
+        };
+        let continuation = if let Some((_, _, continuation)) = &window {
+            continuation.clone()
+        } else {
+            match stored.as_ref() {
+                Some(FreshRssCursor::Full { continuation }) => continuation.clone(),
+                _ => None,
+            }
+        };
+        let mut query = vec![("output", "json".to_owned()), ("n", "500".to_owned())];
+        if let Some((since, _, _)) = window.as_ref() {
+            query.push(("ot", since.to_string()));
+        }
+        if let Some(continuation) = &continuation {
+            query.push(("c", continuation.clone()));
+        }
+        let value = self
+            .json(
+                &session,
+                "reader/api/0/stream/contents/reading-list",
+                &query,
+            )
+            .await?;
+        let rows = value
+            .get("items")
+            .and_then(Value::as_array)
+            .context("FreshRSS response has no items list")?;
+        let entries = rows
+            .iter()
+            .filter_map(|row| parse_entry(row).transpose())
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let next = value
+            .get("continuation")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let has_more =
+            !rows.is_empty() && !next.is_empty() && Some(next.as_str()) != continuation.as_deref();
+        let next_state = if has_more {
+            if let Some((since, until, _)) = window {
+                FreshRssCursor::Window {
+                    since,
+                    until,
+                    continuation: Some(next),
+                }
+            } else {
+                FreshRssCursor::Full {
+                    continuation: Some(next),
+                }
+            }
+        } else if let Some((_, until, _)) = window {
+            FreshRssCursor::Checkpoint { updated_at: until }
+        } else {
+            FreshRssCursor::Checkpoint {
+                updated_at: chrono::Utc::now().timestamp(),
+            }
+        };
+        Ok(SyncPage {
+            entries,
+            next_cursor: Some(SyncCursor {
+                value: serde_json::to_string(&next_state)?,
+            }),
+            has_more,
+            full_sync: !matches!(mode, SyncMode::Incremental),
+        })
     }
 
     pub(super) async fn add_feed(&self, url: &str) -> anyhow::Result<()> {
@@ -300,17 +445,17 @@ impl FreshRss {
                 form.push(("i", id.to_string()));
             }
             form.push((action, state.to_owned()));
-            self.auth_request(&session, Method::POST, "reader/api/0/edit-tag")?
-                .form(&form)
-                .send()
-                .await?
-                .error_for_status()?;
+            self.request_with_retry(&session, |session| {
+                let mut form = form.clone();
+                form.retain(|(key, _)| *key != "T");
+                form.push(("T", session.token.clone()));
+                Ok(self
+                    .auth_request(session, Method::POST, "reader/api/0/edit-tag")?
+                    .form(&form))
+            })
+            .await?;
         }
         Ok(())
-    }
-
-    pub(super) async fn set_starred(&self, id: i64, starred: bool) -> anyhow::Result<()> {
-        self.mark_entries_status(&[id], "starred", starred).await
     }
 
     pub(super) async fn import_opml(&self, xml: &str) -> anyhow::Result<()> {
@@ -354,7 +499,7 @@ impl FreshRss {
     }
 }
 
-fn parse_entry(row: &Value) -> anyhow::Result<Option<Entry>> {
+fn parse_entry(row: &Value) -> anyhow::Result<Option<RemoteEntry>> {
     let id = row
         .get("id")
         .and_then(Value::as_str)
@@ -399,7 +544,7 @@ fn parse_entry(row: &Value) -> anyhow::Result<Option<Entry>> {
         .and_then(Value::as_i64)
         .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
         .map(|time| time.to_rfc3339());
-    Ok(Some(Entry {
+    Ok(Some(RemoteEntry {
         id: numeric_id(id)?,
         feed_id: numeric_id(feed_id)?,
         title: row
@@ -418,6 +563,12 @@ fn parse_entry(row: &Value) -> anyhow::Result<Option<Entry>> {
         }
         .into(),
         starred: states.iter().any(|s| s.ends_with("/starred")),
+        changed_at: row
+            .get("updated")
+            .and_then(Value::as_i64)
+            .and_then(|seconds| chrono::DateTime::from_timestamp(seconds, 0))
+            .map(|time| time.to_rfc3339()),
+        revision: row.get("updated").map(Value::to_string),
     }))
 }
 
@@ -525,7 +676,7 @@ mod tests {
 
     #[test]
     fn mock_server_covers_auth_pagination_feed_changes_and_state_sync() {
-        let (endpoint, server) = mock_server(18, |line, _body| {
+        let (endpoint, server) = mock_server(8, |line, _body| {
             let path = line.split_whitespace().nth(1).unwrap_or_default();
             if path.ends_with("/accounts/ClientLogin") {
                 (200, "SID=session\nAuth=auth-token")
@@ -581,7 +732,7 @@ mod tests {
                 .iter()
                 .filter(|(line, _)| line.ends_with("/reader/api/0/token HTTP/1.1"))
                 .count()
-                == 6
+                == 1
         );
         assert!(
             requests
@@ -606,6 +757,46 @@ mod tests {
                 .iter()
                 .any(|(line, _)| line.contains("stream/contents/reading-list")
                     && line.contains("c=next"))
+        );
+    }
+
+    #[test]
+    fn refreshes_cached_session_once_after_an_unauthorized_response() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let request_attempts = attempts.clone();
+        let (endpoint, server) = mock_server(6, move |line, _| {
+            let path = line.split_whitespace().nth(1).unwrap_or_default();
+            if path.ends_with("/accounts/ClientLogin") {
+                (200, "SID=session\nAuth=auth-token")
+            } else if path.ends_with("/reader/api/0/token") {
+                (200, "csrf")
+            } else if path.contains("/subscription/list")
+                && request_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                (401, "expired session")
+            } else if path.contains("/subscription/list") {
+                (200, r#"{"subscriptions":[]}"#)
+            } else {
+                (500, "unexpected request")
+            }
+        });
+        let client =
+            FreshRss::new(FreshRssConnection::new(&endpoint, "reader", "api-password").unwrap())
+                .unwrap();
+        assert!(runtime().block_on(client.feeds()).unwrap().is_empty());
+        let requests = server.join().unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(line, _)| line.ends_with("/reader/api/0/token HTTP/1.1"))
+                .count(),
+            2
         );
     }
 

@@ -115,6 +115,10 @@ pub struct Entry {
     pub status: String,
     #[serde(default)]
     pub starred: bool,
+    #[serde(default)]
+    pub changed_at: Option<String>,
+    #[serde(default)]
+    pub hash: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -156,21 +160,43 @@ impl Miniflux {
     }
 
     pub async fn me(&self) -> anyhow::Result<User> {
-        self.json(self.request(Method::GET, "v1/me")?).await
+        self.json(self.request(Method::GET, "v1/me")?)
+            .await
+            .context("Miniflux GET /v1/me")
     }
 
     pub async fn feeds(&self) -> anyhow::Result<Vec<Feed>> {
-        self.json(self.request(Method::GET, "v1/feeds")?).await
+        self.json(self.request(Method::GET, "v1/feeds")?)
+            .await
+            .context("Miniflux GET /v1/feeds")
     }
 
     pub async fn entries(&self, offset: usize, limit: usize) -> anyhow::Result<EntryPage> {
-        self.json(self.request(Method::GET, "v1/entries")?.query(&[
+        self.entries_changed(offset, limit, None, None).await
+    }
+
+    pub async fn entries_changed(
+        &self,
+        offset: usize,
+        limit: usize,
+        changed_after: Option<i64>,
+        changed_before: Option<i64>,
+    ) -> anyhow::Result<EntryPage> {
+        let mut query = vec![
             ("offset", offset.to_string()),
             ("limit", limit.to_string()),
             ("order", "id".into()),
             ("direction", "desc".into()),
-        ]))
-        .await
+        ];
+        if let Some(timestamp) = changed_after {
+            query.push(("changed_after", timestamp.to_string()));
+        }
+        if let Some(timestamp) = changed_before {
+            query.push(("changed_before", timestamp.to_string()));
+        }
+        self.json(self.request(Method::GET, "v1/entries")?.query(&query))
+            .await
+            .context("Miniflux GET /v1/entries")
     }
 
     pub async fn categories(&self) -> anyhow::Result<Vec<Category>> {
@@ -198,6 +224,13 @@ impl Miniflux {
     pub async fn refresh_feeds(&self) -> anyhow::Result<()> {
         self.empty(self.request(Method::PUT, "v1/feeds/refresh")?)
             .await
+            .context("Miniflux PUT /v1/feeds/refresh")
+    }
+
+    pub async fn refresh_feed(&self, feed_id: i64) -> anyhow::Result<()> {
+        self.empty(self.request(Method::PUT, &format!("v1/feeds/{feed_id}/refresh"))?)
+            .await
+            .context("Miniflux PUT /v1/feeds/{feed_id}/refresh")
     }
 
     pub async fn mark_read(&self, id: i64, read: bool) -> anyhow::Result<()> {

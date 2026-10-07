@@ -52,8 +52,8 @@ const ZH_CN: &[(&str, &str)] = &[
     ("Feeds", "订阅源"),
     ("Refresh feeds", "刷新订阅"),
     (
-        "Refresh feeds (Shift-click to re-fetch current article)",
-        "刷新订阅（按住 Shift 点击可重新抓取当前文章）",
+        "Refresh feeds (Shift-click to force refresh)",
+        "刷新订阅（按住 Shift 点击强制刷新）",
     ),
     ("Re-fetch current article", "重新抓取当前文章"),
     ("Select an article first", "请先选择一篇文章"),
@@ -471,8 +471,8 @@ const ZH_TW: &[(&str, &str)] = &[
     ("Feeds", "訂閱來源"),
     ("Refresh feeds", "重新整理訂閱"),
     (
-        "Refresh feeds (Shift-click to re-fetch current article)",
-        "重新整理訂閱（按住 Shift 點擊可重新擷取目前文章）",
+        "Refresh feeds (Shift-click to force refresh)",
+        "重新整理訂閱（按住 Shift 點擊強制更新）",
     ),
     ("Re-fetch current article", "重新擷取目前文章"),
     ("Select an article first", "請先選擇一篇文章"),
@@ -801,8 +801,8 @@ const JA: &[(&str, &str)] = &[
     ("Feeds", "フィード"),
     ("Refresh feeds", "フィードを更新"),
     (
-        "Refresh feeds (Shift-click to re-fetch current article)",
-        "フィードを更新（Shift+クリックで現在の記事を再取得）",
+        "Refresh feeds (Shift-click to force refresh)",
+        "フィードを更新（Shift+クリックで強制更新）",
     ),
     ("Re-fetch current article", "現在の記事を再取得"),
     ("Select an article first", "先に記事を選択してください"),
@@ -1095,8 +1095,8 @@ const FR: &[(&str, &str)] = &[
     ("Feeds", "Flux"),
     ("Refresh feeds", "Actualiser les flux"),
     (
-        "Refresh feeds (Shift-click to re-fetch current article)",
-        "Actualiser les flux (Maj-clic pour récupérer l’article actuel)",
+        "Refresh feeds (Shift-click to force refresh)",
+        "Actualiser les flux (Maj-clic pour forcer l’actualisation)",
     ),
     (
         "Re-fetch current article",
@@ -1407,8 +1407,8 @@ const DE: &[(&str, &str)] = &[
     ("Feeds", "Feeds"),
     ("Refresh feeds", "Feeds aktualisieren"),
     (
-        "Refresh feeds (Shift-click to re-fetch current article)",
-        "Feeds aktualisieren (Umschalt-Klick lädt den aktuellen Artikel neu)",
+        "Refresh feeds (Shift-click to force refresh)",
+        "Feeds aktualisieren (Umschalt-Klick erzwingt die Aktualisierung)",
     ),
     (
         "Re-fetch current article",

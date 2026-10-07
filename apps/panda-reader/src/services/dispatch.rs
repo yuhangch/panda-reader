@@ -127,7 +127,7 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
         } => super::connections::connect(kind, endpoint, username, secret, reply, state),
         Command::Disconnect { kind, reply } => super::connections::disconnect(kind, reply, state),
         Command::RefreshFeed { id, reply } => super::sync::refresh_feed(id, reply, state),
-        Command::Refresh { reply } => super::sync::refresh(reply, state),
+        Command::Refresh { force, reply } => super::sync::refresh(force, reply, state),
         Command::EnsureFavicon {
             host,
             site_url,

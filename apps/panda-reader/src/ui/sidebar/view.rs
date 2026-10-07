@@ -481,22 +481,11 @@ impl Sidebar {
                             .small()
                             .ghost()
                             .icon(bundled_icon(BundledIcon::Refresh))
-                            .tooltip(
-                                owner.t("Refresh feeds (Shift-click to re-fetch current article)"),
-                            )
+                            .tooltip(owner.t("Refresh feeds (Shift-click to force refresh)"))
                             .loading(self.is_refreshing)
                             .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
                                 if event.modifiers().shift {
-                                    if let Some(id) = this
-                                        .reader
-                                        .article
-                                        .as_ref()
-                                        .map(|article| article.summary.id)
-                                    {
-                                        this.extract(id, true, cx);
-                                    } else {
-                                        this.set_flash(this.t("Select an article first"), cx);
-                                    }
+                                    this.refresh_with_force(true, cx);
                                 } else {
                                     this.refresh(cx);
                                 }

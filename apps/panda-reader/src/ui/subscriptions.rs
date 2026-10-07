@@ -174,11 +174,15 @@ impl ReaderWindow {
     }
 
     pub(in crate::ui) fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_with_force(false, cx);
+    }
+
+    pub(in crate::ui) fn refresh_with_force(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.sidebar.is_refreshing {
             return;
         }
         let (reply, response) = oneshot::channel();
-        self.services.send(Command::Refresh { reply });
+        self.services.send(Command::Refresh { force, reply });
         self.sidebar.is_refreshing = true;
         self.set_busy(self.t("Syncing…"));
         cx.spawn(async move |this, cx| {

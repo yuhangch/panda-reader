@@ -2,7 +2,8 @@
 
 use panda_providers::{ProviderKind, ProviderSettings, save_settings};
 
-use super::articles::cache::BodyCache;
+use super::articles::cache::RenderCache;
+use super::database::DbWriter;
 use super::{Command, dispatch};
 
 use anyhow::{Context as _, bail};
@@ -10,11 +11,14 @@ use panda_plugins::{
     CommunityCatalog, CommunityPlugin, PluginRegistry, PluginSettings, PluginSummary,
 };
 use panda_providers::ProviderSettingsMap;
-use panda_store::Store;
 use std::{
+    any::Any,
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        mpsc as std_mpsc, mpsc::SyncSender,
+    },
     thread,
 };
 use tokio::sync::{mpsc, oneshot};
@@ -41,7 +45,7 @@ impl AppServices {
         let settings = Arc::new(RwLock::new(initial_settings));
         let workspace = Arc::new(RwLock::new(active_workspace.to_owned()));
         let worker_workspace = workspace.clone();
-        let body_cache = Arc::new(Mutex::new(BodyCache::default()));
+        let body_cache = Arc::new(Mutex::new(RenderCache::default()));
         let favicon_inflight = Arc::new(Mutex::new(HashMap::<String, ()>::new()));
         let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
         thread::Builder::new()
@@ -52,23 +56,24 @@ impl AppServices {
                     .build()
                     .expect("failed to start services runtime");
                 runtime.block_on(async move {
-                    // Opening once performs any required SQLite schema migration.
-                    match Store::open(&path) {
-                        Ok(store) => drop(store),
+                    let writer = match DbWriter::start(path.clone()) {
+                        Ok(writer) => writer,
                         Err(error) => {
-                            eprintln!("could not open Panda Reader database: {error}");
+                            eprintln!("could not start Panda Reader database writer: {error:#}");
                             return;
                         }
                     };
-                    let index_path = path.clone();
+                    let index_writer = writer.clone();
                     thread::Builder::new()
                         .name("panda-reader-search-index".into())
                         .spawn(move || {
                             // Keep startup and synchronization responsive while an older library is indexed.
                             thread::sleep(std::time::Duration::from_secs(2));
                             loop {
-                                let indexed = Store::open(&index_path)
-                                    .and_then(|mut store| store.index_search_batch(50));
+                                let indexed = index_writer
+                                    .write_low_priority("local".into(), |store| {
+                                        store.index_search_batch(50)
+                                    });
                                 match indexed {
                                     Ok(true) => break,
                                     Ok(false) => {
@@ -87,6 +92,7 @@ impl AppServices {
                     let state = WorkerState {
                         path: path.clone(),
                         translator_path,
+                        database: writer,
                         plugin_dir: plugin_dir.clone(),
                         plugin_registry: Arc::new(RwLock::new(load_plugin_registry(&plugin_dir))),
                         provider_settings_path,
@@ -101,7 +107,16 @@ impl AppServices {
                         let Some(command) = receiver.recv().await else {
                             break;
                         };
-                        dispatch::handle(command, &state);
+                        if let Err(panic) =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                dispatch::handle(command, &state)
+                            }))
+                        {
+                            eprintln!(
+                                "service command dispatcher recovered from panic: {}",
+                                panic_message(&*panic)
+                            );
+                        }
                     }
                 });
             })
@@ -114,9 +129,7 @@ impl AppServices {
     }
 
     pub fn set_workspace(&self, workspace: &str) {
-        if let Ok(mut active) = self.workspace.write() {
-            *active = workspace.to_owned();
-        }
+        *write_lock(&self.workspace, "active workspace") = workspace.to_owned();
     }
 }
 
@@ -124,11 +137,12 @@ pub struct WorkerState {
     pub path: PathBuf,
     pub provider_settings_path: PathBuf,
     pub translator_path: PathBuf,
+    pub database: DbWriter,
     pub plugin_dir: PathBuf,
     pub plugin_registry: Arc<RwLock<PluginRegistry>>,
     pub provider_settings: Arc<RwLock<ProviderSettingsMap>>,
     pub active_workspace: Arc<RwLock<String>>,
-    pub body_cache: Arc<Mutex<BodyCache>>,
+    pub body_cache: Arc<Mutex<RenderCache>>,
     pub favicon_inflight: Arc<Mutex<HashMap<String, ()>>>,
     pub title_translation_lock: Arc<Mutex<()>>,
     pub title_translation_attempted: Arc<Mutex<HashMap<String, std::time::Instant>>>,
@@ -145,10 +159,7 @@ fn load_plugin_registry(plugin_dir: &std::path::Path) -> PluginRegistry {
 
 impl WorkerState {
     pub fn workspace(&self) -> String {
-        self.active_workspace
-            .read()
-            .map(|v| v.clone())
-            .unwrap_or_else(|_| "local".into())
+        read_lock(&self.active_workspace, "active workspace").clone()
     }
 
     pub fn provider_kind(&self) -> Option<ProviderKind> {
@@ -160,7 +171,9 @@ impl WorkerState {
     }
 
     pub fn provider_settings(&self, kind: ProviderKind) -> Option<ProviderSettings> {
-        self.provider_settings.read().ok()?.get(&kind).cloned()
+        read_lock(&self.provider_settings, "provider settings")
+            .get(&kind)
+            .cloned()
     }
 
     pub(super) fn save_provider_settings(
@@ -190,29 +203,18 @@ impl WorkerState {
     }
 
     pub(super) fn plugin_list(&self) -> anyhow::Result<Vec<PluginSummary>> {
-        self.plugin_registry
-            .read()
-            .map(|registry| registry.plugins())
-            .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))
+        Ok(read_lock(&self.plugin_registry, "plugin registry").plugins())
     }
 
     pub(super) fn reload_plugins(&self) -> anyhow::Result<Vec<PluginSummary>> {
-        let generation = self
-            .plugin_registry
-            .read()
-            .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))?
+        let generation = read_lock(&self.plugin_registry, "plugin registry")
             .generation()
             .wrapping_add(1);
         let settings = self.plugin_settings()?;
         let next = PluginRegistry::load(&self.plugin_dir, &settings, generation);
         let plugins = next.plugins();
-        *self
-            .plugin_registry
-            .write()
-            .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))? = next;
-        if let Ok(mut cache) = self.body_cache.lock() {
-            cache.clear();
-        }
+        *write_lock(&self.plugin_registry, "plugin registry") = next;
+        RenderCache::lock(&self.body_cache).clear();
         Ok(plugins)
     }
 
@@ -284,19 +286,13 @@ pub(super) fn import_plugin(
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<PluginSettings>(&bytes).ok())
                 .unwrap_or_default();
-            let generation = registry
-                .read()
-                .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))?
+            let generation = read_lock(&registry, "plugin registry")
                 .generation()
                 .wrapping_add(1);
             let next = PluginRegistry::load(&plugin_dir, &settings, generation);
             let plugins = next.plugins();
-            *registry
-                .write()
-                .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))? = next;
-            if let Ok(mut cache) = body_cache.lock() {
-                cache.clear();
-            }
+            *write_lock(&registry, "plugin registry") = next;
+            RenderCache::lock(&body_cache).clear();
             Ok(plugins)
         })()
         .map_err(|error| format!("{error:#}"))
@@ -369,19 +365,13 @@ pub(super) fn install_community_plugin(
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<PluginSettings>(&bytes).ok())
                 .unwrap_or_default();
-            let generation = registry
-                .read()
-                .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))?
+            let generation = read_lock(&registry, "plugin registry")
                 .generation()
                 .wrapping_add(1);
             let next = PluginRegistry::load(&plugin_dir, &settings, generation);
             let plugins = next.plugins();
-            *registry
-                .write()
-                .map_err(|_| anyhow::anyhow!("plugin registry lock poisoned"))? = next;
-            if let Ok(mut cache) = body_cache.lock() {
-                cache.clear();
-            }
+            *write_lock(&registry, "plugin registry") = next;
+            RenderCache::lock(&body_cache).clear();
             Ok(plugins)
         })()
         .map_err(|error| format!("{error:#}"))
@@ -522,12 +512,86 @@ pub(super) fn job<T: Send + 'static>(
     reply: oneshot::Sender<Result<T, String>>,
     run: impl FnOnce(&tokio::runtime::Runtime) -> Result<T, String> + Send + 'static,
 ) {
-    thread::spawn(move || {
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())
-            .and_then(|runtime| run(&runtime));
+    type BackgroundJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
+    static JOBS: OnceLock<SyncSender<BackgroundJob>> = OnceLock::new();
+    let sender = JOBS.get_or_init(|| {
+        let (sender, receiver) = std_mpsc::sync_channel::<BackgroundJob>(256);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..4 {
+            let receiver = receiver.clone();
+            thread::Builder::new()
+                .name(format!("panda-reader-worker-{index}"))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to start background worker runtime");
+                    loop {
+                        let next = {
+                            let receiver = lock_mutex(&receiver, "background job queue");
+                            receiver.recv()
+                        };
+                        let Ok(job) = next else { break };
+                        job(&runtime);
+                    }
+                })
+                .expect("failed to start background worker");
+        }
+        sender
+    });
+    let task: BackgroundJob = Box::new(move |runtime| {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(runtime)))
+            .unwrap_or_else(|panic| {
+                Err(format!(
+                    "Background operation panicked: {}",
+                    panic_message(&*panic)
+                ))
+            });
         let _ = reply.send(result);
     });
+    let _ = sender.send(task);
+}
+
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic")
+}
+
+pub(super) fn lock_mutex<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {
+    match lock.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            lock.clear_poison();
+            eprintln!("recovered poisoned {name} mutex");
+            guard
+        }
+    }
+}
+
+pub(super) fn read_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockReadGuard<'a, T> {
+    match lock.read() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            lock.clear_poison();
+            eprintln!("recovered poisoned {name} read lock");
+            guard
+        }
+    }
+}
+
+pub(super) fn write_lock<'a, T>(lock: &'a RwLock<T>, name: &str) -> RwLockWriteGuard<'a, T> {
+    match lock.write() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            lock.clear_poison();
+            eprintln!("recovered poisoned {name} write lock");
+            guard
+        }
+    }
 }

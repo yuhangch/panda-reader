@@ -49,6 +49,7 @@ pub enum RuleAction {
 }
 
 /// Mutable host DOM with invocation-local, invalidatable handles.
+#[derive(Clone)]
 pub struct ArticleDocument {
     html: Html,
     handles: Vec<NodeId>,
@@ -261,6 +262,17 @@ impl ArticleDocument {
         self.html.root_element().inner_html()
     }
 
+    pub(crate) fn reset_for_invocation(&mut self) {
+        self.handles.clear();
+        self.invalid.clear();
+        self.query_budget = MAX_MATCHES_PER_RULE;
+        self.modified = false;
+    }
+
+    pub(crate) fn modified(&self) -> bool {
+        self.modified
+    }
+
     fn node_id(&self, handle: u32) -> anyhow::Result<NodeId> {
         let id = *self
             .handles
@@ -426,10 +438,13 @@ fn normalize_text(text: &str) -> String {
 }
 
 /// Run one plugin against an isolated copy and commit only a valid result.
-pub fn apply_rules_isolated(source: &str, rules: &RuleSet) -> anyhow::Result<Option<String>> {
-    let mut document = ArticleDocument::parse(source)?;
-    apply_rules(&mut document, rules)?;
-    if !document.modified {
+pub(crate) fn apply_rules_isolated_document(
+    document: &mut ArticleDocument,
+    rules: &RuleSet,
+) -> anyhow::Result<Option<String>> {
+    document.reset_for_invocation();
+    apply_rules(document, rules)?;
+    if !document.modified() {
         return Ok(None);
     }
     let result = document.serialize();

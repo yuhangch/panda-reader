@@ -1,23 +1,19 @@
 //! Bounded cache for prepared article bodies.
 
-use super::content::{TRANSLATION_MARKER_END, TRANSLATION_MARKER_START, prepare_body};
-use panda_core::{Article, TranslationLayout};
-use sha2::{Digest, Sha256};
+use super::content::{TRANSLATION_MARKER_END, TRANSLATION_MARKER_START, render_article};
+use panda_core::{Article, ContentRevision, RenderDocument, RenderOptions, TranslationLayout};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct BodyPrepKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenderCacheKey {
     pub article_id: i64,
-    pub has_extracted: bool,
-    pub show_translation: bool,
-    pub immersive: bool,
-    pub hide_images: bool,
-    pub paragraph_indent: bool,
-    /// Cheap fingerprint so extract/translate invalidates the cache.
-    pub content_rev: [u8; 32],
+    pub canonical_revision: ContentRevision,
+    pub translation_revision: Option<String>,
+    pub options: RenderOptions,
 }
 
-impl BodyPrepKey {
+impl RenderCacheKey {
     pub fn from_article(
         article: &Article,
         show_translation: bool,
@@ -27,70 +23,90 @@ impl BodyPrepKey {
     ) -> Self {
         Self {
             article_id: article.summary.id,
-            has_extracted: article.extracted_html.is_some(),
-            show_translation,
-            immersive: layout == TranslationLayout::Immersive,
-            hide_images,
-            paragraph_indent,
-            content_rev: content_revision(article),
+            canonical_revision: article
+                .canonical
+                .as_ref()
+                .map(|canonical| canonical.revision.clone())
+                .unwrap_or_else(|| ContentRevision(Arc::from("missing-canonical"))),
+            translation_revision: (show_translation
+                && article
+                    .translated_html
+                    .as_deref()
+                    .is_some_and(|html| !html.trim().is_empty())
+                && article
+                    .canonical
+                    .as_ref()
+                    .zip(article.translation_source_hash.as_deref())
+                    .is_some_and(|(canonical, revision)| {
+                        canonical.matches_translation_revision(revision)
+                    }))
+            .then(|| article.translation_source_hash.clone())
+            .flatten(),
+            options: RenderOptions {
+                show_translation,
+                translation_layout: layout,
+                hide_images,
+                paragraph_indent,
+            },
         }
     }
-}
-
-fn content_revision(article: &Article) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    for value in [
-        article.content_html.as_str(),
-        article.source_html.as_deref().unwrap_or_default(),
-        article.source_page_html.as_deref().unwrap_or_default(),
-        article.extracted_html.as_deref().unwrap_or_default(),
-        article.effective_html.as_deref().unwrap_or_default(),
-        article.translated_html.as_deref().unwrap_or_default(),
-        article
-            .translation_source_hash
-            .as_deref()
-            .unwrap_or_default(),
-    ] {
-        hasher.update((value.len() as u64).to_le_bytes());
-        hasher.update(value.as_bytes());
-    }
-    hasher.finalize().into()
 }
 
 #[derive(Default)]
-pub struct BodyCache {
-    entries: HashMap<BodyPrepKey, PreparedBody>,
-    order: Vec<BodyPrepKey>,
+pub struct RenderCache {
+    entries: HashMap<RenderCacheKey, Arc<RenderDocument>>,
+    order: Vec<RenderCacheKey>,
+    bytes: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedBody {
-    pub html: String,
-    pub markdown: String,
-    pub image_urls: Vec<String>,
-}
+impl RenderCache {
+    const CAPACITY_BYTES: usize = 32 * 1024 * 1024;
 
-impl BodyCache {
-    const CAPACITY: usize = 64;
-
-    pub fn get_or_insert(
-        &mut self,
-        key: BodyPrepKey,
-        article: &Article,
-        show_translation: bool,
-        layout: TranslationLayout,
-        hide_images: bool,
-        paragraph_indent: bool,
-    ) -> PreparedBody {
-        if let Some(body) = self.entries.get(&key) {
-            return body.clone();
+    /// Cached article bodies are disposable, so recover cleanly if an older
+    /// renderer panicked while holding this lock.
+    pub fn lock(cache: &Mutex<Self>) -> MutexGuard<'_, Self> {
+        match cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.clear();
+                cache.clear_poison();
+                eprintln!("article body cache recovered after a rendering panic");
+                guard
+            }
         }
-        let html = prepare_body(
-            article,
-            show_translation,
-            layout,
-            hide_images,
-            paragraph_indent,
+    }
+
+    pub fn get(&mut self, key: &RenderCacheKey) -> Option<Arc<RenderDocument>> {
+        let value = self.entries.get(key).cloned()?;
+        self.order.retain(|old| old != key);
+        self.order.push(key.clone());
+        Some(value)
+    }
+
+    /// Prepare a body outside the shared cache lock. A panic in a parser or
+    /// converter is contained to this article request.
+    pub fn prepare(article: &Article, options: RenderOptions) -> Result<RenderDocument, String> {
+        if article.canonical.is_none() {
+            return Err("article must be canonicalized before rendering".to_owned());
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Self::prepare_uncached(article, options)
+        }))
+        .map_err(|_| "article body rendering failed for this article".to_owned())
+    }
+
+    fn prepare_uncached(article: &Article, options: RenderOptions) -> RenderDocument {
+        let canonical = article
+            .canonical
+            .as_ref()
+            .expect("prepare validates that an article is canonicalized");
+        let html = render_article(
+            canonical,
+            article.translated_html.as_deref(),
+            article.translation_source_hash.as_deref(),
+            &article.summary.snippet,
+            options,
         );
         // TextView's HTML reader does not treat <pre> as a code block. Convert
         // the sanitized body off the UI thread so fenced code keeps its
@@ -99,36 +115,87 @@ impl BodyCache {
         let markdown = quick_html2md::html_to_markdown(&markdown_source);
         let markdown = wrap_translation_markdown(&markdown);
         let (markdown, image_urls) = add_image_view_links(&markdown_source, markdown);
-        let markdown = if paragraph_indent {
+        let markdown = if options.paragraph_indent {
             indent_markdown_paragraphs(&markdown)
         } else {
             markdown
         };
-        let body = PreparedBody {
-            html,
-            markdown,
-            image_urls,
-        };
-        if self.order.len() >= Self::CAPACITY {
-            if let Some(old) = self.order.first().cloned() {
-                self.order.remove(0);
-                self.entries.remove(&old);
+        RenderDocument {
+            html: Arc::from(html),
+            markdown: Arc::from(markdown),
+            image_urls: Arc::from(image_urls),
+        }
+    }
+
+    pub fn insert(&mut self, key: RenderCacheKey, body: RenderDocument) -> Arc<RenderDocument> {
+        if let Some(body) = self.entries.get(&key) {
+            return body.clone();
+        }
+        let body = Arc::new(body);
+        let size = body_size(&body);
+        if size > Self::CAPACITY_BYTES {
+            return body;
+        }
+        while self.bytes.saturating_add(size) > Self::CAPACITY_BYTES && !self.order.is_empty() {
+            let old = self.order.remove(0);
+            if let Some(evicted) = self.entries.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(body_size(&evicted));
             }
         }
-        self.order.push(key);
+        self.bytes = self.bytes.saturating_add(size);
+        self.order.push(key.clone());
         self.entries.insert(key, body.clone());
         body
     }
 
+    #[cfg(test)]
+    pub fn get_or_insert(
+        &mut self,
+        key: RenderCacheKey,
+        article: &Article,
+        show_translation: bool,
+        layout: TranslationLayout,
+        hide_images: bool,
+        paragraph_indent: bool,
+    ) -> RenderDocument {
+        if let Some(body) = self.get(&key) {
+            return body.as_ref().clone();
+        }
+        let body = Self::prepare_uncached(
+            article,
+            RenderOptions {
+                show_translation,
+                translation_layout: layout,
+                hide_images,
+                paragraph_indent,
+            },
+        );
+        self.insert(key, body).as_ref().clone()
+    }
+
     pub fn invalidate_article(&mut self, article_id: i64) {
         self.order.retain(|key| key.article_id != article_id);
-        self.entries.retain(|key, _| key.article_id != article_id);
+        let mut released = 0usize;
+        self.entries.retain(|key, body| {
+            if key.article_id == article_id {
+                released = released.saturating_add(body_size(body));
+                false
+            } else {
+                true
+            }
+        });
+        self.bytes = self.bytes.saturating_sub(released);
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.bytes = 0;
     }
+}
+
+fn body_size(body: &RenderDocument) -> usize {
+    body.html.len() + body.markdown.len() + body.image_urls.iter().map(String::len).sum::<usize>()
 }
 
 fn wrap_translation_markdown(markdown: &str) -> String {
@@ -197,27 +264,16 @@ fn add_image_view_links(source_html: &str, markdown: String) -> (String, Vec<Str
             continue;
         };
         let end = url_start + url_end_relative + 1;
-        let image_markdown = &markdown[start..end];
         let image_index = image_urls.len();
         image_urls.push(src.to_owned());
-        let target = format!("panda-image://{image_index}");
-        let replacement =
-            if image.value().attr("width").is_some() || image.value().attr("height").is_some() {
-                let mut tag = format!("<img src=\"{}\"", escape_html_attr(src));
-                if let Some(alt) = image.value().attr("alt") {
-                    tag.push_str(&format!(" alt=\"{}\"", escape_html_attr(alt)));
-                }
-                if let Some(width) = image.value().attr("width") {
-                    tag.push_str(&format!(" width=\"{}\"", escape_html_attr(width)));
-                }
-                if let Some(height) = image.value().attr("height") {
-                    tag.push_str(&format!(" height=\"{}\"", escape_html_attr(height)));
-                }
-                tag.push_str(" />");
-                format!("[{tag}]({target})")
-            } else {
-                format!("[{image_markdown}]({target})")
-            };
+        let alt = image
+            .value()
+            .attr("alt")
+            .unwrap_or_default()
+            .replace('\n', " ");
+        let replacement = format!(
+            "\n\n{IMAGE_FENCE}panda-reader-image\npanda-image:{image_index}\n{alt}\n{IMAGE_FENCE}\n\n"
+        );
         markdown.replace_range(start..end, &replacement);
         cursor = start + replacement.len();
     }
@@ -225,13 +281,7 @@ fn add_image_view_links(source_html: &str, markdown: String) -> (String, Vec<Str
     (markdown, image_urls)
 }
 
-fn escape_html_attr(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
+const IMAGE_FENCE: &str = "````````````````";
 
 /// Apply paragraph indentation after HTML conversion. The Markdown converter
 /// trims leading whitespace inside blockquotes, which otherwise drops the
@@ -345,6 +395,10 @@ mod tests {
     use super::super::test_article;
     use super::*;
 
+    type BodyCache = RenderCache;
+    type BodyPrepKey = RenderCacheKey;
+    type PreparedBody = RenderDocument;
+
     #[test]
     fn cache_distinguishes_display_options_and_invalidates_every_article_variant() {
         let mut article = test_article();
@@ -360,14 +414,28 @@ mod tests {
                 cache.get_or_insert(key, &article, translated, layout, hide_images, true);
             assert_eq!(
                 prepared.html,
-                prepare_body(&article, translated, layout, hide_images, true)
+                Arc::from(render_article(
+                    article.canonical.as_ref().unwrap(),
+                    article.translated_html.as_deref(),
+                    article.translation_source_hash.as_deref(),
+                    &article.summary.snippet,
+                    RenderOptions {
+                        show_translation: translated,
+                        translation_layout: layout,
+                        hide_images,
+                        paragraph_indent: true,
+                    },
+                ))
             );
         }
         assert_eq!(cache.entries.len(), 4);
         cache.invalidate_article(article.summary.id);
         assert!(cache.entries.is_empty());
         assert!(cache.order.is_empty());
-        article.content_html = "<p>Updated body</p>".into();
+        article.canonical.as_mut().unwrap().html =
+            panda_core::CanonicalHtml::new("<p>Updated body</p>");
+        article.canonical.as_mut().unwrap().revision =
+            ContentRevision(Arc::from("updated-body-v1"));
         let key =
             BodyPrepKey::from_article(&article, false, TranslationLayout::Immersive, false, true);
         let prepared = cache.get_or_insert(
@@ -384,14 +452,15 @@ mod tests {
     #[test]
     fn cache_key_changes_when_equal_length_content_changes() {
         let mut article = test_article();
-        article.content_html = "<p>First</p>".into();
+        article.canonical.as_mut().unwrap().html = panda_core::CanonicalHtml::new("<p>First</p>");
+        article.canonical.as_mut().unwrap().revision = ContentRevision(Arc::from("first-v1"));
         let original =
             BodyPrepKey::from_article(&article, false, TranslationLayout::Immersive, false, true);
         let mut cache = BodyCache::default();
         assert!(
             cache
                 .get_or_insert(
-                    original,
+                    original.clone(),
                     &article,
                     false,
                     TranslationLayout::Immersive,
@@ -402,7 +471,8 @@ mod tests {
                 .contains("First")
         );
 
-        article.content_html = "<p>Other</p>".into();
+        article.canonical.as_mut().unwrap().html = panda_core::CanonicalHtml::new("<p>Other</p>");
+        article.canonical.as_mut().unwrap().revision = ContentRevision(Arc::from("other-v1"));
         let updated =
             BodyPrepKey::from_article(&article, false, TranslationLayout::Immersive, false, true);
         assert_ne!(original, updated);
@@ -422,10 +492,46 @@ mod tests {
     }
 
     #[test]
+    fn cache_shares_entries_and_rejects_bodies_over_the_memory_budget() {
+        let article = test_article();
+        let key =
+            BodyPrepKey::from_article(&article, false, TranslationLayout::Immersive, false, true);
+        let mut cache = BodyCache::default();
+        let inserted = cache.insert(
+            key.clone(),
+            PreparedBody {
+                html: Arc::from("<p>body</p>"),
+                markdown: Arc::from("body"),
+                image_urls: Arc::from(Vec::<String>::new()),
+            },
+        );
+        let retrieved = cache.get(&key).unwrap();
+        assert!(Arc::ptr_eq(&inserted, &retrieved));
+
+        let large_key = BodyPrepKey {
+            article_id: 2,
+            ..key.clone()
+        };
+        let large = "x".repeat(BodyCache::CAPACITY_BYTES + 1);
+        let returned = cache.insert(
+            large_key.clone(),
+            PreparedBody {
+                html: Arc::from(large),
+                markdown: Arc::from(""),
+                image_urls: Arc::from(Vec::<String>::new()),
+            },
+        );
+        assert_eq!(returned.html.len(), BodyCache::CAPACITY_BYTES + 1);
+        assert!(!cache.entries.contains_key(&large_key));
+        assert!(cache.entries.contains_key(&key));
+    }
+
+    #[test]
     fn prepared_markdown_keeps_html_preformatted_code_as_a_fenced_block() {
         let mut article = test_article();
-        article.content_html =
-            "<pre><code>fn main() {\n    println!(\"hello\");\n}</code></pre>".into();
+        article.canonical.as_mut().unwrap().html = panda_core::CanonicalHtml::new(
+            "<pre><code>fn main() {\n    println!(\"hello\");\n}</code></pre>",
+        );
         let mut cache = BodyCache::default();
         let key =
             BodyPrepKey::from_article(&article, false, TranslationLayout::Immersive, false, true);

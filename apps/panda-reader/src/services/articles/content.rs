@@ -1,31 +1,31 @@
 //! Pure HTML transformations for the article view; executed off the UI thread.
 
-use panda_core::{Article, TranslationLayout};
+#[cfg(test)]
+use panda_core::Article;
+use panda_core::{CanonicalArticle, RenderOptions, TranslationLayout};
 use panda_translate::html::split_blocks;
 use std::collections::{HashMap, HashSet};
 
 pub const TRANSLATION_MARKER_START: &str = "PANDA_READER_TRANSLATION_START_7D3A";
 pub const TRANSLATION_MARKER_END: &str = "PANDA_READER_TRANSLATION_END_7D3A";
 
-pub fn prepare_body(
-    article: &Article,
-    show_translation: bool,
-    layout: TranslationLayout,
-    hide_images: bool,
-    paragraph_indent: bool,
+pub fn render_article(
+    canonical: &CanonicalArticle,
+    translated_html: Option<&str>,
+    translation_revision: Option<&str>,
+    snippet: &str,
+    options: RenderOptions,
 ) -> String {
-    let original = article
-        .effective_html
+    let original = canonical.html.as_str();
+    let translated = translated_html
         .as_deref()
-        .or(article.extracted_html.as_deref())
-        .or(article.source_html.as_deref())
-        .unwrap_or(&article.content_html);
-    let translated = article
-        .translated_html
-        .as_deref()
-        .filter(|html| !html.trim().is_empty());
-    let body = if show_translation {
-        match (layout, translated) {
+        .filter(|html| !html.trim().is_empty())
+        .filter(|_| {
+            translation_revision
+                .is_some_and(|revision| canonical.matches_translation_revision(revision))
+        });
+    let body = if options.show_translation {
+        match (options.translation_layout, translated) {
             (TranslationLayout::Immersive, Some(translated)) => {
                 bilingual_html(original, translated)
             }
@@ -38,15 +38,15 @@ pub fn prepare_body(
     let prepared = if body.trim().is_empty() {
         format!(
             "<p>This feed did not provide article content. Open the original to read it.</p><p>{}</p>",
-            escape_html(&article.summary.snippet)
+            escape_html(snippet)
         )
-    } else if hide_images {
+    } else if options.hide_images {
         strip_images(&body)
     } else {
         body
     };
     let flat = flatten_reader_html(&prepared);
-    with_paragraph_indent(&flat, paragraph_indent)
+    with_paragraph_indent(&flat, options.paragraph_indent)
 }
 
 pub fn bilingual_html(original: &str, translated: &str) -> String {
@@ -280,6 +280,27 @@ mod tests {
     use super::super::test_article;
     use super::*;
 
+    fn render(
+        article: &Article,
+        show_translation: bool,
+        translation_layout: TranslationLayout,
+        hide_images: bool,
+        paragraph_indent: bool,
+    ) -> String {
+        render_article(
+            article.canonical.as_ref().unwrap(),
+            article.translated_html.as_deref(),
+            article.translation_source_hash.as_deref(),
+            &article.summary.snippet,
+            RenderOptions {
+                show_translation,
+                translation_layout,
+                hide_images,
+                paragraph_indent,
+            },
+        )
+    }
+
     #[test]
     fn pairs_paragraphs_bilingually() {
         let html = bilingual_html("<p>Hello</p><p>World</p>", "<p>你好</p><p>世界</p>");
@@ -298,18 +319,18 @@ mod tests {
     #[test]
     fn reading_modes_keep_the_expected_original_and_translation() {
         let article = test_article();
-        let original = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
+        let original = render(&article, false, TranslationLayout::Immersive, false, true);
         assert!(original.contains("Original"));
         assert!(!original.contains("译文"));
         assert!(original.contains("<img"));
 
-        let bilingual = prepare_body(&article, true, TranslationLayout::Immersive, true, true);
+        let bilingual = render(&article, true, TranslationLayout::Immersive, true, true);
         assert!(bilingual.contains("Original"));
         assert!(bilingual.contains("译文"));
         assert!(!bilingual.contains("<blockquote>"));
         assert!(!bilingual.contains("<img"));
 
-        let replaced = prepare_body(&article, true, TranslationLayout::Replaced, false, true);
+        let replaced = render(&article, true, TranslationLayout::Replaced, false, true);
         assert!(!replaced.contains("Original"));
         assert!(replaced.contains("译文"));
     }
@@ -317,22 +338,49 @@ mod tests {
     #[test]
     fn extracted_content_and_missing_translation_use_the_original() {
         let mut article = test_article();
-        article.extracted_html = Some("<p>Full article</p>".into());
+        article.canonical = Some(panda_core::CanonicalArticle {
+            html: panda_core::CanonicalHtml::new("<p>Full article</p>"),
+            revision: panda_core::ContentRevision("full-article-v1".into()),
+            pipeline_revision: "test-v1".into(),
+        });
         article.translated_html = None;
-        let prepared = prepare_body(&article, true, TranslationLayout::Replaced, false, true);
+        let prepared = render(&article, true, TranslationLayout::Replaced, false, true);
         assert!(prepared.contains("Full article"));
         assert!(!prepared.contains("Original"));
     }
 
     #[test]
+    fn stale_translation_is_not_rendered_for_a_different_canonical_revision() {
+        let mut article = test_article();
+        article.canonical.as_mut().unwrap().revision =
+            panda_core::ContentRevision("new-canonical-revision".into());
+        article.canonical.as_mut().unwrap().html =
+            panda_core::CanonicalHtml::new("<p>New canonical body</p>");
+        let rendered = render(&article, true, TranslationLayout::Replaced, false, false);
+        assert!(rendered.contains("New canonical body"));
+        assert!(!rendered.contains("译文"));
+    }
+
+    #[test]
     fn empty_content_escapes_the_preview_and_unsafe_html_is_removed() {
         let mut article = test_article();
-        article.content_html.clear();
-        let empty = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
+        article.canonical = Some(panda_core::CanonicalArticle {
+            html: panda_core::CanonicalHtml::new(""),
+            revision: panda_core::ContentRevision("empty-v1".into()),
+            pipeline_revision: "test-v1".into(),
+        });
+        let empty = render(&article, false, TranslationLayout::Immersive, false, true);
         assert!(empty.contains("&lt;example&gt; &amp; preview"));
 
-        article.content_html = "<p onclick=\"evil()\">Read me</p><script>evil()</script>".into();
-        let prepared = prepare_body(&article, false, TranslationLayout::Immersive, false, true);
+        article.canonical = Some(panda_core::CanonicalArticle {
+            html: panda_core::CanonicalHtml::new(panda_content::sanitize_html(
+                "<p onclick=\"evil()\">Read me</p><script>evil()</script>",
+                None,
+            )),
+            revision: panda_core::ContentRevision("sanitized-v1".into()),
+            pipeline_revision: "test-v1".into(),
+        });
+        let prepared = render(&article, false, TranslationLayout::Immersive, false, true);
         assert!(prepared.contains("Read me"));
         assert!(!prepared.contains("onclick"));
         assert!(!prepared.contains("script"));

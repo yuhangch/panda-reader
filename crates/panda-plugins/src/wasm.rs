@@ -3,9 +3,8 @@
 use crate::{ArticleDocument, PluginCapability, PluginStage};
 use anyhow::{Context as _, bail};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use url::Url;
 use wasmi::{
     Caller, Config, Engine, Extern, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -40,23 +39,23 @@ pub(super) struct HostState {
 
 pub(super) fn process(
     module_bytes: &[u8],
-    source: &str,
+    module_hash: &str,
+    document: ArticleDocument,
     title: &str,
     url: &str,
     stage: PluginStage,
     capabilities: &[PluginCapability],
-) -> anyhow::Result<Option<(String, bool)>> {
+) -> anyhow::Result<Option<(String, bool, ArticleDocument)>> {
     if module_bytes.len() > MAX_MODULE_BYTES {
         bail!("Wasm plugin exceeds the 4 MiB module limit");
     }
-    let (engine, module) = cached_module(module_bytes)?;
+    let (engine, module) = cached_module(module_hash, module_bytes)?;
     let limits = StoreLimitsBuilder::new()
         .memory_size(MAX_GUEST_MEMORY)
         .memories(1)
         .tables(1)
         .table_elements(100_000)
         .build();
-    let document = ArticleDocument::parse(source)?;
     let state = HostState {
         document,
         title: title.to_owned(),
@@ -105,33 +104,46 @@ pub(super) fn process(
             if body.trim().is_empty() {
                 bail!("Wasm plugin produced empty article content");
             }
-            Ok(Some((body, body_selected)))
+            Ok(Some((body, body_selected, state.document)))
         }
         other => bail!("Wasm plugin returned failure code {other}"),
     }
 }
 
-fn cached_module(bytes: &[u8]) -> anyhow::Result<(Engine, Module)> {
-    let hash = hex::encode(Sha256::digest(bytes));
+fn cached_module(hash: &str, bytes: &[u8]) -> anyhow::Result<(Engine, Module)> {
     let cache = MODULE_CACHE.get_or_init(|| Mutex::new(VecDeque::new()));
-    if let Ok(mut entries) = cache.lock()
-        && let Some(index) = entries.iter().position(|(cached, _, _)| cached == &hash)
     {
-        let (_, engine, module) = entries.remove(index).expect("module index was found");
-        entries.push_front((hash, engine.clone(), module.clone()));
-        return Ok((engine, module));
+        let mut entries = lock_module_cache(cache);
+        if let Some(index) = entries.iter().position(|(cached, _, _)| cached == hash) {
+            let (_, engine, module) = entries.remove(index).expect("module index was found");
+            entries.push_front((hash.to_owned(), engine.clone(), module.clone()));
+            return Ok((engine, module));
+        }
     }
     let mut config = Config::default();
     config.consume_fuel(true);
     let engine = Engine::new(&config);
     let module = Module::new(&engine, bytes).context("invalid Wasm plugin module")?;
-    let mut entries = cache
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Wasm module cache lock poisoned"))?;
-    entries.retain(|(cached, _, _)| cached != &hash);
-    entries.push_front((hash, engine.clone(), module.clone()));
+    let mut entries = lock_module_cache(cache);
+    entries.retain(|(cached, _, _)| cached != hash);
+    entries.push_front((hash.to_owned(), engine.clone(), module.clone()));
     entries.truncate(MODULE_CACHE_CAPACITY);
     Ok((engine, module))
+}
+
+fn lock_module_cache(
+    cache: &Mutex<VecDeque<CachedModule>>,
+) -> MutexGuard<'_, VecDeque<CachedModule>> {
+    match cache.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            let mut guard = poisoned.into_inner();
+            guard.clear();
+            cache.clear_poison();
+            eprintln!("Wasm module cache recovered after a panic");
+            guard
+        }
+    }
 }
 
 fn host_call(
@@ -397,14 +409,15 @@ mod tests {
     fn runs_a_valid_module_with_the_expected_stage_abi() {
         let output = process(
             &applied_module(),
-            "<p>article body</p>",
+            "test-module",
+            ArticleDocument::parse("<p>article body</p>").unwrap(),
             "Title",
             "https://example.com/story",
             PluginStage::Cleanup,
             &[],
         )
         .unwrap();
-        let (html, selected_body) = output.unwrap();
+        let (html, selected_body, _) = output.unwrap();
         assert!(html.contains("article body"));
         assert!(!selected_body);
     }
@@ -414,7 +427,8 @@ mod tests {
         assert!(
             process(
                 b"not wasm",
-                "<p>body</p>",
+                "invalid-module",
+                ArticleDocument::parse("<p>body</p>").unwrap(),
                 "Title",
                 "https://example.com/story",
                 PluginStage::Cleanup,
@@ -428,13 +442,15 @@ mod tests {
     fn instruction_fuel_stops_an_infinite_plugin_loop() {
         let error = process(
             &looping_module(),
-            "<p>body</p>",
+            "looping-module",
+            ArticleDocument::parse("<p>body</p>").unwrap(),
             "Title",
             "https://example.com/story",
             PluginStage::Cleanup,
             &[],
         )
-        .unwrap_err();
+        .err()
+        .unwrap();
         assert!(format!("{error:#}").contains("fuel"));
     }
 }

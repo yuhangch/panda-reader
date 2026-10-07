@@ -120,6 +120,7 @@ pub enum Command {
         reply: oneshot::Sender<Result<usize, String>>,
     },
     Refresh {
+        force: bool,
         reply: oneshot::Sender<Result<usize, String>>,
     },
     Mark {

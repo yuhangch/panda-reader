@@ -7,13 +7,15 @@ use panda_core::{
     Article, ArticleCursor, ArticleSummary, ContentExtractor, Feed, MarkField, ParsedArticle,
     ReaderSnapshot, Scope,
 };
-use panda_miniflux::{Entry as RemoteEntry, Feed as RemoteFeed, Miniflux};
-use panda_providers::{ProviderClient, ProviderKind};
+#[cfg(test)]
+use panda_providers::{ProviderClient, SyncMode};
+use panda_providers::{ProviderKind, RemoteEntry, RemoteFeed, SyncCursor};
 use reqwest::Client;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 use url::Url;
 
@@ -23,12 +25,98 @@ pub struct Store {
     workspace: String,
 }
 
+pub struct FetchedFeed {
+    parsed: Option<ParsedFeed>,
+    etag: Option<String>,
+    modified: Option<String>,
+}
+
+pub struct PreparedFeedResponse {
+    parsed: Option<PreparedFeed>,
+    etag: Option<String>,
+    modified: Option<String>,
+}
+
+impl PreparedFeedResponse {
+    pub fn is_not_modified(&self) -> bool {
+        self.parsed.is_none()
+    }
+}
+
+struct PreparedFeed {
+    title: String,
+    site_url: Option<String>,
+    articles: Vec<(ParsedArticle, Vec<u8>, String)>,
+}
+
+impl FetchedFeed {
+    pub fn is_not_modified(&self) -> bool {
+        self.parsed.is_none()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct FeedRefreshInput {
+    pub id: i64,
+    pub url: String,
+    pub etag: Option<String>,
+    pub modified: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PendingRemoteMark {
+    pub remote_id: i64,
+    pub field: String,
+    pub value: bool,
+    pub revision: i64,
+}
+
+pub struct PreparedExtraction {
+    pub article_id: i64,
+    pub resolved_url: String,
+    pub source_page_html: Vec<u8>,
+    pub extracted_html: String,
+    pub pipeline_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderSyncState {
+    pub provider: String,
+    pub account: String,
+    pub cursor: Option<SyncCursor>,
+    pub last_full_sync_at: Option<String>,
+}
+
+pub struct PreparedRemoteEntry {
+    entry: RemoteEntry,
+    guid: String,
+    remote_hash: String,
+    html: String,
+    snippet: String,
+    compressed_source: Vec<u8>,
+}
+
+fn shared_http_client() -> Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            Client::builder()
+                .user_agent("PandaReader/0.1 (+https://github.com)")
+                .timeout(Duration::from_secs(25))
+                .build()
+                .expect("store HTTP client configuration is valid")
+        })
+        .clone()
+}
+
 impl Store {
+    #[cfg(test)]
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        Self::open_workspace(path, "local")
+        Self::open_writer(path, "local")
     }
 
-    pub fn open_workspace(path: &Path, workspace: &str) -> anyhow::Result<Self> {
+    /// Apply versioned schema changes once before starting the writable connection.
+    pub fn migrate(path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -39,7 +127,11 @@ impl Store {
         if !journal_mode.eq_ignore_ascii_case("wal") {
             connection.pragma_update(None, "journal_mode", "WAL")?;
         }
-        connection.execute_batch(
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let schema_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version < 4 {
+            connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS feeds (
                 id INTEGER PRIMARY KEY,
                 feed_url TEXT NOT NULL,
@@ -77,8 +169,22 @@ impl Store {
                 UNIQUE(feed_id, guid)
             );
             CREATE INDEX IF NOT EXISTS idx_articles_feed_date ON articles(feed_id, published_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_articles_state_date ON articles(is_read, is_starred, read_later, published_at DESC);
-            CREATE TABLE IF NOT EXISTS remote_state (workspace TEXT PRIMARY KEY, account TEXT NOT NULL);
+            DROP INDEX IF EXISTS idx_articles_state_date;
+            DROP INDEX IF EXISTS idx_articles_feed_date;
+            CREATE INDEX IF NOT EXISTS idx_articles_sort ON articles(COALESCE(published_at,''),id);
+            CREATE INDEX IF NOT EXISTS idx_articles_unread_sort ON articles(COALESCE(published_at,''),id) WHERE is_read=0;
+            CREATE INDEX IF NOT EXISTS idx_articles_starred_sort ON articles(COALESCE(published_at,''),id) WHERE is_starred=1;
+            CREATE INDEX IF NOT EXISTS idx_articles_later_sort ON articles(COALESCE(published_at,''),id) WHERE read_later=1;
+            CREATE INDEX IF NOT EXISTS idx_articles_feed_sort ON articles(feed_id,COALESCE(published_at,''),id);
+            CREATE INDEX IF NOT EXISTS idx_articles_feed_unread ON articles(feed_id) WHERE is_read=0;
+            CREATE TABLE IF NOT EXISTS remote_state (
+                workspace TEXT PRIMARY KEY,
+                provider TEXT NOT NULL DEFAULT '',
+                account TEXT NOT NULL,
+                sync_cursor TEXT,
+                last_sync_at TEXT,
+                last_full_sync_at TEXT
+            );
             CREATE TABLE IF NOT EXISTS pending_remote_marks (
                 workspace TEXT NOT NULL,
                 remote_id INTEGER NOT NULL,
@@ -95,8 +201,8 @@ impl Store {
             );
             PRAGMA foreign_keys = ON;",
         )?;
-        connection.execute_batch(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS article_fts USING fts5(
+            connection.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS article_fts USING fts5(
                 title, author, content_text, translated_text, tokenize='unicode61'
              );
              CREATE TABLE IF NOT EXISTS article_fts_state (
@@ -106,76 +212,442 @@ impl Store {
              CREATE TRIGGER IF NOT EXISTS articles_fts_delete AFTER DELETE ON articles BEGIN
                 DELETE FROM article_fts WHERE rowid=old.id;
              END;",
-        )?;
-        // A missing state row means the index may be newly created or left
-        // incomplete by a prior crash, so conservatively schedule a rebuild.
-        connection.execute(
+            )?;
+            // A missing state row means the index may be newly created or left
+            // incomplete by a prior crash, so conservatively schedule a rebuild.
+            connection.execute(
             "INSERT OR IGNORE INTO article_fts_state(id,last_article_id,complete) VALUES(1,0,0)",
             [],
         )?;
-        ensure_column(
-            &connection,
-            "feeds",
-            "source",
-            "TEXT NOT NULL DEFAULT 'local'",
-        )?;
-        ensure_column(&connection, "feeds", "remote_id", "INTEGER")?;
-        ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
-        ensure_column(&connection, "feeds", "language", "TEXT")?;
-        ensure_column(
-            &connection,
-            "feeds",
-            "auto_translate_titles",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        ensure_column(&connection, "articles", "remote_id", "INTEGER")?;
-        ensure_column(&connection, "articles", "source_html", "BLOB")?;
-        ensure_column(&connection, "articles", "source_page_html", "BLOB")?;
-        ensure_column(&connection, "articles", "extraction_pipeline_hash", "TEXT")?;
-        ensure_column(&connection, "articles", "processed_html", "TEXT")?;
-        ensure_column(&connection, "articles", "processed_source_hash", "TEXT")?;
-        ensure_column(&connection, "articles", "processed_pipeline_hash", "TEXT")?;
-        ensure_column(&connection, "articles", "translated_html", "TEXT")?;
-        ensure_column(&connection, "articles", "translated_title", "TEXT")?;
-        ensure_column(&connection, "articles", "translated_lang", "TEXT")?;
-        ensure_column(&connection, "articles", "translation_source_hash", "TEXT")?;
-        ensure_column(&connection, "articles", "auto_translated_title", "TEXT")?;
-        ensure_column(
-            &connection,
-            "articles",
-            "auto_translated_title_lang",
-            "TEXT",
-        )?;
-        ensure_column(
-            &connection,
-            "articles",
-            "auto_translated_title_source_hash",
-            "TEXT",
-        )?;
-        connection.execute_batch("CREATE TABLE IF NOT EXISTS translation_usage(day TEXT NOT NULL, provider TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, characters INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,provider));")?;
-        migrate_workspace_schema(&connection)?;
-        ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
-        ensure_column(
-            &connection,
-            "pending_remote_marks",
-            "revision",
-            "INTEGER NOT NULL DEFAULT 0",
-        )?;
-        connection.execute_batch(
+            ensure_column(
+                &connection,
+                "feeds",
+                "source",
+                "TEXT NOT NULL DEFAULT 'local'",
+            )?;
+            ensure_column(&connection, "feeds", "remote_id", "INTEGER")?;
+            ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
+            ensure_column(&connection, "feeds", "language", "TEXT")?;
+            ensure_column(
+                &connection,
+                "feeds",
+                "auto_translate_titles",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(&connection, "articles", "remote_id", "INTEGER")?;
+            ensure_column(&connection, "articles", "remote_content_hash", "TEXT")?;
+            ensure_column(&connection, "articles", "source_revision", "TEXT")?;
+            ensure_column(
+                &connection,
+                "articles",
+                "content_revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(&connection, "articles", "source_html", "BLOB")?;
+            ensure_column(&connection, "articles", "source_page_html", "BLOB")?;
+            ensure_column(&connection, "articles", "extraction_pipeline_hash", "TEXT")?;
+            ensure_column(&connection, "articles", "processed_html", "TEXT")?;
+            ensure_column(&connection, "articles", "processed_source_hash", "TEXT")?;
+            ensure_column(&connection, "articles", "processed_pipeline_hash", "TEXT")?;
+            ensure_column(&connection, "articles", "translated_html", "TEXT")?;
+            ensure_column(&connection, "articles", "translated_title", "TEXT")?;
+            ensure_column(&connection, "articles", "translated_lang", "TEXT")?;
+            ensure_column(&connection, "articles", "translation_source_hash", "TEXT")?;
+            ensure_column(&connection, "articles", "auto_translated_title", "TEXT")?;
+            ensure_column(
+                &connection,
+                "articles",
+                "auto_translated_title_lang",
+                "TEXT",
+            )?;
+            ensure_column(
+                &connection,
+                "articles",
+                "auto_translated_title_source_hash",
+                "TEXT",
+            )?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS translation_usage(day TEXT NOT NULL, provider TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, characters INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,provider));")?;
+            migrate_workspace_schema(&connection)?;
+            ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
+            ensure_column(&connection, "feeds", "language", "TEXT")?;
+            ensure_column(
+                &connection,
+                "feeds",
+                "auto_translate_titles",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            connection.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_feeds_workspace_folder ON feeds(workspace,folder);",
+            )?;
+            ensure_column(
+                &connection,
+                "remote_state",
+                "provider",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
+            ensure_column(&connection, "remote_state", "sync_cursor", "TEXT")?;
+            ensure_column(&connection, "remote_state", "last_sync_at", "TEXT")?;
+            ensure_column(&connection, "remote_state", "last_full_sync_at", "TEXT")?;
+            ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
+            ensure_column(
+                &connection,
+                "pending_remote_marks",
+                "revision",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            connection.execute_batch(
             "DROP INDEX IF EXISTS idx_feeds_remote;
              DROP INDEX IF EXISTS idx_articles_remote;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_feeds_remote ON feeds(workspace,remote_id) WHERE remote_id IS NOT NULL;
              CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_remote ON articles(feed_id,remote_id) WHERE remote_id IS NOT NULL;",
         )?;
-        let client = Client::builder()
-            .user_agent("PandaReader/0.1 (+https://github.com)")
-            .timeout(Duration::from_secs(25))
-            .build()?;
+            connection.pragma_update(None, "user_version", 4)?;
+        }
+        let fts_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='article_fts')",
+            [],
+            |row| row.get(0),
+        )?;
+        let fts_state_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='article_fts_state')",
+            [],
+            |row| row.get(0),
+        )?;
+        let fts_trigger_exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='articles_fts_delete')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !fts_exists || !fts_state_exists || !fts_trigger_exists {
+            connection.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS article_fts USING fts5(
+                    title, author, content_text, translated_text, tokenize='unicode61'
+                 );
+                 CREATE TABLE IF NOT EXISTS article_fts_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), last_article_id INTEGER NOT NULL DEFAULT 0,
+                    complete INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TRIGGER IF NOT EXISTS articles_fts_delete AFTER DELETE ON articles BEGIN
+                    DELETE FROM article_fts WHERE rowid=old.id;
+                 END;
+                 INSERT OR IGNORE INTO article_fts_state(id,last_article_id,complete) VALUES(1,0,0);",
+            )?;
+            if !fts_exists {
+                connection.execute(
+                    "UPDATE article_fts_state SET last_article_id=0,complete=0 WHERE id=1",
+                    [],
+                )?;
+            }
+        }
+        if schema_version < 5 {
+            // The canonical-body contract changes the FTS source from extracted
+            // HTML to processed canonical HTML. Rebuild incrementally so old
+            // rows converge without blocking startup.
+            connection.execute(
+                "UPDATE article_fts_state SET last_article_id=0,complete=0 WHERE id=1",
+                [],
+            )?;
+            connection.pragma_update(None, "user_version", 5)?;
+        }
+        Ok(())
+    }
+
+    /// Open the one writable connection owned by the application's DB writer.
+    pub fn open_writer(path: &Path, workspace: &str) -> anyhow::Result<Self> {
+        #[cfg(test)]
+        Self::migrate(path)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let journal_mode: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        connection.pragma_update(None, "foreign_keys", "ON")?;
+        let schema_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version < 5 {
+            anyhow::bail!("database schema migration is required before opening the writer");
+        }
+        let client = shared_http_client();
         Ok(Self {
             connection,
             client,
             workspace: workspace.to_owned(),
         })
+    }
+
+    /// Open an independent read-only connection. All mutations must be sent
+    /// through the application's serialized database writer.
+    pub fn open_read_workspace(path: &Path, workspace: &str) -> anyhow::Result<Self> {
+        let connection = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self {
+            connection,
+            client: shared_http_client(),
+            workspace: workspace.to_owned(),
+        })
+    }
+
+    /// Change the workspace used by the writer-owned connection.
+    pub fn set_workspace(&mut self, workspace: &str) {
+        self.workspace.clear();
+        self.workspace.push_str(workspace);
+    }
+
+    pub fn local_feeds_to_refresh(&self) -> anyhow::Result<Vec<FeedRefreshInput>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,feed_url,etag,last_modified FROM feeds WHERE source='local' AND workspace=?1 ORDER BY id",
+        )?;
+        Ok(statement
+            .query_map([&self.workspace], |row| {
+                Ok(FeedRefreshInput {
+                    id: row.get(0)?,
+                    url: row.get(1)?,
+                    etag: row.get(2)?,
+                    modified: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn local_feed_refresh_input(&self, id: i64) -> anyhow::Result<FeedRefreshInput> {
+        let (url, etag, modified, source): (String, Option<String>, Option<String>, String) =
+            self.connection.query_row(
+                "SELECT feed_url,etag,last_modified,source FROM feeds WHERE id=?1 AND workspace=?2",
+                params![id, self.workspace],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        anyhow::ensure!(
+            source == "local",
+            "Remote feeds refresh through provider sync"
+        );
+        Ok(FeedRefreshInput {
+            id,
+            url,
+            etag,
+            modified,
+        })
+    }
+
+    pub fn article_source_revisions(
+        &self,
+        feed_id: i64,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT guid,source_revision FROM articles WHERE feed_id=?1 AND source_revision IS NOT NULL",
+        )?;
+        Ok(statement
+            .query_map([feed_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
+    pub fn remote_content_revisions(&self) -> anyhow::Result<HashMap<i64, String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.remote_id,COALESCE(a.source_revision,a.remote_content_hash) FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE f.workspace=?1 AND a.remote_id IS NOT NULL AND a.remote_content_hash IS NOT NULL",
+        )?;
+        Ok(statement
+            .query_map([&self.workspace], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
+    pub fn has_feed_url(&self, url: &str) -> anyhow::Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM feeds WHERE feed_url=?1 AND workspace=?2)",
+            params![url, self.workspace],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub async fn fetch_feed_data(
+        url: &str,
+        etag: Option<&str>,
+        modified: Option<&str>,
+    ) -> anyhow::Result<FetchedFeed> {
+        let mut request = Client::builder()
+            .user_agent("PandaReader/0.1 (+https://github.com)")
+            .timeout(Duration::from_secs(25))
+            .build()?
+            .get(url);
+        if let Some(etag) = etag {
+            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(modified) = modified {
+            request = request.header(reqwest::header::IF_MODIFIED_SINCE, modified);
+        }
+        let response = request.send().await?;
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(FetchedFeed {
+                parsed: None,
+                etag: etag.map(str::to_owned),
+                modified: modified.map(str::to_owned),
+            });
+        }
+        let response = response.error_for_status()?;
+        let next_etag = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let next_modified = response
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let bytes = response.bytes().await?;
+        Ok(FetchedFeed {
+            parsed: Some(feed_rs::parser::parse(bytes.as_ref())?),
+            etag: next_etag,
+            modified: next_modified,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn persist_fetched_feed(
+        &mut self,
+        url: &str,
+        id: Option<i64>,
+        fetched: FetchedFeed,
+    ) -> anyhow::Result<()> {
+        if let Some(feed) = fetched.parsed {
+            self.save_feed(url, feed, id, fetched.etag, fetched.modified)
+        } else if let Some(id) = id {
+            self.connection.execute(
+                "UPDATE feeds SET last_error=NULL WHERE id=?1 AND workspace=?2",
+                params![id, self.workspace],
+            )?;
+            Ok(())
+        } else {
+            anyhow::bail!("Feed has no content yet")
+        }
+    }
+
+    pub fn prepare_fetched_feed(
+        url: &str,
+        fetched: FetchedFeed,
+    ) -> anyhow::Result<PreparedFeedResponse> {
+        Self::prepare_fetched_feed_with_revisions(url, fetched, &HashMap::new())
+    }
+
+    pub fn prepare_fetched_feed_with_revisions(
+        url: &str,
+        fetched: FetchedFeed,
+        known_revisions: &HashMap<String, String>,
+    ) -> anyhow::Result<PreparedFeedResponse> {
+        let parsed = fetched
+            .parsed
+            .map(|feed| prepare_feed(url, feed, known_revisions))
+            .transpose()?;
+        Ok(PreparedFeedResponse {
+            parsed,
+            etag: fetched.etag,
+            modified: fetched.modified,
+        })
+    }
+
+    pub fn persist_prepared_feed(
+        &mut self,
+        url: &str,
+        id: Option<i64>,
+        response: PreparedFeedResponse,
+    ) -> anyhow::Result<bool> {
+        if let Some(feed) = response.parsed {
+            self.write_prepared_feed(url, feed, id, response.etag, response.modified)?;
+            Ok(true)
+        } else if let Some(id) = id {
+            self.connection.execute(
+                "UPDATE feeds SET last_error=NULL WHERE id=?1 AND workspace=?2",
+                params![id, self.workspace],
+            )?;
+            Ok(false)
+        } else {
+            anyhow::bail!("Feed has no content yet")
+        }
+    }
+
+    pub fn set_feed_refresh_error(&self, id: i64, error: Option<&str>) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE feeds SET last_error=?1 WHERE id=?2 AND workspace=?3",
+            params![error, id, self.workspace],
+        )?;
+        Ok(())
+    }
+
+    pub fn parse_opml_feeds(
+        source: &str,
+    ) -> anyhow::Result<Vec<(String, Option<String>, Option<String>)>> {
+        let document = OPML::from_str(source)?;
+        let mut entries = Vec::new();
+        for outline in &document.body.outlines {
+            collect_outlines(outline, None, &mut entries);
+        }
+        Ok(entries)
+    }
+
+    #[cfg(test)]
+    pub fn persist_imported_feed(
+        &mut self,
+        url: &str,
+        fetched: FetchedFeed,
+        title: Option<String>,
+        folder: Option<String>,
+    ) -> anyhow::Result<bool> {
+        if self.has_feed_url(url)? {
+            return Ok(false);
+        }
+        let Some(feed) = fetched.parsed else {
+            return Ok(false);
+        };
+        self.save_feed(url, feed, None, fetched.etag, fetched.modified)?;
+        if let Some(folder) = folder.filter(|value| !value.trim().is_empty()) {
+            self.connection.execute(
+                "UPDATE feeds SET folder=?1 WHERE feed_url=?2 AND workspace=?3",
+                params![folder, url, self.workspace],
+            )?;
+        }
+        if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+            self.connection.execute(
+                "UPDATE feeds SET title=?1 WHERE feed_url=?2 AND workspace=?3",
+                params![title, url, self.workspace],
+            )?;
+        }
+        Ok(true)
+    }
+
+    pub fn persist_imported_feed_response(
+        &mut self,
+        url: &str,
+        response: PreparedFeedResponse,
+        title: Option<String>,
+        folder: Option<String>,
+    ) -> anyhow::Result<bool> {
+        if self.has_feed_url(url)? {
+            return Ok(false);
+        }
+        let Some(feed) = response.parsed else {
+            return Ok(false);
+        };
+        self.write_prepared_feed(url, feed, None, response.etag, response.modified)?;
+        if let Some(folder) = folder.filter(|value| !value.trim().is_empty()) {
+            self.connection.execute(
+                "UPDATE feeds SET folder=?1 WHERE feed_url=?2 AND workspace=?3",
+                params![folder, url, self.workspace],
+            )?;
+        }
+        if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+            self.connection.execute(
+                "UPDATE feeds SET title=?1 WHERE feed_url=?2 AND workspace=?3",
+                params![title, url, self.workspace],
+            )?;
+        }
+        Ok(true)
     }
 
     pub fn snapshot(
@@ -189,8 +661,8 @@ impl Store {
         let feeds = if include_feeds {
             let mut feeds_statement = self.connection.prepare(
                 "SELECT f.id, COALESCE(f.custom_title,f.title), f.feed_url, f.site_url, f.folder,
-                        COUNT(CASE WHEN a.is_read=0 THEN 1 END), f.last_error, f.auto_translate_titles
-                 FROM feeds f LEFT JOIN articles a ON a.feed_id=f.id
+                        COUNT(a.id), f.last_error, f.auto_translate_titles
+                 FROM feeds f LEFT JOIN articles a ON a.feed_id=f.id AND a.is_read=0
                  WHERE f.workspace=?1
                  GROUP BY f.id ORDER BY COALESCE(f.folder,''), COALESCE(f.custom_title,f.title) COLLATE NOCASE",
             )?;
@@ -239,10 +711,15 @@ impl Store {
             ""
         };
         // FTS stores sanitized plain text, keeping HTML parsing out of the read path.
+        let search_filter = if search_query.is_empty() {
+            ""
+        } else {
+            "AND a.id IN (SELECT rowid FROM article_fts WHERE article_fts MATCH ?)"
+        };
         let sql = format!(
-            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles
+            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles,a.feed_id
              FROM articles a JOIN feeds f ON f.id=a.feed_id
-                 WHERE f.workspace=? AND {filter} AND (?='' OR a.id IN (SELECT rowid FROM article_fts WHERE article_fts MATCH ?))
+                 WHERE f.workspace=? AND {filter} {search_filter}
              {cursor_filter}
              ORDER BY COALESCE(a.published_at,'') DESC,a.id DESC LIMIT {limit}"
         );
@@ -264,11 +741,8 @@ impl Store {
                 auto_translated_title: row.get(10)?,
                 auto_translated_title_lang: row.get(11)?,
                 auto_translated_title_source_hash: row.get(12)?,
+                feed_id: row.get(15)?,
             })
-        };
-        let bind_search = |params: &mut Vec<rusqlite::types::Value>| {
-            params.push(search_query.clone().into());
-            params.push(search_query.clone().into());
         };
         let mut params: Vec<rusqlite::types::Value> = Vec::new();
         params.push(self.workspace.clone().into());
@@ -277,7 +751,9 @@ impl Store {
             ScopeBind::Folder(folder) => params.push(folder.clone().into()),
             ScopeBind::None => {}
         }
-        bind_search(&mut params);
+        if !search_query.is_empty() {
+            params.push(search_query.into());
+        }
         if use_cursor {
             params.push(cursor_pub.clone().into());
             params.push(cursor_pub.into());
@@ -332,56 +808,48 @@ impl Store {
     }
 
     pub fn article(&self, id: i64) -> anyhow::Result<Article> {
-        let summary = self.summary_by_id(id)?;
-        let (
-            url,
-            content_html,
-            source_html,
-            source_page_html,
-            extracted_html,
-            translated_html,
-            translated_title,
-            translated_lang,
-            translation_source_hash,
-        ): (
-            Option<String>,
-            String,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-        ) = self.connection.query_row(
-                "SELECT url,content_html,source_html,source_page_html,extracted_html,translated_html,translated_title,translated_lang,translation_source_hash FROM articles WHERE id=?1",
-                [id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                    ))
+        let (summary, content_revision, url, content_html, source_html, extracted_html,
+            translated_html, translated_title, translated_lang, translation_source_hash) = self.connection.query_row(
+            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,
+                    a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,
+                    a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,
+                    f.auto_translate_titles,a.feed_id,a.content_revision,a.content_html,
+                    CASE WHEN a.extracted_html IS NULL THEN a.source_html ELSE NULL END,a.extracted_html,
+                    a.translated_html,a.translated_title,a.translated_lang,a.translation_source_hash
+             FROM articles a JOIN feeds f ON f.id=a.feed_id
+             WHERE a.id=?1 AND f.workspace=?2",
+            params![id, self.workspace],
+            |row| Ok((
+                ArticleSummary {
+                    id: row.get(0)?, feed_title: row.get(1)?, title: row.get(2)?, url: row.get(3)?,
+                    author: row.get(4)?, snippet: row.get(5)?, published_at: row.get(6)?,
+                    is_read: row.get(7)?, is_starred: row.get(8)?, read_later: row.get(9)?,
+                    auto_translated_title: row.get(10)?, auto_translated_title_lang: row.get(11)?,
+                    auto_translated_title_source_hash: row.get(12)?, feed_language: row.get(13)?,
+                    feed_auto_translate_titles: row.get::<_, i64>(14)? != 0, feed_id: row.get(15)?,
                 },
-            )?;
+                row.get::<_, i64>(16)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(17)?,
+                row.get::<_, Option<Vec<u8>>>(18)?,
+                row.get::<_, Option<String>>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<String>>(21)?,
+                row.get::<_, Option<String>>(22)?,
+                row.get::<_, Option<String>>(23)?,
+            )),
+        )?;
         Ok(Article {
             summary,
+            content_revision,
             url,
             content_html,
             source_html: source_html
                 .map(|bytes| decompress_html(&bytes))
                 .transpose()?,
-            source_page_html: source_page_html
-                .map(|bytes| decompress_html(&bytes))
-                .transpose()?,
+            source_page_html: None,
             extracted_html,
-            effective_html: None,
+            canonical: None,
             translated_html,
             translated_title,
             translated_lang,
@@ -431,6 +899,23 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Stable identity for a canonical body, derived from its source and the
+    /// pipeline that produced it rather than re-hashing HTML on every read.
+    pub fn canonical_revision(
+        source: &str,
+        url: &str,
+        title: &str,
+        pipeline: &str,
+    ) -> panda_core::ContentRevision {
+        let source_hash = processed_source_hash(source, url, title);
+        let mut hasher = Sha256::new();
+        hasher.update(b"panda-canonical-v1\0");
+        hasher.update(source_hash.as_bytes());
+        hasher.update([0]);
+        hasher.update(pipeline.as_bytes());
+        panda_core::ContentRevision(std::sync::Arc::from(hex::encode(hasher.finalize())))
+    }
+
     pub fn save_processed_content(
         &self,
         article_id: i64,
@@ -441,34 +926,46 @@ impl Store {
         processed: &str,
     ) -> anyhow::Result<()> {
         let source_hash = processed_source_hash(source, url, title);
-        self.connection.execute(
-            "UPDATE articles SET processed_html=?1,processed_source_hash=?2,processed_pipeline_hash=?3 WHERE id=?4",
+        let changed = self.connection.execute(
+            "UPDATE articles SET processed_html=?1,processed_source_hash=?2,processed_pipeline_hash=?3,
+                translated_html=NULL,translated_title=NULL,translated_lang=NULL,translation_source_hash=NULL,
+                content_revision=content_revision+1 WHERE id=?4 AND
+                (processed_html IS NOT ?1 OR processed_source_hash IS NOT ?2 OR processed_pipeline_hash IS NOT ?3)",
             params![processed, source_hash, pipeline, article_id],
         )?;
+        if changed > 0 {
+            sync_article_fts(&self.connection, article_id)?;
+        }
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn translate(
         &mut self,
         article_id: i64,
         target_lang: &str,
         translator: &panda_translate::AnyTranslator,
     ) -> anyhow::Result<Article> {
-        let article = self.article(article_id)?;
+        let mut article = self.article(article_id)?;
         let source = article
-            .effective_html
+            .extracted_html
             .as_deref()
-            .or(article
-                .extracted_html
-                .as_deref()
-                .filter(|html| !html.trim().is_empty()))
+            .filter(|html| !html.trim().is_empty())
             .or(article.source_html.as_deref())
             .unwrap_or(article.content_html.as_str())
             .to_owned();
+        let url = article.url.as_deref().unwrap_or_default();
+        let pipeline = "store-test-canonical-v1";
+        article.canonical = Some(panda_core::CanonicalArticle {
+            html: panda_core::CanonicalHtml(std::sync::Arc::from(source.as_str())),
+            revision: Self::canonical_revision(&source, url, &article.summary.title, pipeline),
+            pipeline_revision: std::sync::Arc::from(pipeline),
+        });
         self.translate_with_source(article_id, target_lang, &source, translator)
             .await
     }
 
+    #[cfg(test)]
     pub async fn translate_with_source(
         &mut self,
         article_id: i64,
@@ -520,7 +1017,8 @@ impl Store {
             })
             .await?;
         self.connection.execute(
-            "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4 WHERE id=?5",
+            "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4,
+                content_revision=content_revision+1 WHERE id=?5",
             params![result.html, result.title, target_lang, source_hash, article_id],
         )?;
         sync_article_fts(&self.connection, article_id)?;
@@ -541,21 +1039,21 @@ impl Store {
         self.article(article_id)
     }
 
-    fn summary_by_id(&self, id: i64) -> anyhow::Result<ArticleSummary> {
-        Ok(self.connection.query_row(
-            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles
-             FROM articles a JOIN feeds f ON f.id=a.feed_id WHERE a.id=?1 AND f.workspace=?2",
-            params![id, self.workspace],
-            |row| Ok(ArticleSummary {
-                id: row.get(0)?, feed_title: row.get(1)?, title: row.get(2)?,
-                feed_language: row.get(13)?,
-                feed_auto_translate_titles: row.get::<_, i64>(14)? != 0,
-                url: row.get(3)?,
-                author: row.get(4)?, snippet: row.get(5)?, published_at: row.get(6)?,
-                is_read: row.get(7)?, is_starred: row.get(8)?, read_later: row.get(9)?,
-                auto_translated_title: row.get(10)?, auto_translated_title_lang: row.get(11)?, auto_translated_title_source_hash: row.get(12)?,
-            }),
-        )?)
+    pub fn persist_translation(
+        &self,
+        article_id: i64,
+        target_lang: &str,
+        source_hash: &str,
+        translated_html: &str,
+        translated_title: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4,
+                content_revision=content_revision+1 WHERE id=?5",
+            params![translated_html, translated_title, target_lang, source_hash, article_id],
+        )?;
+        sync_article_fts(&self.connection, article_id)?;
+        Ok(())
     }
 
     pub fn save_auto_translated_title(
@@ -617,6 +1115,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn flush_provider_marks(&mut self, remote: &ProviderClient) -> anyhow::Result<usize> {
         let pending = {
             let mut statement = self.connection.prepare(
@@ -741,6 +1240,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn refresh_feed(&mut self, id: i64) -> anyhow::Result<usize> {
         let (url, etag, modified, source): (String, Option<String>, Option<String>, String) =
             self.connection.query_row(
@@ -802,23 +1302,47 @@ impl Store {
         )?)
     }
 
-    pub async fn sync_provider(
-        &mut self,
-        remote: &ProviderClient,
+    pub fn pending_remote_marks(&self) -> anyhow::Result<Vec<PendingRemoteMark>> {
+        let mut statement = self.connection.prepare(
+            "SELECT remote_id,field,value,revision FROM pending_remote_marks WHERE workspace=?1 ORDER BY remote_id,field",
+        )?;
+        Ok(statement
+            .query_map([&self.workspace], |row| {
+                Ok(PendingRemoteMark {
+                    remote_id: row.get(0)?,
+                    field: row.get(1)?,
+                    value: row.get(2)?,
+                    revision: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn provider_sync_state(&self) -> anyhow::Result<Option<ProviderSyncState>> {
+        let state = self.connection.query_row(
+            "SELECT provider,account,sync_cursor,last_full_sync_at FROM remote_state WHERE workspace=?1",
+            [&self.workspace],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)),
+        ).optional()?;
+        Ok(state.map(
+            |(provider, account, cursor, last_full_sync_at)| ProviderSyncState {
+                provider,
+                account,
+                cursor: cursor.map(|value| SyncCursor { value }),
+                last_full_sync_at,
+            },
+        ))
+    }
+
+    pub fn begin_provider_sync(
+        &self,
         kind: ProviderKind,
-    ) -> anyhow::Result<usize> {
-        let identity = remote.identity().await?;
-        let feeds = remote.feeds().await?;
-        let account = identity.account;
-        let previous: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT account FROM remote_state WHERE workspace=?1",
-                [&self.workspace],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if previous.as_deref().is_some_and(|old| old != account) {
+        account: &str,
+        cursor: Option<&SyncCursor>,
+        last_full_sync_at: Option<&str>,
+        reset: bool,
+    ) -> anyhow::Result<()> {
+        if reset {
             self.connection.execute(
                 "DELETE FROM feeds WHERE source=?1 AND workspace=?2",
                 params![kind.key(), self.workspace],
@@ -829,25 +1353,153 @@ impl Store {
             )?;
         }
         self.connection.execute(
-            "INSERT INTO remote_state(workspace,account) VALUES(?1,?2)
-             ON CONFLICT(workspace) DO UPDATE SET account=excluded.account",
-            params![self.workspace, account],
+            "INSERT INTO remote_state(workspace,provider,account,sync_cursor,last_sync_at,last_full_sync_at)
+             VALUES(?1,?2,?3,?4,NULL,?5)
+             ON CONFLICT(workspace) DO UPDATE SET provider=excluded.provider,account=excluded.account,
+                sync_cursor=excluded.sync_cursor,last_full_sync_at=excluded.last_full_sync_at",
+            params![self.workspace, kind.key(), account, cursor.map(|value| value.value.as_str()), last_full_sync_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_provider_sync_cursor(
+        &self,
+        cursor: Option<&SyncCursor>,
+        full_sync_at: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.connection.execute(
+            "UPDATE remote_state SET sync_cursor=?1,last_sync_at=?2,last_full_sync_at=COALESCE(?3,last_full_sync_at) WHERE workspace=?4",
+            params![cursor.map(|value| value.value.as_str()), now, full_sync_at, self.workspace],
+        )?;
+        Ok(())
+    }
+
+    pub fn acknowledge_remote_marks(
+        &mut self,
+        marks: &[PendingRemoteMark],
+    ) -> anyhow::Result<usize> {
+        let transaction = self.connection.transaction()?;
+        let mut completed = 0;
+        for mark in marks {
+            completed += transaction.execute(
+                "DELETE FROM pending_remote_marks WHERE workspace=?1 AND remote_id=?2 AND field=?3 AND revision=?4",
+                params![self.workspace, mark.remote_id, mark.field, mark.revision],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(completed)
+    }
+
+    #[cfg(test)]
+    pub async fn sync_provider(
+        &mut self,
+        remote: &ProviderClient,
+        kind: ProviderKind,
+    ) -> anyhow::Result<usize> {
+        let identity = remote.identity().await?;
+        let feeds = remote.feeds().await?;
+        let account = identity.account;
+        let previous: Option<(String, String, Option<String>, Option<String>)> = self
+            .connection
+            .query_row(
+                "SELECT provider,account,sync_cursor,last_full_sync_at FROM remote_state WHERE workspace=?1",
+                [&self.workspace],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let account_changed = previous
+            .as_ref()
+            .is_some_and(|(_, old_account, _, _)| old_account != &account);
+        let provider_changed = previous.as_ref().is_some_and(|(old_provider, _, _, _)| {
+            !old_provider.is_empty() && old_provider != kind.key()
+        });
+        let reset = account_changed || provider_changed;
+        if reset {
+            self.connection.execute(
+                "DELETE FROM feeds WHERE source=?1 AND workspace=?2",
+                params![kind.key(), self.workspace],
+            )?;
+            self.connection.execute(
+                "DELETE FROM pending_remote_marks WHERE workspace=?1",
+                [&self.workspace],
+            )?;
+        }
+        let mut cursor = if reset {
+            None
+        } else {
+            previous
+                .as_ref()
+                .and_then(|(_, _, cursor, _)| cursor.as_ref())
+                .map(|value| SyncCursor {
+                    value: value.clone(),
+                })
+        };
+        let last_full_sync_at = if reset {
+            None
+        } else {
+            previous
+                .as_ref()
+                .and_then(|(_, _, _, timestamp)| timestamp.as_deref())
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&chrono::Utc))
+        };
+        let mode = if reset || previous.is_none() || cursor.is_none() {
+            SyncMode::Initial
+        } else if !remote.capabilities().incremental_sync {
+            SyncMode::Reconcile
+        } else if last_full_sync_at
+            .is_none_or(|last| chrono::Utc::now().signed_duration_since(last).num_days() >= 7)
+        {
+            SyncMode::Reconcile
+        } else {
+            SyncMode::Incremental
+        };
+        self.connection.execute(
+            "INSERT INTO remote_state(workspace,provider,account,sync_cursor,last_sync_at,last_full_sync_at)
+             VALUES(?1,?2,?3,?4,NULL,?5)
+             ON CONFLICT(workspace) DO UPDATE SET provider=excluded.provider,account=excluded.account,
+                sync_cursor=excluded.sync_cursor,last_full_sync_at=excluded.last_full_sync_at",
+            params![
+                self.workspace,
+                kind.key(),
+                account,
+                cursor.as_ref().map(|value| value.value.as_str()),
+                last_full_sync_at.map(|value| value.to_rfc3339())
+            ],
         )?;
         self.flush_provider_marks(remote).await?;
         let feed_ids = self.save_remote_feeds(&feeds, kind)?;
-        let entries = remote.all_entries().await?;
-        self.save_remote_entries(&entries, &feed_ids)
+        let mut saved = 0;
+        let mut full_sync = matches!(mode, SyncMode::Initial | SyncMode::Reconcile);
+        loop {
+            let page = remote.entries_page(mode, cursor.as_ref()).await?;
+            full_sync |= page.full_sync;
+            saved += self.save_remote_entries(&page.entries, &feed_ids, kind)?;
+            cursor = page.next_cursor;
+            let now = chrono::Utc::now().to_rfc3339();
+            let full_sync_at = (!page.has_more && full_sync).then_some(now.as_str());
+            self.connection.execute(
+                "UPDATE remote_state SET sync_cursor=?1,last_sync_at=?2,
+                    last_full_sync_at=COALESCE(?3,last_full_sync_at) WHERE workspace=?4",
+                params![
+                    cursor.as_ref().map(|value| value.value.as_str()),
+                    now,
+                    full_sync_at,
+                    self.workspace
+                ],
+            )?;
+            if !page.has_more {
+                break;
+            }
+            if cursor.is_none() {
+                anyhow::bail!("Provider returned another sync page without a continuation cursor");
+            }
+        }
+        Ok(saved)
     }
 
-    pub async fn sync_miniflux(&mut self, remote: &Miniflux) -> anyhow::Result<usize> {
-        self.sync_provider(
-            &ProviderClient::Miniflux(remote.clone()),
-            ProviderKind::Miniflux,
-        )
-        .await
-    }
-
-    fn save_remote_feeds(
+    pub fn save_remote_feeds(
         &mut self,
         feeds: &[RemoteFeed],
         kind: ProviderKind,
@@ -931,15 +1583,78 @@ impl Store {
         Ok(result)
     }
 
-    fn save_remote_entries(
+    #[cfg(test)]
+    pub fn save_remote_entries(
         &mut self,
         entries: &[RemoteEntry],
+        feed_ids: &HashMap<i64, i64>,
+        kind: ProviderKind,
+    ) -> anyhow::Result<usize> {
+        let prepared = Self::prepare_remote_entries(entries.to_vec(), kind)?;
+        self.save_prepared_remote_entries(&prepared, feed_ids)
+    }
+
+    pub fn prepare_remote_entries(
+        entries: Vec<RemoteEntry>,
+        kind: ProviderKind,
+    ) -> anyhow::Result<Vec<PreparedRemoteEntry>> {
+        Self::prepare_remote_entries_with_revisions(entries, kind, &HashMap::new())
+    }
+
+    pub fn prepare_remote_entries_with_revisions(
+        entries: Vec<RemoteEntry>,
+        kind: ProviderKind,
+        known_revisions: &HashMap<i64, String>,
+    ) -> anyhow::Result<Vec<PreparedRemoteEntry>> {
+        entries
+            .into_iter()
+            .map(|entry| {
+                let remote_hash = hex::encode(Sha256::digest(entry.content.as_bytes()));
+                if entry.status == "removed" {
+                    return Ok(PreparedRemoteEntry {
+                        guid: format!("{}:{}", kind.key(), entry.id),
+                        entry,
+                        remote_hash,
+                        html: String::new(),
+                        snippet: String::new(),
+                        compressed_source: Vec::new(),
+                    });
+                }
+                if known_revisions.get(&entry.id) == Some(&remote_hash) {
+                    return Ok(PreparedRemoteEntry {
+                        guid: format!("{}:{}", kind.key(), entry.id),
+                        entry,
+                        remote_hash,
+                        html: String::new(),
+                        snippet: String::new(),
+                        compressed_source: Vec::new(),
+                    });
+                }
+                let html = sanitize_html(&entry.content, entry.url.as_deref());
+                let snippet = plain_text(&html).chars().take(280).collect();
+                let compressed_source = compress_html(&entry.content)?;
+                Ok(PreparedRemoteEntry {
+                    guid: format!("{}:{}", kind.key(), entry.id),
+                    entry,
+                    remote_hash,
+                    html,
+                    snippet,
+                    compressed_source,
+                })
+            })
+            .collect()
+    }
+
+    pub fn save_prepared_remote_entries(
+        &mut self,
+        entries: &[PreparedRemoteEntry],
         feed_ids: &HashMap<i64, i64>,
     ) -> anyhow::Result<usize> {
         let mut saved = 0;
         for batch in entries.chunks(100) {
             let transaction = self.connection.transaction()?;
-            for entry in batch {
+            for prepared in batch {
+                let entry = &prepared.entry;
                 let Some(feed_id) = feed_ids.get(&entry.feed_id) else {
                     continue;
                 };
@@ -950,38 +1665,142 @@ impl Store {
                     )?;
                     continue;
                 }
-                let source_html = compress_html(&entry.content)?;
-                let html = sanitize_html(&entry.content, entry.url.as_deref());
-                let snippet = plain_text(&html).chars().take(280).collect::<String>();
-                transaction.execute(
-                    "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,source_html,is_read,is_starred,remote_id)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                 ON CONFLICT(feed_id,guid) DO UPDATE SET
-                    title=excluded.title,url=excluded.url,author=excluded.author,
-                    published_at=excluded.published_at,snippet=excluded.snippet,
-                    content_html=excluded.content_html,
-                    source_html=CASE WHEN excluded.content_html='' THEN articles.source_html ELSE excluded.source_html END,
-                    is_read=excluded.is_read,
-                    is_starred=excluded.is_starred,remote_id=excluded.remote_id",
-                    params![
-                        feed_id, format!("miniflux:{}", entry.id), entry.title, entry.url,
-                        entry.author, entry.published_at, snippet, html, source_html,
-                        entry.status == "read", entry.starred, entry.id
-                    ],
-                )?;
-                let article_id: i64 = transaction.query_row(
-                    "SELECT id FROM articles WHERE feed_id=?1 AND guid=?2",
-                    params![feed_id, format!("miniflux:{}", entry.id)],
-                    |row| row.get(0),
-                )?;
-                sync_article_fts(&transaction, article_id)?;
-                saved += 1;
+                let remote_hash = &prepared.remote_hash;
+                let is_read = entry.status == "read";
+                let existing: Option<(
+                    i64,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    bool,
+                    bool,
+                )> = transaction
+                    .query_row(
+                        "SELECT id,remote_content_hash,title,url,author,published_at,is_read,is_starred
+                         FROM articles WHERE feed_id=?1 AND guid=?2",
+                        params![feed_id, prepared.guid],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get::<_, i64>(6)? != 0,
+                                row.get::<_, i64>(7)? != 0,
+                            ))
+                        },
+                    )
+                    .optional()?;
+
+                if let Some((
+                    article_id,
+                    stored_hash,
+                    old_title,
+                    old_url,
+                    old_author,
+                    old_published_at,
+                    old_is_read,
+                    old_is_starred,
+                )) = existing
+                {
+                    let content_changed = stored_hash.as_deref() != Some(remote_hash.as_str());
+                    let title_changed = old_title != entry.title;
+                    let author_changed = old_author != entry.author;
+                    let changed = content_changed
+                        || title_changed
+                        || old_url != entry.url
+                        || author_changed
+                        || old_published_at != entry.published_at
+                        || old_is_read != is_read
+                        || old_is_starred != entry.starred;
+                    if !changed {
+                        continue;
+                    }
+
+                    if content_changed {
+                        transaction.execute(
+                            "UPDATE articles SET title=?1,url=?2,author=?3,published_at=?4,
+                                snippet=?5,content_html=?6,
+                                source_html=CASE WHEN ?6='' THEN source_html ELSE ?7 END,
+                                content_revision=content_revision+1,
+                                remote_content_hash=?8,source_revision=?8,is_read=?9,is_starred=?10,
+                                extraction_pipeline_hash=NULL,extracted_html=NULL,
+                                processed_html=NULL,processed_source_hash=NULL,processed_pipeline_hash=NULL,
+                                translated_html=NULL,translated_title=NULL,translated_lang=NULL,
+                                translation_source_hash=NULL,auto_translated_title=NULL,
+                                auto_translated_title_lang=NULL,auto_translated_title_source_hash=NULL
+                             WHERE id=?11",
+                            params![
+                                entry.title,
+                                entry.url,
+                                entry.author,
+                                entry.published_at,
+                                prepared.snippet,
+                                prepared.html,
+                                prepared.compressed_source,
+                                remote_hash,
+                                is_read,
+                                entry.starred,
+                                article_id,
+                            ],
+                        )?;
+                    } else {
+                        transaction.execute(
+                            "UPDATE articles SET title=?1,url=?2,author=?3,published_at=?4,
+                                is_read=?5,is_starred=?6,
+                                content_revision=content_revision+CASE WHEN title IS NOT ?1 THEN 1 ELSE 0 END
+                             WHERE id=?7",
+                            params![
+                                entry.title,
+                                entry.url,
+                                entry.author,
+                                entry.published_at,
+                                is_read,
+                                entry.starred,
+                                article_id,
+                            ],
+                        )?;
+                    }
+                    if content_changed || title_changed || author_changed {
+                        sync_article_fts(&transaction, article_id)?;
+                    }
+                    saved += 1;
+                } else {
+                    transaction.execute(
+                            "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,
+                            content_html,source_html,is_read,is_starred,remote_id,remote_content_hash,source_revision)
+                         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13)",
+                        params![
+                            feed_id,
+                            prepared.guid,
+                            entry.title,
+                            entry.url,
+                            entry.author,
+                            entry.published_at,
+                            prepared.snippet,
+                            prepared.html,
+                            prepared.compressed_source,
+                            is_read,
+                            entry.starred,
+                            entry.id,
+                            remote_hash,
+                        ],
+                    )?;
+                    let article_id = transaction.last_insert_rowid();
+                    sync_article_fts(&transaction, article_id)?;
+                    saved += 1;
+                }
             }
             transaction.commit()?;
         }
         Ok(saved)
     }
 
+    #[cfg(test)]
     pub async fn add_feed(&mut self, feed_url: &str) -> anyhow::Result<()> {
         let url = normalize_http_url(feed_url)?;
         if self
@@ -1020,6 +1839,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn refresh_all(&mut self) -> anyhow::Result<usize> {
         let feeds = {
             let mut statement = self.connection.prepare(
@@ -1072,6 +1892,7 @@ impl Store {
         Ok(total)
     }
 
+    #[cfg(test)]
     async fn fetch_feed(
         &self,
         url: &str,
@@ -1105,6 +1926,7 @@ impl Store {
         Ok((Some(feed), next_etag, next_modified))
     }
 
+    #[cfg(test)]
     fn save_feed(
         &mut self,
         url: &str,
@@ -1113,19 +1935,28 @@ impl Store {
         etag: Option<String>,
         modified: Option<String>,
     ) -> anyhow::Result<()> {
-        let site_url = feed
-            .links
-            .iter()
-            .find(|link| link.rel.as_deref() == Some("alternate"))
-            .or_else(|| feed.links.first())
-            .map(|link| resolve_url(url, &link.href));
-        let title = feed
-            .title
-            .as_ref()
-            .map(|t| t.content.trim())
-            .filter(|t| !t.is_empty())
-            .unwrap_or(url)
-            .to_owned();
+        self.write_prepared_feed(
+            url,
+            prepare_feed(url, feed, &HashMap::new())?,
+            existing_id,
+            etag,
+            modified,
+        )
+    }
+
+    fn write_prepared_feed(
+        &mut self,
+        url: &str,
+        feed: PreparedFeed,
+        existing_id: Option<i64>,
+        etag: Option<String>,
+        modified: Option<String>,
+    ) -> anyhow::Result<()> {
+        let PreparedFeed {
+            title,
+            site_url,
+            articles,
+        } = feed;
         let id = if let Some(id) = existing_id {
             self.connection.execute("UPDATE feeds SET title=?1,site_url=COALESCE(?2,site_url),etag=COALESCE(?3,etag),last_modified=COALESCE(?4,last_modified),last_error=NULL WHERE id=?5 AND workspace=?6", params![title,site_url,etag,modified,id,self.workspace])?;
             id
@@ -1133,37 +1964,44 @@ impl Store {
             self.connection.execute("INSERT INTO feeds(feed_url,title,site_url,etag,last_modified,workspace) VALUES(?1,?2,?3,?4,?5,?6)", params![url,title,site_url,etag,modified,self.workspace])?;
             self.connection.last_insert_rowid()
         };
-        let mut entries = feed.entries.into_iter().peekable();
+        let mut entries = articles.into_iter().peekable();
         while entries.peek().is_some() {
             let transaction = self.connection.transaction()?;
             for _ in 0..100 {
-                let Some(entry) = entries.next() else {
+                let Some((parsed, compressed_source, source_revision)) = entries.next() else {
                     break;
                 };
-                let Some(parsed) = map_entry(entry, url, site_url.as_deref()) else {
-                    continue;
-                };
                 transaction.execute(
-                    "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,source_html)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                    "INSERT INTO articles(feed_id,guid,title,url,author,published_at,snippet,content_html,source_html,source_revision)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(feed_id,guid) DO UPDATE SET title=excluded.title,url=excluded.url,author=excluded.author,
                  published_at=COALESCE(excluded.published_at,articles.published_at),snippet=excluded.snippet,
                  content_html=CASE WHEN excluded.content_html='' THEN articles.content_html ELSE excluded.content_html END,
-                 source_html=CASE WHEN excluded.source_html IS NULL OR excluded.source_html=X'' THEN articles.source_html ELSE excluded.source_html END",
-                    params![id,parsed.guid,parsed.title,parsed.url,parsed.author,parsed.published_at,parsed.snippet,parsed.content_html,compress_html(&parsed.source_html)?],
+                 source_html=CASE WHEN excluded.source_html IS NULL OR excluded.source_html=X'' THEN articles.source_html ELSE excluded.source_html END,
+                 source_revision=excluded.source_revision,
+                 content_revision=articles.content_revision+1
+                 WHERE articles.source_revision IS NOT excluded.source_revision OR articles.title IS NOT excluded.title OR articles.url IS NOT excluded.url
+                    OR articles.author IS NOT excluded.author OR articles.published_at IS NOT COALESCE(excluded.published_at,articles.published_at)
+                    OR articles.snippet IS NOT excluded.snippet
+                    OR (excluded.content_html<>'' AND articles.content_html IS NOT excluded.content_html)
+                    OR (excluded.source_html IS NOT NULL AND excluded.source_html<>X'' AND articles.source_html IS NOT excluded.source_html)",
+                    params![id,parsed.guid,parsed.title,parsed.url,parsed.author,parsed.published_at,parsed.snippet,parsed.content_html,compressed_source,source_revision],
                 )?;
                 let article_id: i64 = transaction.query_row(
                     "SELECT id FROM articles WHERE feed_id=?1 AND guid=?2",
                     params![id, parsed.guid],
                     |row| row.get(0),
                 )?;
-                sync_article_fts(&transaction, article_id)?;
+                if transaction.changes() > 0 {
+                    sync_article_fts(&transaction, article_id)?;
+                }
             }
             transaction.commit()?;
         }
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn extract(
         &mut self,
         article_id: i64,
@@ -1174,6 +2012,7 @@ impl Store {
             .await
     }
 
+    #[cfg(test)]
     pub async fn extract_using(
         &mut self,
         article_id: i64,
@@ -1182,6 +2021,23 @@ impl Store {
         pipeline_hash: &str,
         prepare: impl FnOnce(&str, &str, &str) -> anyhow::Result<Option<(String, bool)>>,
     ) -> anyhow::Result<()> {
+        if let Some(prepared) = self
+            .prepare_extraction_using(article_id, force, extractor, pipeline_hash, prepare)
+            .await?
+        {
+            self.persist_extraction(prepared)?;
+        }
+        Ok(())
+    }
+
+    pub async fn prepare_extraction_using(
+        &self,
+        article_id: i64,
+        force: bool,
+        extractor: ContentExtractor,
+        pipeline_hash: &str,
+        prepare: impl FnOnce(&str, &str, &str) -> anyhow::Result<Option<(String, bool)>>,
+    ) -> anyhow::Result<Option<PreparedExtraction>> {
         let (existing, existing_hash, cached_page): (Option<String>, Option<String>, Option<Vec<u8>>) = self.connection.query_row(
             "SELECT extracted_html,extraction_pipeline_hash,source_page_html FROM articles WHERE id=?1",
             [article_id],
@@ -1194,7 +2050,7 @@ impl Store {
             && existing_hash.is_none()
             && cached_page.is_none()
         {
-            return Ok(());
+            return Ok(None);
         }
         let (url, title): (String, String) = self.connection.query_row(
             "SELECT url,title FROM articles WHERE id=?1",
@@ -1218,13 +2074,7 @@ impl Store {
                 .is_some_and(|html| !html.trim().is_empty())
             && existing_hash.as_deref() == Some(pipeline_hash.as_str())
         {
-            return Ok(());
-        }
-        if resolved != url {
-            self.connection.execute(
-                "UPDATE articles SET url=?1 WHERE id=?2",
-                params![resolved, article_id],
-            )?;
+            return Ok(None);
         }
         let compressed_raw = compress_html(&raw)?;
         let prepared = prepare(&raw, &resolved, &title)?;
@@ -1249,14 +2099,28 @@ impl Store {
         if plain_text(&sanitized).trim().len() < 80 {
             anyhow::bail!("No extractable article content found on this page");
         }
+        Ok(Some(PreparedExtraction {
+            article_id,
+            resolved_url: resolved,
+            source_page_html: compressed_raw,
+            extracted_html: sanitized,
+            pipeline_hash,
+        }))
+    }
+
+    pub fn persist_extraction(&self, prepared: PreparedExtraction) -> anyhow::Result<()> {
         self.connection.execute(
-            "UPDATE articles SET source_page_html=?1, extracted_html=?2, extraction_pipeline_hash=?3, processed_html=NULL, processed_source_hash=NULL, processed_pipeline_hash=NULL, translated_html=NULL, translated_title=NULL, translated_lang=NULL, translation_source_hash=NULL WHERE id=?4",
-            params![compressed_raw, sanitized, pipeline_hash, article_id],
+            "UPDATE articles SET url=?1,source_page_html=?2, extracted_html=?3, extraction_pipeline_hash=?4,
+                processed_html=NULL, processed_source_hash=NULL, processed_pipeline_hash=NULL,
+                translated_html=NULL, translated_title=NULL, translated_lang=NULL, translation_source_hash=NULL,
+                content_revision=content_revision+1 WHERE id=?5",
+            params![prepared.resolved_url, prepared.source_page_html, prepared.extracted_html, prepared.pipeline_hash, prepared.article_id],
         )?;
-        sync_article_fts(&self.connection, article_id)?;
+        sync_article_fts(&self.connection, prepared.article_id)?;
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn import_opml(&mut self, source: &str) -> anyhow::Result<usize> {
         let document = OPML::from_str(source)?;
         let mut entries = Vec::new();
@@ -1347,6 +2211,109 @@ impl Store {
     }
 }
 
+fn prepare_feed(
+    url: &str,
+    feed: ParsedFeed,
+    known_revisions: &HashMap<String, String>,
+) -> anyhow::Result<PreparedFeed> {
+    let site_url = feed
+        .links
+        .iter()
+        .find(|link| link.rel.as_deref() == Some("alternate"))
+        .or_else(|| feed.links.first())
+        .map(|link| resolve_url(url, &link.href));
+    let title = feed
+        .title
+        .as_ref()
+        .map(|title| title.content.trim())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(url)
+        .to_owned();
+    let mut articles = Vec::new();
+    for entry in feed.entries {
+        let Some((guid, source_revision)) = entry_source_revision(&entry, url, site_url.as_deref())
+        else {
+            continue;
+        };
+        if known_revisions.get(&guid) == Some(&source_revision) {
+            continue;
+        }
+        if let Some(article) = map_entry(entry, url, site_url.as_deref()) {
+            let compressed_source = compress_html(&article.source_html)?;
+            articles.push((article, compressed_source, source_revision));
+        }
+    }
+    Ok(PreparedFeed {
+        title,
+        site_url,
+        articles,
+    })
+}
+
+fn entry_source_revision(
+    entry: &Entry,
+    feed_url: &str,
+    site_url: Option<&str>,
+) -> Option<(String, String)> {
+    let title = entry
+        .title
+        .as_ref()
+        .map(|title| title.content.trim())
+        .filter(|title| !title.is_empty())?;
+    let published_at = entry
+        .published
+        .as_ref()
+        .or(entry.updated.as_ref())
+        .map(|date| date.to_rfc3339());
+    let guid = if entry.id.trim().is_empty() {
+        format!("{}:{}", title, published_at.as_deref().unwrap_or(""))
+    } else {
+        entry.id.clone()
+    };
+    let base = site_url.unwrap_or(feed_url);
+    let url = entry
+        .links
+        .iter()
+        .find(|link| link.rel.as_deref() == Some("alternate"))
+        .or_else(|| entry.links.first())
+        .map(|link| resolve_url(base, &link.href))
+        .unwrap_or_default();
+    let raw_html = entry
+        .content
+        .as_ref()
+        .and_then(|content| content.body.as_deref())
+        .or_else(|| {
+            entry
+                .summary
+                .as_ref()
+                .map(|summary| summary.content.as_str())
+        })
+        .unwrap_or_default();
+    let author = entry
+        .authors
+        .first()
+        .map(|person| person.name.as_str())
+        .unwrap_or_default();
+    let summary = entry
+        .summary
+        .as_ref()
+        .map(|summary| summary.content.as_str())
+        .unwrap_or_default();
+    let mut hasher = Sha256::new();
+    for value in [
+        title,
+        url.as_str(),
+        author,
+        raw_html,
+        summary,
+        published_at.as_deref().unwrap_or(""),
+    ] {
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    Some((guid, hex::encode(hasher.finalize())))
+}
+
 fn compress_html(html: &str) -> anyhow::Result<Vec<u8>> {
     if html.len() > 8 * 1024 * 1024 {
         anyhow::bail!("article source exceeds the 8 MiB limit");
@@ -1384,7 +2351,7 @@ fn decompress_html(compressed: &[u8]) -> anyhow::Result<String> {
 fn sync_article_fts(connection: &Connection, article_id: i64) -> anyhow::Result<()> {
     let article = connection
         .query_row(
-            "SELECT title,author,content_html,extracted_html,translated_html FROM articles WHERE id=?1",
+            "SELECT title,author,content_html,processed_html,translated_html FROM articles WHERE id=?1",
             [article_id],
             |row| {
                 Ok((
@@ -1397,13 +2364,11 @@ fn sync_article_fts(connection: &Connection, article_id: i64) -> anyhow::Result<
             },
         )
         .optional()?;
-    let Some((title, author, content_html, extracted_html, translated_html)) = article else {
+    let Some((title, author, content_html, canonical_html, translated_html)) = article else {
         connection.execute("DELETE FROM article_fts WHERE rowid=?1", [article_id])?;
         return Ok(());
     };
-    let source_html = extracted_html
-        .filter(|html| !html.trim().is_empty())
-        .unwrap_or(content_html);
+    let source_html = canonical_html.unwrap_or(content_html);
     let content_text = plain_text(&source_html);
     let translated_text = translated_html
         .as_deref()
@@ -1617,7 +2582,7 @@ fn map_entry(entry: Entry, feed_url: &str, site_url: Option<&str>) -> Option<Par
     })
 }
 
-fn normalize_http_url(raw: &str) -> anyhow::Result<String> {
+pub fn normalize_http_url(raw: &str) -> anyhow::Result<String> {
     let url = Url::parse(raw.trim())?;
     if !matches!(url.scheme(), "http" | "https") {
         anyhow::bail!("Feed URL must use HTTP or HTTPS");
@@ -1815,13 +2780,129 @@ mod tests {
     use super::*;
     use panda_core::Scope;
 
+    #[test]
+    fn migration_is_versioned_and_read_connections_do_not_change_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("migration.sqlite3");
+        Store::migrate(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        connection
+            .execute(
+                "UPDATE article_fts_state SET last_article_id=99,complete=1 WHERE id=1",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 4).unwrap();
+        drop(connection);
+        Store::migrate(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let (last_id, complete): (i64, i64) = connection
+            .query_row(
+                "SELECT last_article_id,complete FROM article_fts_state WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((last_id, complete), (0, 0));
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        let before: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let reader = Store::open_read_workspace(&path, "local").unwrap();
+        reader.snapshot(Scope::All, "", 20, None, false).unwrap();
+        drop(reader);
+        let connection = Connection::open(&path).unwrap();
+        let after: i64 = connection
+            .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn scope_indexes_match_their_filters_and_sort_order() {
+        let (_directory, store) = test_store();
+        store
+            .connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title,folder) VALUES(1,'https://example.org/feed','feed','folder')",
+                [],
+            )
+            .unwrap();
+        for index in 0..2_000 {
+            store.connection.execute(
+                "INSERT INTO articles(feed_id,guid,title,published_at,is_read,is_starred,read_later)
+                 VALUES(1,?1,?2,?3,?4,?5,?6)",
+                params![
+                    index.to_string(),
+                    format!("article {index}"),
+                    format!("2026-01-{:02}-{:02}", index % 12 + 1, index % 27 + 1),
+                    index % 20 != 0,
+                    index % 5 == 0,
+                    index % 7 == 0,
+                ],
+            ).unwrap();
+        }
+        store.connection.execute_batch("ANALYZE").unwrap();
+        let plan = |sql: &str| -> String {
+            let mut statement = store.connection.prepare(sql).unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+        };
+        let all_plan = plan(
+            "EXPLAIN QUERY PLAN SELECT id FROM articles ORDER BY COALESCE(published_at,'') DESC,id DESC LIMIT 20",
+        );
+        assert!(all_plan.contains("idx_articles_sort"), "{all_plan}");
+        let unread_plan = plan(
+            "EXPLAIN QUERY PLAN SELECT id FROM articles WHERE is_read=0 ORDER BY COALESCE(published_at,'') DESC,id DESC LIMIT 20",
+        );
+        assert!(
+            unread_plan.contains("idx_articles_unread_sort"),
+            "{unread_plan}"
+        );
+        assert!(plan("EXPLAIN QUERY PLAN SELECT id FROM articles WHERE is_starred=1 ORDER BY COALESCE(published_at,'') DESC,id DESC LIMIT 20").contains("idx_articles_starred_sort"));
+        assert!(plan("EXPLAIN QUERY PLAN SELECT id FROM articles WHERE read_later=1 ORDER BY COALESCE(published_at,'') DESC,id DESC LIMIT 20").contains("idx_articles_later_sort"));
+        assert!(plan("EXPLAIN QUERY PLAN SELECT id FROM articles WHERE feed_id=1 ORDER BY COALESCE(published_at,'') DESC,id DESC LIMIT 20").contains("idx_articles_feed_sort"));
+        let folder_plan = plan(
+            "EXPLAIN QUERY PLAN SELECT a.id FROM feeds f JOIN articles a ON a.feed_id=f.id WHERE f.workspace='local' AND f.folder='folder' ORDER BY COALESCE(a.published_at,'') DESC,a.id DESC LIMIT 20",
+        );
+        assert!(
+            folder_plan.contains("idx_feeds_workspace_folder"),
+            "{folder_plan}"
+        );
+        let unread_counts = plan(
+            "EXPLAIN QUERY PLAN SELECT feed_id,COUNT(*) FROM articles WHERE is_read=0 GROUP BY feed_id",
+        );
+        assert!(
+            unread_counts.contains("idx_articles_feed_unread"),
+            "{unread_counts}"
+        );
+        assert!(
+            plan(
+                "EXPLAIN QUERY PLAN SELECT rowid FROM article_fts WHERE article_fts MATCH 'article'"
+            )
+            .contains("VIRTUAL TABLE INDEX")
+        );
+    }
+
     fn test_store() -> (tempfile::TempDir, Store) {
         test_store_for("local")
     }
 
     fn test_store_for(workspace: &str) -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().expect("temporary database directory");
-        let store = Store::open_workspace(&directory.path().join("reader.sqlite3"), workspace)
+        let store = Store::open_writer(&directory.path().join("reader.sqlite3"), workspace)
             .expect("open test database");
         (directory, store)
     }
@@ -1858,13 +2939,15 @@ mod tests {
         }
 
         store
-            .connection
-            .execute(
-                "UPDATE articles SET extracted_html='<p>replacement body about ocean currents</p>' WHERE id=1",
-                [],
+            .save_processed_content(
+                1,
+                "<p>raw body</p>",
+                "https://example.org/article",
+                "湖南大学找到植物生长开关",
+                "canonical-v1",
+                "<p>replacement body about ocean currents</p>",
             )
             .unwrap();
-        sync_article_fts(&store.connection, 1).unwrap();
         assert_eq!(
             store
                 .snapshot(Scope::All, "quantum foam", 20, None, false)
@@ -1881,6 +2964,23 @@ mod tests {
                 .len(),
             1
         );
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "original article body", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .snapshot(Scope::All, "月球基地", 20, None, false)
+                .unwrap()
+                .articles
+                .len(),
+            0,
+            "a canonical revision change must discard the stale translation"
+        );
         store
             .connection
             .execute("DELETE FROM articles WHERE id=1", [])
@@ -1893,6 +2993,67 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn local_feed_revision_skips_unchanged_entry_preparation() {
+        let bytes = include_bytes!("../tests/fixtures/sample_feed.xml");
+        let feed = feed_rs::parser::parse(bytes.as_slice()).unwrap();
+        let first = Store::prepare_fetched_feed(
+            "https://example.com/feed.xml",
+            FetchedFeed {
+                parsed: Some(feed),
+                etag: None,
+                modified: None,
+            },
+        )
+        .unwrap();
+        let prepared = first.parsed.unwrap();
+        let known = prepared
+            .articles
+            .iter()
+            .map(|(article, _, revision)| (article.guid.clone(), revision.clone()))
+            .collect::<HashMap<_, _>>();
+        let feed = feed_rs::parser::parse(bytes.as_slice()).unwrap();
+        let second = Store::prepare_fetched_feed_with_revisions(
+            "https://example.com/feed.xml",
+            FetchedFeed {
+                parsed: Some(feed),
+                etag: None,
+                modified: None,
+            },
+            &known,
+        )
+        .unwrap();
+        assert!(second.parsed.unwrap().articles.is_empty());
+    }
+
+    #[test]
+    fn known_provider_revision_skips_sanitize_and_compression() {
+        let entry = RemoteEntry {
+            id: 44,
+            feed_id: 4,
+            title: "Same article".into(),
+            url: Some("https://example.com/story".into()),
+            author: None,
+            published_at: None,
+            content: "<script>old</script><p>unchanged</p>".into(),
+            status: "unread".into(),
+            starred: false,
+            changed_at: None,
+            revision: None,
+        };
+        let hash = hex::encode(Sha256::digest(entry.content.as_bytes()));
+        let known = HashMap::from([(entry.id, hash)]);
+        let prepared = Store::prepare_remote_entries_with_revisions(
+            vec![entry],
+            ProviderKind::Miniflux,
+            &known,
+        )
+        .unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].html.is_empty());
+        assert!(prepared[0].compressed_source.is_empty());
     }
 
     #[test]
@@ -1918,7 +3079,7 @@ mod tests {
             .unwrap();
         drop(store);
         let mut store =
-            Store::open_workspace(&directory.path().join("reader.sqlite3"), "local").unwrap();
+            Store::open_writer(&directory.path().join("reader.sqlite3"), "local").unwrap();
         assert!(!store.index_search_batch(1).unwrap());
         assert_eq!(
             store
@@ -2037,7 +3198,7 @@ mod tests {
             "INSERT INTO feeds(feed_url,title,source,remote_id,workspace) VALUES(?1,'Remote feed','miniflux',17,'provider:miniflux')",
             ["https://example.com/feed.xml"],
         ).unwrap();
-        let provider = Store::open_workspace(&path, "provider:miniflux").unwrap();
+        let provider = Store::open_writer(&path, "provider:miniflux").unwrap();
 
         assert_eq!(
             local
@@ -2090,8 +3251,8 @@ mod tests {
         ).unwrap();
         drop(legacy);
 
-        let local = Store::open_workspace(&path, "local").unwrap();
-        let provider = Store::open_workspace(&path, "provider:miniflux").unwrap();
+        let local = Store::open_writer(&path, "local").unwrap();
+        let provider = Store::open_writer(&path, "provider:miniflux").unwrap();
         assert_eq!(
             local
                 .snapshot(Scope::All, "", 20, None, true)
@@ -2137,7 +3298,7 @@ mod tests {
             feed_url: "https://example.com/feed.xml".into(),
             site_url: "https://example.com".into(),
             language: Some("en".into()),
-            category: Some(panda_miniflux::Category {
+            category: Some(panda_providers::RemoteCategory {
                 id: 3,
                 title: "技术".into(),
             }),
@@ -2155,8 +3316,12 @@ mod tests {
             content: "<p>正文</p><script>alert(1)</script>".into(),
             status: "unread".into(),
             starred: false,
+            changed_at: None,
+            revision: None,
         };
-        store.save_remote_entries(&[entry.clone()], &ids).unwrap();
+        store
+            .save_remote_entries(&[entry.clone()], &ids, ProviderKind::Miniflux)
+            .unwrap();
         let snapshot = store.snapshot(Scope::All, "", 500, None, true).unwrap();
         assert_eq!(snapshot.feeds[0].folder.as_deref(), Some("技术"));
         let article_id = snapshot.articles[0].id;
@@ -2170,7 +3335,9 @@ mod tests {
         let mut changed = entry;
         changed.status = "read".into();
         changed.starred = true;
-        store.save_remote_entries(&[changed], &ids).unwrap();
+        store
+            .save_remote_entries(&[changed], &ids, ProviderKind::Miniflux)
+            .unwrap();
         let article = store.article(article_id).unwrap();
         assert!(article.summary.is_read);
         assert!(article.summary.is_starred);
@@ -2271,7 +3438,7 @@ mod tests {
         });
         received_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let newer = Store::open_workspace(&path, "provider:miniflux").unwrap();
+        let newer = Store::open_writer(&path, "provider:miniflux").unwrap();
         newer.mark(1, MarkField::Read, false).unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(flush.join().unwrap(), 0);
@@ -2329,7 +3496,7 @@ mod tests {
     }
 
     #[test]
-    fn miniflux_sync_downloads_feeds_and_articles() {
+    fn provider_sync_downloads_feeds_and_articles() {
         use std::io::{Read as _, Write as _};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2351,14 +3518,25 @@ mod tests {
             }
         });
         let (_directory, mut store) = test_store_for("provider:miniflux");
-        let config =
-            panda_miniflux::Connection::new(&format!("http://{address}"), "secret").unwrap();
-        let remote = Miniflux::new(config).unwrap();
+        let remote = ProviderClient::new(
+            ProviderKind::Miniflux,
+            &panda_providers::ProviderSettings {
+                endpoint: format!("http://{address}"),
+                username: String::new(),
+                secret: "secret".into(),
+            },
+        )
+        .unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        assert_eq!(runtime.block_on(store.sync_miniflux(&remote)).unwrap(), 1);
+        assert_eq!(
+            runtime
+                .block_on(store.sync_provider(&remote, ProviderKind::Miniflux))
+                .unwrap(),
+            1
+        );
         let snapshot = store.snapshot(Scope::Starred, "", 500, None, true).unwrap();
         assert_eq!(snapshot.feeds[0].folder.as_deref(), Some("科技"));
         assert_eq!(snapshot.articles[0].title, "远程文章");
@@ -2367,6 +3545,111 @@ mod tests {
             Some(99)
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_incremental_sync_fetches_changes_and_skips_unchanged_content() {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let feeds = r#"[{"id":42,"title":"Feed","feed_url":"https://example.com/rss","site_url":"https://example.com","category":{"id":1,"title":"News"}}]"#;
+            let initial = r#"{"total":1,"entries":[{"id":99,"feed_id":42,"title":"Story","url":"https://example.com/post","content":"<p>Body</p>","status":"unread","starred":false}]}"#;
+            let changed = r#"{"total":1,"entries":[{"id":99,"feed_id":42,"title":"Story","url":"https://example.com/post","content":"<p>Body</p>","status":"read","starred":true}]}"#;
+            let replies = [
+                (r#"{"id":5,"username":"reader"}"#, ""),
+                (feeds, ""),
+                (initial, ""),
+                (r#"{"id":5,"username":"reader"}"#, ""),
+                (feeds, ""),
+                (initial, "changed_after"),
+                (r#"{"id":5,"username":"reader"}"#, ""),
+                (feeds, ""),
+                (changed, "changed_after"),
+            ];
+            let mut requests = Vec::new();
+            for (body, expected_query) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]).to_string();
+                if !expected_query.is_empty() {
+                    assert!(request.lines().next().unwrap().contains(expected_query));
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+
+        let (_directory, mut store) = test_store_for("provider:miniflux");
+        let remote = ProviderClient::new(
+            ProviderKind::Miniflux,
+            &panda_providers::ProviderSettings {
+                endpoint: format!("http://{address}"),
+                username: String::new(),
+                secret: "secret".into(),
+            },
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .block_on(store.sync_provider(&remote, ProviderKind::Miniflux))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            runtime
+                .block_on(store.sync_provider(&remote, ProviderKind::Miniflux))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            runtime
+                .block_on(store.sync_provider(&remote, ProviderKind::Miniflux))
+                .unwrap(),
+            1
+        );
+
+        let snapshot = store.snapshot(Scope::All, "", 20, None, true).unwrap();
+        assert!(snapshot.articles[0].is_read);
+        assert!(snapshot.articles[0].is_starred);
+        let requests = server.join().unwrap();
+        assert!(
+            requests[5]
+                .lines()
+                .next()
+                .unwrap()
+                .contains("changed_after")
+        );
+        assert!(
+            requests[8]
+                .lines()
+                .next()
+                .unwrap()
+                .contains("changed_after")
+        );
+        let synced_state: (String, Option<String>, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT provider,sync_cursor,last_full_sync_at FROM remote_state WHERE workspace='provider:miniflux'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(synced_state.0, "miniflux");
+        assert!(synced_state.1.is_some());
+        assert!(synced_state.2.is_some());
     }
 
     #[test]
@@ -2652,6 +3935,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_revision_is_stable_and_tracks_each_pipeline_input() {
+        let revision = Store::canonical_revision(
+            "<p>body</p>",
+            "https://example.com/a",
+            "Title",
+            "pipeline-v1",
+        );
+        assert_eq!(
+            revision,
+            Store::canonical_revision(
+                "<p>body</p>",
+                "https://example.com/a",
+                "Title",
+                "pipeline-v1",
+            )
+        );
+        assert_ne!(
+            revision,
+            Store::canonical_revision(
+                "<p>changed</p>",
+                "https://example.com/a",
+                "Title",
+                "pipeline-v1",
+            )
+        );
+        assert_ne!(
+            revision,
+            Store::canonical_revision(
+                "<p>body</p>",
+                "https://example.com/b",
+                "Title",
+                "pipeline-v1",
+            )
+        );
+        assert_ne!(
+            revision,
+            Store::canonical_revision(
+                "<p>body</p>",
+                "https://example.com/a",
+                "Title",
+                "pipeline-v2",
+            )
+        );
+    }
+
     #[tokio::test]
     async fn cached_page_can_be_reprocessed_offline_and_skips_unchanged_pipeline() {
         let (_directory, mut store) = test_store();
@@ -2690,9 +4019,21 @@ mod tests {
         assert!(
             updated
                 .extracted_html
+                .as_deref()
                 .unwrap()
                 .contains("recovered article paragraph")
         );
+        let canonical = updated.extracted_html.as_deref().unwrap();
+        store
+            .save_processed_content(
+                1,
+                canonical,
+                "https://127.0.0.1:1/story",
+                "Title",
+                "canonical-html-v1:new-pipeline",
+                canonical,
+            )
+            .unwrap();
         assert_eq!(
             store
                 .snapshot(Scope::All, "recovered article paragraph", 20, None, false)
@@ -2700,7 +4041,7 @@ mod tests {
                 .articles
                 .len(),
             1,
-            "a completed full-text extraction must refresh the FTS row"
+            "the canonical body must refresh the FTS row"
         );
 
         store
