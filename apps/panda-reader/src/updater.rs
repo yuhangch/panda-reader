@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(target_os = "windows")]
+use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
 const RELEASES_API: &str = "https://api.github.com/repos/yuhangch/panda-reader/releases/latest";
@@ -326,12 +328,18 @@ fn normalize_windows_path(path: &Path) -> String {
 }
 
 #[cfg(any(target_os = "windows", test))]
+fn normalized_windows_path(path: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalize_windows_path(&canonical)
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn classify_windows_install_scope(
     executable_root: &Path,
     current_user_install: Option<PathBuf>,
     all_users_install: Option<PathBuf>,
 ) -> Result<WindowsInstallScope, String> {
-    let executable_root = normalize_windows_path(executable_root);
+    let executable_root = normalized_windows_path(executable_root);
     let matches = [
         (current_user_install, WindowsInstallScope::CurrentUser),
         (all_users_install, WindowsInstallScope::AllUsers),
@@ -339,7 +347,7 @@ fn classify_windows_install_scope(
     .into_iter()
     .filter_map(|(location, scope)| {
         location
-            .filter(|location| normalize_windows_path(location) == executable_root)
+            .filter(|location| normalized_windows_path(location) == executable_root)
             .map(|_| scope)
     })
     .collect::<Vec<_>>();
@@ -356,6 +364,15 @@ fn windows_setup_scope_argument(scope: WindowsInstallScope) -> &'static str {
     match scope {
         WindowsInstallScope::CurrentUser => "/CURRENTUSER",
         WindowsInstallScope::AllUsers => "/ALLUSERS",
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_install_scope(value: &str) -> Result<WindowsInstallScope, String> {
+    match value {
+        "current-user" => Ok(WindowsInstallScope::CurrentUser),
+        "all-users" => Ok(WindowsInstallScope::AllUsers),
+        _ => Err("The updater did not receive a valid Windows installation scope.".into()),
     }
 }
 
@@ -597,6 +614,14 @@ fn spawn_helper(update: &ReadyUpdate, data_dir: &Path, parent_pid: u32) -> Resul
         InstallKind::MacAppZip => "mac-app-zip",
         InstallKind::LinuxAppImage => "linux-appimage",
     };
+    #[cfg(target_os = "windows")]
+    let expected_scope = match update.plan.windows_scope {
+        Some(WindowsInstallScope::CurrentUser) => "current-user",
+        Some(WindowsInstallScope::AllUsers) => "all-users",
+        None => return Err("The update plan is missing its Windows install scope.".into()),
+    };
+    #[cfg(not(target_os = "windows"))]
+    let expected_scope = "not-applicable";
     let mut command = Command::new(helper_copy);
     command
         .arg("--apply-update")
@@ -606,7 +631,8 @@ fn spawn_helper(update: &ReadyUpdate, data_dir: &Path, parent_pid: u32) -> Resul
         .arg(&update.plan.target)
         .arg(&update.version)
         .arg(&update.sha256)
-        .arg(data_dir);
+        .arg(data_dir)
+        .arg(expected_scope);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -619,6 +645,9 @@ fn spawn_helper(update: &ReadyUpdate, data_dir: &Path, parent_pid: u32) -> Resul
 /// If the user chose "Next launch", hand off before creating the GPUI app.
 /// Returns true when the updater was started and the current process should exit.
 pub fn apply_pending_on_launch(data_dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    cleanup_stale_windows_helper_copies();
+
     let pending_path = data_dir.join("pending-update.json");
     let Ok(bytes) = fs::read(&pending_path) else {
         return false;
@@ -673,7 +702,7 @@ pub fn apply_pending_on_launch(data_dir: &Path) -> bool {
 
 pub fn helper_main() -> Result<(), String> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if arguments.len() != 8 || arguments[0] != "--apply-update" {
+    if arguments.len() != 9 || arguments[0] != "--apply-update" {
         return Err("Expected --apply-update and a verified update plan.".into());
     }
     let kind = arguments[1]
@@ -692,13 +721,31 @@ pub fn helper_main() -> Result<(), String> {
         .to_str()
         .ok_or_else(|| "Invalid update checksum.".to_owned())?;
     let data_dir = PathBuf::from(&arguments[7]);
+    let expected_scope = arguments[8]
+        .to_str()
+        .ok_or_else(|| "Invalid expected installation scope.".to_owned())?;
     let version = semver::Version::parse(version).map_err(|error| error.to_string())?;
     if hash_file(&package)? != expected_sha256 {
         return Err("The staged update failed SHA-256 verification.".into());
     }
     wait_for_parent(parent_pid)?;
     let result = match kind {
-        "windows-setup" => apply_windows_setup(&package, &target, &version),
+        "windows-setup" => {
+            #[cfg(target_os = "windows")]
+            {
+                apply_windows_setup(
+                    &package,
+                    &target,
+                    &version,
+                    parse_windows_install_scope(expected_scope)?,
+                )
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let _ = expected_scope;
+                Err("A Windows update package cannot run on this platform.".into())
+            }
+        }
         "mac-app-zip" => apply_mac_bundle(&package, &target, &version),
         "linux-appimage" => apply_linux_appimage(&package, &target, &version),
         _ => Err("Unknown update format.".into()),
@@ -759,12 +806,19 @@ fn apply_windows_setup(
     package: &Path,
     target: &Path,
     version: &semver::Version,
+    expected_scope: WindowsInstallScope,
 ) -> Result<(), String> {
     let root = target
         .parent()
         .ok_or_else(|| "Could not locate the Panda Reader installation folder.".to_owned())?;
     let (current_user_install, all_users_install) = windows_install_locations()?;
     let scope = classify_windows_install_scope(root, current_user_install, all_users_install)?;
+    if scope != expected_scope {
+        return Err(
+            "The Windows install scope changed after this update was prepared. Check for updates again."
+                .into(),
+        );
+    }
     let backup = if scope == WindowsInstallScope::CurrentUser {
         let backup =
             std::env::temp_dir().join(format!("panda-reader-{}-old.exe", std::process::id()));
@@ -822,16 +876,17 @@ fn run_windows_setup(
     ];
 
     if scope == WindowsInstallScope::CurrentUser {
-        return Command::new(package)
+        let mut child = Command::new(package)
             .args(arguments)
-            .status()
-            .map_err(|error| format!("Could not run the installer: {error}"));
+            .spawn()
+            .map_err(|error| format!("Could not run the installer: {error}"))?;
+        return wait_for_windows_installer(&mut child);
     }
 
     use std::os::windows::ffi::OsStrExt as _;
-    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_FAILED};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_FAILED, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, INFINITE, WaitForSingleObject,
+        GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -871,7 +926,18 @@ fn run_windows_setup(
     }
 
     // SAFETY: ShellExecuteExW returned a process handle because SEE_MASK_NOCLOSEPROCESS was set.
-    let wait = unsafe { WaitForSingleObject(execute_info.hProcess, INFINITE) };
+    const INSTALLER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+    let wait =
+        unsafe { WaitForSingleObject(execute_info.hProcess, INSTALLER_TIMEOUT.as_millis() as u32) };
+    if wait == WAIT_TIMEOUT {
+        // SAFETY: execute_info.hProcess is the installer process returned by ShellExecuteExW.
+        unsafe {
+            TerminateProcess(execute_info.hProcess, 1);
+            WaitForSingleObject(execute_info.hProcess, 5_000);
+            CloseHandle(execute_info.hProcess);
+        }
+        return Err("The Windows installer timed out after 15 minutes.".into());
+    }
     if wait == WAIT_FAILED {
         let error = std::io::Error::last_os_error();
         // SAFETY: execute_info.hProcess is an owned process handle.
@@ -893,6 +959,57 @@ fn run_windows_setup(
     }
     use std::os::windows::process::ExitStatusExt as _;
     Ok(std::process::ExitStatus::from_raw(exit_code))
+}
+
+#[cfg(target_os = "windows")]
+fn wait_for_windows_installer(
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, String> {
+    const INSTALLER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+    let deadline = Instant::now() + INSTALLER_TIMEOUT;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("Could not inspect the installer process: {error}"))?
+        {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("The Windows installer timed out after 15 minutes.".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_stale_windows_helper_copies() {
+    const MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("panda-reader-updater-") || !name.ends_with(".exe") {
+            continue;
+        }
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        if SystemTime::now()
+            .duration_since(modified)
+            .is_ok_and(|age| age > MAX_AGE)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 #[cfg(test)]
