@@ -100,6 +100,7 @@ pub fn run() {
                 window_bounds: Some(WindowBounds::centered(size(px(1160.), px(760.)), cx)),
                 window_min_size: Some(size(px(820.), px(520.))),
                 window_decorations: Some(WindowDecorations::Client),
+                app_id: Some("panda-reader".into()),
                 icon: Some(std::sync::Arc::new(
                     image::load_from_memory(include_bytes!("../../assets/app-icon.png"))
                         .expect("failed to decode Panda Reader icon")
