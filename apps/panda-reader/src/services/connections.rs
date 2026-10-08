@@ -12,16 +12,9 @@ pub(super) fn connect(
     reply: oneshot::Sender<Result<ConnectOutcome, String>>,
     state: &WorkerState,
 ) {
-    let path = state.path.clone();
-    let workspace = match kind {
-        ProviderKind::Miniflux => "provider:miniflux",
-        ProviderKind::FreshRss => "provider:freshrss",
-    }
-    .to_owned();
     let settings_path = state.provider_settings_path.clone();
     let settings_map = state.provider_settings.clone();
     let cache = state.body_cache.clone();
-    let database = state.database.clone();
     job(reply, move |runtime| {
         let settings = ProviderSettings {
             endpoint,
@@ -37,11 +30,8 @@ pub(super) fn connect(
         save_settings(&settings_path, &all).map_err(|e| e.to_string())?;
         *write_lock(&settings_map, "provider settings") = all;
         *RenderCache::lock(&cache) = RenderCache::default();
-        let initial_sync_error =
-            super::sync::sync_provider(&path, &workspace, &database, &remote, kind, runtime).err();
         Ok(ConnectOutcome {
             account_name: identity.name,
-            initial_sync_error,
         })
     });
 }

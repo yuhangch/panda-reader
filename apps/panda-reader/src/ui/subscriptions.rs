@@ -4,7 +4,8 @@ use crate::ui::window::ReaderWindow;
 use gpui_kit::*;
 use panda_core::Scope;
 use panda_providers::{ProviderKind, ProviderSettings};
-use tokio::sync::oneshot;
+use std::time::Duration;
+use tokio::sync::{oneshot, oneshot::error::TryRecvError};
 
 impl ReaderWindow {
     pub(in crate::ui) fn connect_provider(&mut self, cx: &mut Context<Self>) {
@@ -63,20 +64,16 @@ impl ReaderWindow {
                                 secret,
                             },
                         );
-                        if let Some(error) = outcome.initial_sync_error {
-                            this.set_error(format!("Initial sync failed: {error}"));
-                        } else {
-                            this.record_refresh_success();
-                            this.set_flash(
-                                i18n::format(
-                                    this.preferences.language,
-                                    "Connected: {}",
-                                    outcome.account_name,
-                                ),
-                                cx,
-                            );
-                        }
+                        this.set_flash(
+                            i18n::format(
+                                this.preferences.language,
+                                "Connected: {}",
+                                outcome.account_name,
+                            ),
+                            cx,
+                        );
                         this.load_snapshot(cx);
+                        this.refresh(cx);
                     }
                     Err(error) => this.set_error(error),
                 }
@@ -186,9 +183,25 @@ impl ReaderWindow {
         self.sidebar.is_refreshing = true;
         self.set_busy(self.t("Syncing…"));
         cx.spawn(async move |this, cx| {
-            let result = response
-                .await
-                .unwrap_or_else(|_| Err("Background service stopped".to_string()));
+            let mut response = response;
+            let result = loop {
+                match response.try_recv() {
+                    Ok(result) => break result,
+                    Err(TryRecvError::Closed) => {
+                        break Err("Background service stopped".to_string());
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+
+                let _ = this.update(cx, |this, cx| {
+                    if this.list.articles.is_empty() && !this.list.is_loading {
+                        this.load_snapshot(cx);
+                    }
+                });
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+            };
             let _ = this.update(cx, |this, cx| {
                 this.sidebar.is_refreshing = false;
                 match result {

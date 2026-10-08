@@ -8,7 +8,6 @@ use tokio::sync::oneshot;
 
 pub struct ConnectOutcome {
     pub account_name: String,
-    pub initial_sync_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -67,7 +67,10 @@ fn worker_routes_local_reads_and_checks_provider_operations() {
     );
 
     let (reply, response) = oneshot::channel();
-    services.send(Command::Refresh { reply });
+    services.send(Command::Refresh {
+        force: false,
+        reply,
+    });
     let result = runtime.block_on(async {
         tokio::time::timeout(std::time::Duration::from_secs(5), response)
             .await
