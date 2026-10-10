@@ -50,6 +50,8 @@ impl VolcengineTranslator {
                 .map_err(|error| crate::TitleBatchFailure {
                     requests: requests + 1,
                     characters: characters + batch_chars,
+                    input_tokens: None,
+                    output_tokens: None,
                     error,
                 })?;
             output.extend(parts);
@@ -67,6 +69,8 @@ impl VolcengineTranslator {
         Ok(crate::TitleBatchResult {
             translations: mapped,
             requests,
+            input_tokens: None,
+            output_tokens: None,
         })
     }
 
@@ -136,6 +140,7 @@ impl Translator for VolcengineTranslator {
             html,
             title: translated_title,
             detected_source_lang: detected,
+            metrics: Default::default(),
         })
     }
 }

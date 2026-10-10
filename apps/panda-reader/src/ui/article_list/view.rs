@@ -267,8 +267,7 @@ impl ArticleList {
 
 fn display_title(article: &panda_core::ArticleSummary, target: &str) -> String {
     let hash = panda_translate::title_source_hash(&article.title);
-    if article.feed_auto_translate_titles
-        && article.auto_translated_title_lang.as_deref() == Some(target)
+    if article.auto_translated_title_lang.as_deref() == Some(target)
         && article.auto_translated_title_source_hash.as_deref() == Some(hash.as_str())
     {
         if let Some(title) = article

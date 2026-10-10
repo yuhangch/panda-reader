@@ -18,6 +18,8 @@ pub struct ArticleSummary {
     /// Language declared by this article's feed, when the provider exposes it.
     pub feed_language: Option<String>,
     pub feed_auto_translate_titles: bool,
+    /// True when the article ID is above its feed's auto-translation watermark.
+    pub title_is_future: bool,
     pub title: String,
     pub url: Option<String>,
     pub author: Option<String>,
@@ -37,6 +39,8 @@ pub struct TranslationUsage {
     pub provider: String,
     pub requests: u64,
     pub characters: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(

@@ -53,3 +53,5 @@ The generated [THIRD_PARTY_LICENSES.txt](THIRD_PARTY_LICENSES.txt) lists Rust de
 ## Acknowledgements
 
 Special thanks to [l0ng-ai](https://github.com/l0ng-ai) for creating [TTY7](https://github.com/l0ng-ai/tty7) and [Papr](https://github.com/l0ng-ai/papr). Panda Reader draws inspiration from TTY7's themes and packaging, and Papr's feed parsing, article extraction, and store design.
+
+Thanks to [Read Frog](https://github.com/mengxi-ream/read-frog) for inspiring the adaptive fallback approach used when a batch translation response is invalid.

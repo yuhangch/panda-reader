@@ -13,7 +13,11 @@ pub(in crate::ui) struct ArticleView {
     pub(in crate::ui) restore_progress: Option<f32>,
     pub(in crate::ui) progress_epoch: u64,
     pub(in crate::ui) showing_translation: bool,
+    pub(in crate::ui) translating_article_id: Option<i64>,
+    pub(in crate::ui) translation_incomplete: bool,
     pub(in crate::ui) request_epoch: RequestEpoch,
+    pub(in crate::ui) translation_epoch: RequestEpoch,
+    pub(in crate::ui) translation_spinner_frame: u32,
     pub(in crate::ui) is_extracting: bool,
     pub(in crate::ui) requested_article_id: Option<i64>,
 }
@@ -25,6 +29,9 @@ impl ArticleView {
         preferences: &crate::app::preferences::Preferences,
         provider: &str,
     ) -> bool {
+        if self.translation_incomplete {
+            return false;
+        }
         let target = preferences.translation_language.translator_code();
         let source = article
             .extracted_html
@@ -53,9 +60,8 @@ impl ArticleView {
         preferences: &crate::app::preferences::Preferences,
     ) -> String {
         let source_hash = panda_translate::title_source_hash(&article.summary.title);
-        if article.summary.feed_auto_translate_titles
-            && article.summary.auto_translated_title_lang.as_deref()
-                == Some(preferences.translation_language.translator_code())
+        if article.summary.auto_translated_title_lang.as_deref()
+            == Some(preferences.translation_language.translator_code())
             && article.summary.auto_translated_title_source_hash.as_deref()
                 == Some(source_hash.as_str())
             && let Some(title) = article
@@ -92,9 +98,8 @@ impl ArticleView {
         preferences: &crate::app::preferences::Preferences,
     ) -> Option<String> {
         let hash = panda_translate::title_source_hash(&article.summary.title);
-        if article.summary.feed_auto_translate_titles
-            && article.summary.auto_translated_title_lang.as_deref()
-                == Some(preferences.translation_language.translator_code())
+        if article.summary.auto_translated_title_lang.as_deref()
+            == Some(preferences.translation_language.translator_code())
             && article.summary.auto_translated_title_source_hash.as_deref() == Some(hash.as_str())
             && article
                 .summary

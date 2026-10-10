@@ -73,17 +73,55 @@ impl Settings {
                     ),
             )
             .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .py_2()
+                    .child(
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_sm().child(owner.t("Only translate future titles")))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(owner.t("Skip titles already in your library; manual translation remains available.")),
+                            ),
+                    )
+                    .child(
+                        Switch::new("settings-only-future-title-translation")
+                            .checked(owner.preferences.only_translate_future_titles)
+                            .accessibility_label(owner.t("Only translate future titles"))
+                            .on_change(cx.listener(|this, checked, _, cx| {
+                                this.set_only_translate_future_titles(*checked, cx)
+                            })),
+                    ),
+            )
+            .child(
                 v_flex()
                     .gap_1()
                     .pt_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(div().child(owner.t("Title translation usage (daily)")))
+                    .child(div().child(owner.t("Translation usage (daily)")))
                     .children(owner.title_translation_usage.iter().map(|usage| {
-                        div().child(format!(
-                            "{} · {} · {} requests · {} chars",
-                            usage.day, usage.provider, usage.requests, usage.characters
-                        ))
+                        let token_usage = usage.input_tokens + usage.output_tokens;
+                        div().child(if token_usage > 0 {
+                            format!(
+                                "{} · {} · {} requests · {} chars · {} input / {} output tokens",
+                                usage.day,
+                                usage.provider,
+                                usage.requests,
+                                usage.characters,
+                                usage.input_tokens,
+                                usage.output_tokens
+                            )
+                        } else {
+                            format!(
+                                "{} · {} · {} requests · {} chars",
+                                usage.day, usage.provider, usage.requests, usage.characters
+                            )
+                        })
                     })),
             )
             .child(div().my_5().border_t_1().border_color(cx.theme().border))

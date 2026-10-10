@@ -141,6 +141,7 @@ impl ReaderWindow {
         let items: Vec<_> = rows
             .iter()
             .filter(|r| r.feed_auto_translate_titles)
+            .filter(|r| !self.preferences.only_translate_future_titles || r.title_is_future)
             .map(|r| crate::services::TitleTranslationInput {
                 id: r.id,
                 title: r.title.clone(),
@@ -158,6 +159,7 @@ impl ReaderWindow {
         self.services.send(Command::TranslateTitles {
             items,
             target_lang: target.clone(),
+            force: false,
             reply,
         });
         cx.spawn(async move |this, cx| {
@@ -222,6 +224,78 @@ impl ReaderWindow {
                     cx.notify();
                 });
             }
+        })
+        .detach();
+    }
+
+    pub(in crate::ui) fn translate_title_manually(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(row) = self.list.articles.iter().find(|row| row.id == id) else {
+            if let Some(article) = self
+                .reader
+                .article
+                .as_ref()
+                .filter(|article| article.summary.id == id)
+            {
+                self.queue_manual_title_translation(id, article.summary.title.clone(), cx);
+            }
+            return;
+        };
+        self.queue_manual_title_translation(id, row.title.clone(), cx);
+    }
+
+    fn queue_manual_title_translation(&mut self, id: i64, title: String, cx: &mut Context<Self>) {
+        let target = self
+            .preferences
+            .translation_language
+            .translator_code()
+            .to_owned();
+        let (reply, response) = oneshot::channel();
+        self.services.send(Command::TranslateTitles {
+            items: vec![crate::services::TitleTranslationInput { id, title }],
+            target_lang: target,
+            force: true,
+            reply,
+        });
+        cx.spawn(async move |this, cx| {
+            let result = response
+                .await
+                .unwrap_or_else(|_| Err("Background service stopped".into()));
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(outcome) => {
+                    this.title_translation_usage = outcome.usage;
+                    for (id, original, translated, lang) in outcome.translated {
+                        if let Some(row) = Arc::make_mut(&mut this.list.articles)
+                            .iter_mut()
+                            .find(|row| row.id == id && row.title == original)
+                        {
+                            row.auto_translated_title = Some(translated.clone());
+                            row.auto_translated_title_lang = Some(lang.clone());
+                            row.auto_translated_title_source_hash =
+                                Some(panda_translate::title_source_hash(&original));
+                        }
+                        if let Some(article) = this.reader.article.as_mut().filter(|article| {
+                            article.summary.id == id && article.summary.title == original
+                        }) {
+                            article.summary.auto_translated_title = Some(translated);
+                            article.summary.auto_translated_title_lang = Some(lang);
+                            article.summary.auto_translated_title_source_hash =
+                                Some(panda_translate::title_source_hash(&original));
+                        }
+                    }
+                    if let Some(status) = outcome.status {
+                        match status {
+                            crate::services::TitleTranslationStatus::Info(message) => {
+                                this.set_flash(message, cx)
+                            }
+                            crate::services::TitleTranslationStatus::Error(message) => {
+                                this.set_error(message)
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+                Err(error) => this.set_error(format!("Title translation failed: {error}")),
+            });
         })
         .detach();
     }

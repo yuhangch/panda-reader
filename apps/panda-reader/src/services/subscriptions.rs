@@ -124,6 +124,19 @@ pub(super) fn set_feed_auto_translate_titles(
     });
 }
 
+pub(super) fn reset_title_translation_cutoffs(
+    reply: oneshot::Sender<Result<(), String>>,
+    state: &WorkerState,
+) {
+    let workspace = state.workspace();
+    let database = state.database.clone();
+    job(reply, move |_| {
+        database.write(workspace, |store| {
+            store.reset_auto_title_translation_cutoffs()
+        })
+    });
+}
+
 pub(super) fn import_opml(
     content: String,
     reply: oneshot::Sender<Result<usize, String>>,

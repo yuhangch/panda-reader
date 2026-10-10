@@ -13,9 +13,23 @@ use tokio::sync::oneshot;
 
 impl ReaderWindow {
     pub(in crate::ui) fn copy_article_image(&mut self, url: String, cx: &mut Context<Self>) {
+        let referer = self
+            .reader
+            .article
+            .as_ref()
+            .and_then(|article| article.url.as_deref().or(article.summary.url.as_deref()))
+            .and_then(|url| url::Url::parse(url).ok())
+            .map(|mut url| {
+                // Image hosts can require the source page, but its query may contain private tokens.
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url
+            });
         let weak = cx.entity().downgrade();
         cx.spawn(async move |_, cx| {
-            let result = match fetch_article_image(&url).await {
+            let result = match fetch_article_image(&url, referer.as_ref()).await {
                 Ok(image) => {
                     cx.background_executor()
                         .spawn(async move {
@@ -66,6 +80,11 @@ impl ReaderWindow {
 
     pub(in crate::ui) fn open_article(&mut self, id: i64, cx: &mut Context<Self>) {
         self.save_current_reading_progress();
+        self.reader.translation_epoch.next();
+        if let Some(translating_id) = self.reader.translating_article_id.take() {
+            self.services.cancel_article_work(translating_id);
+            self.clear_status();
+        }
         if let Some(previous_id) = self.reader.requested_article_id
             && previous_id != id
         {
@@ -79,6 +98,8 @@ impl ReaderWindow {
         self.reader.image_urls.clear();
         self.reader.scroll.set_offset(point(px(0.), px(0.)));
         self.reader.is_extracting = false;
+        self.reader.translating_article_id = None;
+        self.reader.translation_incomplete = false;
         let (reply, response) = oneshot::channel();
         self.services.send(Command::Article {
             id,
@@ -479,6 +500,16 @@ impl ReaderWindow {
     }
 
     pub(in crate::ui) fn toggle_or_translate(&mut self, id: i64, cx: &mut Context<Self>) {
+        if self.reader.translating_article_id == Some(id) {
+            self.services.cancel_article_work(id);
+            self.reader.translation_epoch.next();
+            self.reader.translating_article_id = None;
+            self.reader.translation_incomplete = true;
+            self.clear_status();
+            self.set_flash(self.t("Translation cancelled"), cx);
+            cx.notify();
+            return;
+        }
         let Some(article) = self.reader.article.as_ref() else {
             return;
         };
@@ -515,7 +546,13 @@ impl ReaderWindow {
         let translation_layout = self.preferences.translation_layout;
         let hide_images = self.preferences.hide_images;
         let paragraph_indent = self.preferences.paragraph_indent;
-        let revision = self.reader.request_epoch.next();
+        self.reader.request_epoch.next();
+        let revision = self.reader.translation_epoch.next();
+        self.reader.translating_article_id = Some(id);
+        self.reader.translation_spinner_frame = 0;
+        self.reader.translation_incomplete = true;
+        let translation_started = std::time::Instant::now();
+        let (progress, mut progress_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (reply, response) = oneshot::channel();
         self.services.send(Command::Translate {
             id,
@@ -525,19 +562,67 @@ impl ReaderWindow {
             translation_layout,
             hide_images,
             paragraph_indent,
+            progress,
             reply,
         });
         self.set_busy(self.t("Translating…"));
         cx.spawn(async move |this, cx| {
-            let result = response
-                .await
-                .unwrap_or_else(|_| Err("Background service stopped".to_string()));
+            let response = response;
+            tokio::pin!(response);
+            let result = loop {
+                let animation_tick = cx.background_executor()
+                    .timer(std::time::Duration::from_millis(125));
+                tokio::select! {
+                    biased;
+                    result = &mut response => {
+                        break result.unwrap_or_else(|_| Err("Background service stopped".to_string()));
+                    }
+                    Some(mut prepared) = progress_receiver.recv() => {
+                        // Only render the newest snapshot when the UI falls behind.
+                        while let Ok(newer) = progress_receiver.try_recv() {
+                            prepared = newer;
+                        }
+                        let _ = this.update(cx, |this, cx| {
+                            if !this.reader.translation_epoch.is_current(revision)
+                                || !this.reader.article.as_ref().is_some_and(|article| article.summary.id == id)
+                                || this.preferences.translation_layout != translation_layout
+                                || this.preferences.hide_images != hide_images
+                                || this.preferences.paragraph_indent != paragraph_indent
+                            {
+                                return;
+                            }
+                            this.reader.showing_translation = true;
+                            this.reader.translation_incomplete = true;
+                            this.reader.body_html = prepared.body_html.into();
+                            this.reader.body_markdown = prepared.body_markdown.into();
+                            this.reader.image_urls = prepared.image_urls.to_vec();
+                            this.reader.article = Some(prepared.article);
+                            cx.notify();
+                        });
+                    }
+                    _ = animation_tick => {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.reader.translation_epoch.is_current(revision)
+                                && this.reader.translating_article_id == Some(id)
+                            {
+                                this.reader.translation_spinner_frame =
+                                    this.reader.translation_spinner_frame.wrapping_add(1);
+                                cx.notify();
+                            }
+                        });
+                    }
+                }
+            };
             let _ = this.update(cx, |this, cx| {
-                if !this.reader.request_epoch.is_current(revision) {
+                if !this.reader.translation_epoch.is_current(revision) {
                     return;
                 }
+                this.reader.translating_article_id = None;
+                this.clear_status();
                 match result {
                     Ok(prepared) => {
+                        this.reader.translation_incomplete = false;
+                        this.reader.request_epoch.next();
                         if this
                             .reader
                             .article
@@ -565,7 +650,24 @@ impl ReaderWindow {
                                     .clone();
                             }
                             this.reader.article = Some(prepared.article);
-                            this.set_flash(this.t("Translation ready"), cx);
+                            let elapsed = format!(
+                                "{:.2} s",
+                                translation_started.elapsed().as_secs_f64()
+                            );
+                            this.set_flash(
+                                i18n::format(
+                                    this.preferences.language,
+                                    "Translation ready · {}",
+                                    elapsed,
+                                ),
+                                cx,
+                            );
+                            if this.preferences.translation_layout != translation_layout
+                                || this.preferences.hide_images != hide_images
+                                || this.preferences.paragraph_indent != paragraph_indent
+                            {
+                                this.request_prepared_body(cx);
+                            }
                         }
                     }
                     Err(error) => this.set_error(error),
@@ -605,7 +707,10 @@ impl ReaderWindow {
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CLIPBOARD_IMAGE_PIXELS: u64 = 40_000_000;
 
-async fn fetch_article_image(url: &str) -> Result<arboard::ImageData<'static>, String> {
+async fn fetch_article_image(
+    url: &str,
+    referer: Option<&url::Url>,
+) -> Result<arboard::ImageData<'static>, String> {
     let parsed = url::Url::parse(url).map_err(|error| error.to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("only HTTP and HTTPS images can be copied".into());
@@ -614,13 +719,16 @@ async fn fetch_article_image(url: &str) -> Result<arboard::ImageData<'static>, S
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     let client = CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .user_agent("PandaReader/0.1")
+            .user_agent(concat!("PandaReader/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .expect("article image client configuration is valid")
     });
-    let mut response = client
-        .get(parsed)
+    let mut request = client.get(parsed);
+    if let Some(referer) = referer {
+        request = request.header(reqwest::header::REFERER, referer.as_str());
+    }
+    let mut response = request
         .send()
         .await
         .map_err(|error| error.to_string())?

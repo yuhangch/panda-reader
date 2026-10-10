@@ -1,6 +1,7 @@
 use anyhow::bail;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::Path;
 
 mod azure;
@@ -232,6 +233,14 @@ pub struct TranslateResult {
     pub html: String,
     pub title: Option<String>,
     pub detected_source_lang: Option<String>,
+    pub metrics: TranslationMetrics,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TranslationMetrics {
+    pub requests: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 /// Thin provider contract. New backends implement this; the app builds one via [`build`].
@@ -256,12 +265,16 @@ pub enum AnyTranslator {
 pub struct TitleBatchResult {
     pub translations: Vec<String>,
     pub requests: usize,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
 }
 
 #[derive(Debug)]
 pub struct TitleBatchFailure {
     pub requests: usize,
     pub characters: usize,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub error: anyhow::Error,
 }
 
@@ -296,6 +309,54 @@ impl AnyTranslator {
         }
     }
 
+    /// Translate article bodies with optional persistent segment results. Only
+    /// LLM providers use the cache; traditional MT backends keep their current
+    /// request and reconstruction paths.
+    pub async fn translate_with_cached_segments<F>(
+        &self,
+        req: TranslateRequest,
+        cached: HashMap<String, String>,
+        save_segment: F,
+    ) -> anyhow::Result<TranslateResult>
+    where
+        F: FnMut(&str, &str, &str) -> anyhow::Result<()> + Send,
+    {
+        self.translate_with_cached_segments_and_progress(req, cached, save_segment, |_| Ok(()))
+            .await
+    }
+
+    /// Translate an article and report validated LLM paragraphs as soon as
+    /// their request batch completes. Traditional translation backends retain
+    /// their current request path and report no intermediate paragraphs.
+    pub async fn translate_with_cached_segments_and_progress<F, P>(
+        &self,
+        req: TranslateRequest,
+        cached: HashMap<String, String>,
+        save_segment: F,
+        on_segment: P,
+    ) -> anyhow::Result<TranslateResult>
+    where
+        F: FnMut(&str, &str, &str) -> anyhow::Result<()> + Send,
+        P: FnMut(&[(String, String)]) -> anyhow::Result<()> + Send,
+    {
+        match self {
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => {
+                translator
+                    .translate_with_cached_segments_and_progress(
+                        req,
+                        cached,
+                        save_segment,
+                        on_segment,
+                    )
+                    .await
+            }
+            Self::Azure(translator) => translator.translate(req).await,
+            Self::Volcengine(translator) => translator.translate(req).await,
+        }
+    }
+
     pub async fn translate_titles(
         &self,
         titles: &[String],
@@ -317,6 +378,15 @@ impl AnyTranslator {
             Self::OpenAiCompatible(translator)
             | Self::Anthropic(translator)
             | Self::Gemini(translator) => translator.cache_id(),
+        }
+    }
+
+    pub fn resumable_prompt_revision(&self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiCompatible(_) | Self::Anthropic(_) | Self::Gemini(_) => {
+                Some(LlmTranslator::prompt_revision())
+            }
+            Self::Azure(_) | Self::Volcengine(_) => None,
         }
     }
 }

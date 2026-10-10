@@ -24,7 +24,10 @@ use std::sync::Mutex;
 type TranslationWaiters = Mutex<
     std::collections::HashMap<
         TranslationJobKey,
-        Vec<oneshot::Sender<Result<PreparedArticle, String>>>,
+        Vec<(
+            oneshot::Sender<Result<PreparedArticle, String>>,
+            Option<tokio::sync::mpsc::UnboundedSender<PreparedArticle>>,
+        )>,
     >,
 >;
 
@@ -32,14 +35,32 @@ fn add_translation_waiter(
     jobs: &TranslationWaiters,
     key: TranslationJobKey,
     reply: oneshot::Sender<Result<PreparedArticle, String>>,
+    progress: tokio::sync::mpsc::UnboundedSender<PreparedArticle>,
 ) -> bool {
     let mut jobs = lock_mutex(jobs, "translation task deduplication");
     if let Some(waiters) = jobs.get_mut(&key) {
-        waiters.push(reply);
+        waiters.push((reply, Some(progress)));
         false
     } else {
-        jobs.insert(key, vec![reply]);
+        jobs.insert(key, vec![(reply, Some(progress))]);
         true
+    }
+}
+
+fn send_translation_progress(
+    jobs: &TranslationWaiters,
+    key: &TranslationJobKey,
+    prepared: PreparedArticle,
+) {
+    if let Some(waiters) = lock_mutex(jobs, "translation task progress").get_mut(key) {
+        for (_, progress) in waiters {
+            if progress
+                .as_ref()
+                .is_some_and(|sender| sender.send(prepared.clone()).is_err())
+            {
+                *progress = None;
+            }
+        }
     }
 }
 
@@ -51,7 +72,7 @@ fn finish_translation_job(
     let waiters = lock_mutex(jobs, "translation task deduplication")
         .remove(key)
         .unwrap_or_default();
-    for waiter in waiters {
+    for (waiter, _) in waiters {
         let _ = waiter.send(result.clone());
     }
 }
@@ -472,6 +493,7 @@ pub(super) fn translate(
     hide_images: bool,
     paragraph_indent: bool,
     reply: oneshot::Sender<Result<PreparedArticle, String>>,
+    progress: tokio::sync::mpsc::UnboundedSender<PreparedArticle>,
     state: &WorkerState,
 ) {
     let path = state.path.clone();
@@ -494,7 +516,7 @@ pub(super) fn translate(
         translator_id,
         plugin_revision,
     );
-    if !add_translation_waiter(&translation_jobs, key.clone(), reply) {
+    if !add_translation_waiter(&translation_jobs, key.clone(), reply, progress) {
         return;
     }
     lock_mutex(&latest_translation, "latest translation task")
@@ -524,9 +546,16 @@ pub(super) fn translate(
                 let canonical =
                     canonical_article_body(&store, &article, &registry, &database, &workspace)?;
                 drop(registry);
+                let prompt_revision = translator.resumable_prompt_revision();
+                let backend_id = translator.cache_id();
+                let translation_context_hash =
+                    panda_translate::title_source_hash(article.summary.title.trim());
+                let translation_backend = prompt_revision
+                    .map(|revision| format!("{backend_id}:{revision}"))
+                    .unwrap_or_else(|| backend_id.clone());
                 let source_hash = panda_translate::translation_revision_hash(
                     canonical.revision.0.as_ref(),
-                    &translator.cache_id(),
+                    &translation_backend,
                     &target_lang,
                 );
                 let legacy_hash = panda_translate::translation_cache_hash(
@@ -541,7 +570,8 @@ pub(super) fn translate(
                         .as_deref()
                         .is_some_and(|html| !html.trim().is_empty())
                     && article.translation_source_hash.as_deref() == Some(source_hash.as_str());
-                let reusable_legacy = article.translated_lang.as_deref()
+                let reusable_legacy = prompt_revision.is_none()
+                    && article.translated_lang.as_deref()
                     == Some(target_lang.as_str())
                     && article
                         .translated_html
@@ -579,16 +609,113 @@ pub(super) fn translate(
                     if !translation_is_latest(&latest_translation, &key) {
                         return Err("Translation request was superseded".into());
                     }
+                    let cached_segments = match prompt_revision {
+                        Some(prompt_revision) => store
+                            .translation_segments(
+                                id,
+                                &target_lang,
+                                &backend_id,
+                                prompt_revision,
+                                &translation_context_hash,
+                            )
+                            .map_err(|error| format!("Could not load translation progress: {error:#}"))?,
+                        None => Default::default(),
+                    };
+                    let database_for_segments = database.clone();
+                    let workspace_for_segments = workspace.clone();
+                    let lang_for_segments = target_lang.clone();
+                    let backend_for_segments = backend_id.clone();
+                    let context_hash_for_segments = translation_context_hash.clone();
+                    let progress_jobs = translation_jobs.clone();
+                    let progress_key = key.clone();
+                    let progress_segments = panda_translate::html::prepare_html_translation_segments(
+                        canonical.html.as_str(),
+                    );
+                    let progress_blocks = panda_translate::html::split_blocks(canonical.html.as_str());
+                    let source_hash_for_progress = source_hash.clone();
+                    let lang_for_progress = target_lang.clone();
+                    let mut progressive_translations = std::collections::HashMap::new();
+                    let mut progress_article = article.clone();
+                    progress_article.canonical = Some(canonical.clone());
                     let translated = runtime.block_on(async {
                         tokio::select! {
                             _ = wait_for_article_work_cancel(cancel_receiver) => {
                                 Err("Article task cancelled".to_owned())
                             }
-                            result = translator.translate(panda_translate::TranslateRequest {
-                                html: canonical.html.as_str().to_owned(),
-                                title: Some(article.summary.title.clone()),
-                                target_lang: target_lang.clone(),
-                            }) => result.map_err(|error| error.to_string()),
+                            result = translator.translate_with_cached_segments_and_progress(
+                                panda_translate::TranslateRequest {
+                                    html: canonical.html.as_str().to_owned(),
+                                    title: Some(article.summary.title.clone()),
+                                    target_lang: target_lang.clone(),
+                                },
+                                cached_segments,
+                                move |segment_id, source_hash, translated_html| {
+                                    let segment_id = segment_id.to_owned();
+                                    let source_hash = source_hash.to_owned();
+                                    let translated_html = translated_html.to_owned();
+                                    let prompt_revision = prompt_revision
+                                        .ok_or_else(|| anyhow::anyhow!("Missing translation prompt revision"))?;
+                                    let language = lang_for_segments.clone();
+                                    let backend = backend_for_segments.clone();
+                                    let context_hash = context_hash_for_segments.clone();
+                                    database_for_segments
+                                        .write(workspace_for_segments.clone(), move |store| {
+                                            store.save_translation_segment(
+                                                id,
+                                                &language,
+                                                &backend,
+                                                prompt_revision,
+                                                &context_hash,
+                                                &segment_id,
+                                                &source_hash,
+                                                &translated_html,
+                                            )
+                                        })
+                                        .map_err(anyhow::Error::msg)
+                                },
+                                move |completed| {
+                                    progressive_translations.extend(completed.iter().cloned());
+                                    // A batch delivers several segments together. Coalesce that
+                                    // burst instead of converting the whole article for every item.
+                                    // Let the final reply display the complete, persisted result.
+                                    if progressive_translations.len() == progress_segments.len() {
+                                        return Ok(());
+                                    }
+                                    let mut blocks = progress_blocks.clone();
+                                    for segment in &progress_segments {
+                                        if let Some(translated) = progressive_translations.get(&segment.id) {
+                                            blocks[segment.block_index] = translated.clone();
+                                        }
+                                    }
+                                    let partial_html = blocks.join("\n");
+                                    let mut article = progress_article.clone();
+                                    article.translated_html = Some(partial_html);
+                                    article.translated_lang = Some(lang_for_progress.clone());
+                                    article.translation_source_hash =
+                                        Some(source_hash_for_progress.clone());
+                                    let options = RenderOptions {
+                                        show_translation: true,
+                                        translation_layout,
+                                        hide_images,
+                                        paragraph_indent,
+                                    };
+                                    let Ok(body) = RenderCache::prepare(&article, options) else {
+                                        return Ok(());
+                                    };
+                                    send_translation_progress(
+                                        &progress_jobs,
+                                        &progress_key,
+                                        PreparedArticle {
+                                            article,
+                                            body_html: body.html,
+                                            body_markdown: body.markdown,
+                                            reading_progress: 0.0,
+                                            image_urls: body.image_urls,
+                                        },
+                                    );
+                                    Ok(())
+                                },
+                            ) => result.map_err(|error| error.to_string()),
                         }
                     })?;
                     let result = translated;
@@ -599,6 +726,10 @@ pub(super) fn translate(
                     let lang = target_lang.clone();
                     let hash = source_hash.clone();
                     let title_hash = panda_translate::title_source_hash(&title);
+                    let metrics = result.metrics.clone();
+                    let usage_day = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let usage_provider = translator.id().to_owned();
+                    let usage_characters = (canonical.html.0.chars().count() + title.chars().count()) as u64;
                     if !translation_is_latest(&latest_translation, &key) {
                         return Err("Translation request was superseded".into());
                     }
@@ -619,6 +750,15 @@ pub(super) fn translate(
                             &body,
                             translated_title.as_deref(),
                         )?;
+                        if let Some(prompt_revision) = prompt_revision {
+                            store.prune_translation_segments(
+                                id,
+                                &lang,
+                                &backend_id,
+                                prompt_revision,
+                                &translation_context_hash,
+                            )?;
+                        }
                         if store.article(id)?.summary.feed_auto_translate_titles
                             && let Some(translated_title) = translated_title.as_deref()
                         {
@@ -628,6 +768,16 @@ pub(super) fn translate(
                                 translated_title,
                                 &lang,
                                 &title_hash,
+                            )?;
+                        }
+                        if metrics.requests > 0 {
+                            store.record_translation_usage_with_tokens(
+                                &usage_day,
+                                &usage_provider,
+                                metrics.requests,
+                                usage_characters,
+                                metrics.input_tokens.unwrap_or(0),
+                                metrics.output_tokens.unwrap_or(0),
                             )?;
                         }
                         Ok(())
@@ -711,6 +861,7 @@ pub(super) fn translation_usage(
 pub(super) fn translate_titles(
     items: Vec<TitleTranslationInput>,
     target_lang: String,
+    force: bool,
     reply: oneshot::Sender<Result<TitleTranslationOutcome, String>>,
     state: &WorkerState,
 ) {
@@ -766,11 +917,13 @@ pub(super) fn translate_titles(
                 stale += 1;
                 continue;
             }
-            if !article.summary.feed_auto_translate_titles {
+            if !force && !article.summary.feed_auto_translate_titles {
                 disabled_feed += 1;
                 continue;
             }
-            if article.summary.auto_translated_title_lang.as_deref() == Some(target_lang.as_str())
+            if !force
+                && article.summary.auto_translated_title_lang.as_deref()
+                    == Some(target_lang.as_str())
                 && article.summary.auto_translated_title_source_hash.as_deref()
                     == Some(hash.as_str())
                 && article
@@ -788,11 +941,12 @@ pub(super) fn translate_titles(
                 ));
                 continue;
             }
-            if lock_mutex(&attempted, "title translation backoff")
-                .get(&key)
-                .is_some_and(|last_attempt| {
-                    last_attempt.elapsed() < std::time::Duration::from_secs(60)
-                })
+            if !force
+                && lock_mutex(&attempted, "title translation backoff")
+                    .get(&key)
+                    .is_some_and(|last_attempt| {
+                        last_attempt.elapsed() < std::time::Duration::from_secs(60)
+                    })
             {
                 deferred += 1;
                 continue;
@@ -853,11 +1007,13 @@ pub(super) fn translate_titles(
                     let provider_name = provider.clone();
                     database.write(workspace.clone(), move |store| {
                         store
-                            .record_translation_usage(
+                            .record_translation_usage_with_tokens(
                                 &day,
                                 &provider_name,
                                 failure.requests as u64,
                                 failure.characters as u64,
+                                failure.input_tokens.unwrap_or(0),
+                                failure.output_tokens.unwrap_or(0),
                             )
                             .map_err(Into::into)
                     })?;
@@ -879,9 +1035,18 @@ pub(super) fn translate_titles(
             let day = chrono::Local::now().format("%Y-%m-%d").to_string();
             let provider_name = provider.clone();
             let requests = result.requests as u64;
+            let input_tokens = result.input_tokens.unwrap_or(0);
+            let output_tokens = result.output_tokens.unwrap_or(0);
             database.write(workspace.clone(), move |store| {
                 store
-                    .record_translation_usage(&day, &provider_name, requests, chars)
+                    .record_translation_usage_with_tokens(
+                        &day,
+                        &provider_name,
+                        requests,
+                        chars,
+                        input_tokens,
+                        output_tokens,
+                    )
                     .map_err(Into::into)
             })?;
         }
@@ -956,9 +1121,21 @@ mod translation_dedup_tests {
         );
         let (first_tx, first_rx) = oneshot::channel();
         let (second_tx, second_rx) = oneshot::channel();
+        let (first_progress, _first_progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (second_progress, _second_progress_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        assert!(add_translation_waiter(&jobs, key.clone(), first_tx));
-        assert!(!add_translation_waiter(&jobs, key.clone(), second_tx));
+        assert!(add_translation_waiter(
+            &jobs,
+            key.clone(),
+            first_tx,
+            first_progress
+        ));
+        assert!(!add_translation_waiter(
+            &jobs,
+            key.clone(),
+            second_tx,
+            second_progress
+        ));
         finish_translation_job(&jobs, &key, Err("mock translation failure".into()));
 
         assert!(
@@ -1003,6 +1180,7 @@ fn test_article() -> panda_core::Article {
             feed_title: "Example feed".into(),
             feed_language: None,
             feed_auto_translate_titles: false,
+            title_is_future: false,
             title: "Example article".into(),
             url: None,
             author: None,

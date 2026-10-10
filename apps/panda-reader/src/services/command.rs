@@ -107,6 +107,9 @@ pub enum Command {
         enabled: bool,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    ResetTitleTranslationCutoffs {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     RefreshFeed {
         id: i64,
         reply: oneshot::Sender<Result<usize, String>>,
@@ -140,11 +143,13 @@ pub enum Command {
         translation_layout: TranslationLayout,
         hide_images: bool,
         paragraph_indent: bool,
+        progress: tokio::sync::mpsc::UnboundedSender<PreparedArticle>,
         reply: oneshot::Sender<Result<PreparedArticle, String>>,
     },
     TranslateTitles {
         items: Vec<TitleTranslationInput>,
         target_lang: String,
+        force: bool,
         reply: oneshot::Sender<Result<TitleTranslationOutcome, String>>,
     },
     TranslationUsage {
@@ -185,6 +190,7 @@ impl Command {
             | Self::RemoveFeed { reply, .. }
             | Self::UpdateFeed { reply, .. }
             | Self::SetFeedAutoTranslateTitles { reply, .. }
+            | Self::ResetTitleTranslationCutoffs { reply }
             | Self::Mark { reply, .. }
             | Self::Extract { reply, .. } => {
                 let _ = reply.send(Err(message));

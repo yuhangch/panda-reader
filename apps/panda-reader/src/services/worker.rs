@@ -251,7 +251,10 @@ pub struct WorkerState {
         Mutex<
             HashMap<
                 TranslationJobKey,
-                Vec<oneshot::Sender<Result<panda_core::PreparedArticle, String>>>,
+                Vec<(
+                    oneshot::Sender<Result<panda_core::PreparedArticle, String>>,
+                    Option<tokio::sync::mpsc::UnboundedSender<panda_core::PreparedArticle>>,
+                )>,
             >,
         >,
     >,

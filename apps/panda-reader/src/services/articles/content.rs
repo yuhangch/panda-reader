@@ -70,7 +70,10 @@ pub fn bilingual_html(original: &str, translated: &str) -> String {
             out.push_str(block);
             out.push('\n');
         }
-        if let Some(block) = translations.get(index) {
+        if let Some(block) = translations
+            .get(index)
+            .filter(|translated| originals.get(index).is_none_or(|original| *translated != original))
+        {
             out.push_str(&as_translation_follow(block));
             out.push('\n');
         }

@@ -4,7 +4,7 @@ use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::base::text::{MarkdownNode, MarkdownPlugin, markdown_ast};
 use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _,
+    ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{ContextMenuExt as _, PopupMenuItem},
@@ -135,14 +135,33 @@ impl ArticleView {
             } else {
                 owner.t("Translate")
             };
-            toolbar = toolbar.child(
-                Button::new("translate-article")
-                    .small()
-                    .ghost()
-                    .icon(IconName::Globe)
-                    .tooltip(translate_label)
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_or_translate(id, cx))),
-            );
+            if self.translating_article_id == Some(id) {
+                toolbar = toolbar.child(
+                    Button::new("cancel-translation")
+                        .small()
+                        .ghost()
+                        .tooltip(owner.t("Cancel"))
+                        .child(
+                            Icon::new(IconName::Loader).transform(Transformation::rotate(
+                                percentage((self.translation_spinner_frame % 8) as f32 / 8.),
+                            )),
+                        )
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.toggle_or_translate(id, cx)),
+                        ),
+                );
+            } else {
+                toolbar = toolbar.child(
+                    Button::new("translate-article")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Globe)
+                        .tooltip(translate_label)
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| this.toggle_or_translate(id, cx)),
+                        ),
+                );
+            }
             if self.showing_translation {
                 toolbar = toolbar.child(
                     Button::new("translation-layout")

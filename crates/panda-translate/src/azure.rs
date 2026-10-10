@@ -124,6 +124,8 @@ impl AzureTranslator {
                         .iter()
                         .map(|title| title.chars().count())
                         .sum(),
+                    input_tokens: None,
+                    output_tokens: None,
                     error,
                 })?;
             output.extend(parts);
@@ -133,6 +135,8 @@ impl AzureTranslator {
         Ok(crate::TitleBatchResult {
             translations: output,
             requests,
+            input_tokens: None,
+            output_tokens: None,
         })
     }
 }
@@ -194,6 +198,7 @@ impl Translator for AzureTranslator {
             html,
             title: translated_title,
             detected_source_lang: detected,
+            metrics: Default::default(),
         })
     }
 }

@@ -151,6 +151,8 @@ pub struct Preferences {
     pub paragraph_indent: bool,
     /// Translate confidently identified article titles in the background.
     pub auto_translate_titles: bool,
+    /// Restrict automatic title translation to articles received after this feature was added.
+    pub only_translate_future_titles: bool,
     pub auto_extract_full_text: bool,
     /// Which library extracts article body from the fetched page.
     pub content_extractor: ContentExtractor,
@@ -194,6 +196,7 @@ impl Default for Preferences {
             translation_language: Language::ZhCn,
             paragraph_indent: true,
             auto_translate_titles: false,
+            only_translate_future_titles: true,
             auto_extract_full_text: false,
             content_extractor: ContentExtractor::DomSmoothie,
             hide_images: false,

@@ -79,6 +79,7 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
             translation_layout,
             hide_images,
             paragraph_indent,
+            progress,
             reply,
         } => super::articles::translate(
             id,
@@ -89,13 +90,15 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
             hide_images,
             paragraph_indent,
             reply,
+            progress,
             state,
         ),
         Command::TranslateTitles {
             items,
             target_lang,
+            force,
             reply,
-        } => super::articles::translate_titles(items, target_lang, reply, state),
+        } => super::articles::translate_titles(items, target_lang, force, reply, state),
         Command::TranslationUsage { reply } => super::articles::translation_usage(reply, state),
         Command::AddFeed { url, reply } => super::subscriptions::add_feed(url, reply, state),
         Command::RemoveFeed { id, reply } => super::subscriptions::remove_feed(id, reply, state),
@@ -117,6 +120,9 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
         ),
         Command::SetFeedAutoTranslateTitles { id, enabled, reply } => {
             super::subscriptions::set_feed_auto_translate_titles(id, enabled, reply, state)
+        }
+        Command::ResetTitleTranslationCutoffs { reply } => {
+            super::subscriptions::reset_title_translation_cutoffs(reply, state)
         }
         Command::ImportOpml { content, reply } => {
             super::subscriptions::import_opml(content, reply, state)

@@ -1,4 +1,5 @@
 use crate::app::preferences::{Language, Preferences};
+use crate::services::Command;
 use crate::ui::i18n;
 use crate::ui::theme;
 use crate::ui::window::ReaderWindow;
@@ -7,6 +8,7 @@ use gpui_kit::component::{IndexPath, select::SearchableVec};
 use gpui_kit::*;
 use panda_core::Scope;
 use panda_translate::TranslatorConfig;
+use tokio::sync::oneshot;
 
 use super::selectors::{LanguageOption, LogRetentionOption, TranslatorProvider};
 
@@ -412,6 +414,45 @@ impl ReaderWindow {
             self.queue_title_translations(&rows, cx);
         }
         cx.notify();
+    }
+
+    pub(in crate::ui) fn set_only_translate_future_titles(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.preferences.only_translate_future_titles = enabled;
+        self.save_preferences();
+        if self.preferences.auto_translate_titles && enabled {
+            self.reset_title_translation_cutoffs(cx);
+        } else if self.preferences.auto_translate_titles {
+            let rows = self.list.articles.as_ref().clone();
+            self.queue_title_translations(&rows, cx);
+        }
+        cx.notify();
+    }
+
+    fn reset_title_translation_cutoffs(&mut self, cx: &mut Context<Self>) {
+        let (reply, response) = oneshot::channel();
+        self.services
+            .send(Command::ResetTitleTranslationCutoffs { reply });
+        cx.spawn(async move |this, cx| {
+            let result = response
+                .await
+                .unwrap_or_else(|_| Err("Background service stopped".into()));
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    if this.preferences.auto_translate_titles
+                        && this.preferences.only_translate_future_titles
+                    {
+                        this.load_snapshot(cx);
+                    }
+                    cx.notify();
+                }
+                Err(error) => this.set_error(error),
+            });
+        })
+        .detach();
     }
 
     pub(in crate::ui) fn choose_theme(&mut self, id: &'static str, cx: &mut Context<Self>) {

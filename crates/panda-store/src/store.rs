@@ -191,6 +191,7 @@ impl Store {
                 last_modified TEXT,
                 last_error TEXT,
                 added_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                auto_translate_titles_after_article_id INTEGER,
                 workspace TEXT NOT NULL DEFAULT 'local',
                 UNIQUE(workspace,feed_url)
             );
@@ -282,6 +283,16 @@ impl Store {
                 "auto_translate_titles",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
+            ensure_column(
+                &connection,
+                "feeds",
+                "auto_translate_titles_after_article_id",
+                "INTEGER",
+            )?;
+            connection.execute(
+                "UPDATE feeds SET auto_translate_titles_after_article_id=COALESCE((SELECT MAX(id) FROM articles WHERE articles.feed_id=feeds.id),0) WHERE auto_translate_titles=1 AND auto_translate_titles_after_article_id IS NULL",
+                [],
+            )?;
             ensure_column(&connection, "articles", "remote_id", "INTEGER")?;
             ensure_column(&connection, "articles", "remote_content_hash", "TEXT")?;
             ensure_column(&connection, "articles", "source_revision", "TEXT")?;
@@ -315,6 +326,25 @@ impl Store {
                 "TEXT",
             )?;
             connection.execute_batch("CREATE TABLE IF NOT EXISTS translation_usage(day TEXT NOT NULL, provider TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0, characters INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,provider));")?;
+            ensure_column(
+                &connection,
+                "translation_usage",
+                "input_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            ensure_column(
+                &connection,
+                "translation_usage",
+                "output_tokens",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            connection.execute_batch("CREATE TABLE IF NOT EXISTS article_translation_segments(workspace TEXT NOT NULL, article_id INTEGER NOT NULL, target_lang TEXT NOT NULL, backend_id TEXT NOT NULL, prompt_revision TEXT NOT NULL, context_hash TEXT NOT NULL DEFAULT '', segment_id TEXT NOT NULL, source_hash TEXT NOT NULL, translated_html TEXT NOT NULL, PRIMARY KEY(workspace,article_id,target_lang,backend_id,prompt_revision,segment_id,source_hash));")?;
+            ensure_column(
+                &connection,
+                "article_translation_segments",
+                "context_hash",
+                "TEXT NOT NULL DEFAULT ''",
+            )?;
             migrate_workspace_schema(&connection)?;
             ensure_column(&connection, "feeds", "custom_title", "TEXT")?;
             ensure_column(&connection, "feeds", "language", "TEXT")?;
@@ -351,6 +381,19 @@ impl Store {
         )?;
             connection.pragma_update(None, "user_version", 4)?;
         }
+        // Keep this idempotent for databases whose schema version predates the
+        // title-translation watermark. Existing enabled feeds start after their
+        // current newest article so their history is never queued as new.
+        ensure_column(
+            &connection,
+            "feeds",
+            "auto_translate_titles_after_article_id",
+            "INTEGER",
+        )?;
+        connection.execute(
+            "UPDATE feeds SET auto_translate_titles_after_article_id=COALESCE((SELECT MAX(id) FROM articles WHERE articles.feed_id=feeds.id),0) WHERE auto_translate_titles=1 AND auto_translate_titles_after_article_id IS NULL",
+            [],
+        )?;
         let fts_exists: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='article_fts')",
             [],
@@ -784,7 +827,7 @@ impl Store {
             "AND a.id IN (SELECT rowid FROM article_fts WHERE article_fts MATCH ?)"
         };
         let sql = format!(
-            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles,a.feed_id
+            "SELECT a.id,COALESCE(f.custom_title,f.title),a.title,a.url,a.author,a.snippet,a.published_at,a.is_read,a.is_starred,a.read_later,a.auto_translated_title,a.auto_translated_title_lang,a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,f.auto_translate_titles,a.feed_id,a.id>COALESCE(f.auto_translate_titles_after_article_id,0)
              FROM articles a JOIN feeds f ON f.id=a.feed_id
                  WHERE f.workspace=? AND {filter} {search_filter}
              {cursor_filter}
@@ -797,6 +840,7 @@ impl Store {
                 feed_title: row.get(1)?,
                 feed_language: row.get(13)?,
                 feed_auto_translate_titles: row.get::<_, i64>(14)? != 0,
+                title_is_future: row.get(16)?,
                 title: row.get(2)?,
                 url: row.get(3)?,
                 author: row.get(4)?,
@@ -882,7 +926,8 @@ impl Store {
                     a.auto_translated_title_source_hash,CASE WHEN f.source='miniflux' THEN f.language ELSE NULL END,
                     f.auto_translate_titles,a.feed_id,a.content_revision,a.content_html,
                     CASE WHEN a.extracted_html IS NULL THEN a.source_html ELSE NULL END,a.extracted_html,
-                    a.translated_html,a.translated_title,a.translated_lang,a.translation_source_hash
+                    a.translated_html,a.translated_title,a.translated_lang,a.translation_source_hash,
+                    a.id>COALESCE(f.auto_translate_titles_after_article_id,0)
              FROM articles a JOIN feeds f ON f.id=a.feed_id
              WHERE a.id=?1 AND f.workspace=?2",
             params![id, self.workspace],
@@ -894,6 +939,7 @@ impl Store {
                     auto_translated_title: row.get(10)?, auto_translated_title_lang: row.get(11)?,
                     auto_translated_title_source_hash: row.get(12)?, feed_language: row.get(13)?,
                     feed_auto_translate_titles: row.get::<_, i64>(14)? != 0, feed_id: row.get(15)?,
+                    title_is_future: row.get(24)?,
                 },
                 row.get::<_, i64>(16)?,
                 row.get::<_, Option<String>>(3)?,
@@ -1127,6 +1173,88 @@ impl Store {
         Ok(())
     }
 
+    pub fn translation_segments(
+        &self,
+        article_id: i64,
+        target_lang: &str,
+        backend_id: &str,
+        prompt_revision: &str,
+        context_hash: &str,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT segment_id,translated_html FROM article_translation_segments
+             WHERE workspace=?1 AND article_id=?2 AND target_lang=?3 AND backend_id=?4 AND prompt_revision=?5 AND context_hash=?6",
+        )?;
+        let rows = statement.query_map(
+            params![
+                self.workspace,
+                article_id,
+                target_lang,
+                backend_id,
+                prompt_revision,
+                context_hash
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )?;
+        rows.collect::<Result<HashMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn save_translation_segment(
+        &self,
+        article_id: i64,
+        target_lang: &str,
+        backend_id: &str,
+        prompt_revision: &str,
+        context_hash: &str,
+        segment_id: &str,
+        source_hash: &str,
+        translated_html: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO article_translation_segments(workspace,article_id,target_lang,backend_id,prompt_revision,context_hash,segment_id,source_hash,translated_html)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(workspace,article_id,target_lang,backend_id,prompt_revision,segment_id,source_hash)
+             DO UPDATE SET context_hash=excluded.context_hash,translated_html=excluded.translated_html",
+            params![
+                self.workspace,
+                article_id,
+                target_lang,
+                backend_id,
+                prompt_revision,
+                context_hash,
+                segment_id,
+                source_hash,
+                translated_html
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_translation_segments(
+        &self,
+        article_id: i64,
+        target_lang: &str,
+        backend_id: &str,
+        prompt_revision: &str,
+        context_hash: &str,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "DELETE FROM article_translation_segments
+             WHERE workspace=?1 AND article_id=?2
+               AND NOT (target_lang=?3 AND backend_id=?4 AND prompt_revision=?5 AND context_hash=?6)",
+            params![
+                self.workspace,
+                article_id,
+                target_lang,
+                backend_id,
+                prompt_revision,
+                context_hash
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn save_auto_translated_title(
         &self,
         id: i64,
@@ -1146,12 +1274,28 @@ impl Store {
         requests: u64,
         characters: u64,
     ) -> anyhow::Result<()> {
-        self.connection.execute("INSERT INTO translation_usage(day,provider,requests,characters) VALUES(?1,?2,?3,?4) ON CONFLICT(day,provider) DO UPDATE SET requests=requests+excluded.requests,characters=characters+excluded.characters",params![day,provider,requests,characters])?;
+        self.record_translation_usage_with_tokens(day, provider, requests, characters, 0, 0)
+    }
+
+    pub fn record_translation_usage_with_tokens(
+        &self,
+        day: &str,
+        provider: &str,
+        requests: u64,
+        characters: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO translation_usage(day,provider,requests,characters,input_tokens,output_tokens) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(day,provider) DO UPDATE SET requests=requests+excluded.requests,characters=characters+excluded.characters,input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens",
+            params![day,provider,requests,characters,input_tokens,output_tokens],
+        )?;
         Ok(())
     }
 
     pub fn translation_usage(&self) -> anyhow::Result<Vec<panda_core::TranslationUsage>> {
-        let mut stmt=self.connection.prepare("SELECT day,provider,requests,characters FROM translation_usage ORDER BY day DESC,provider")?;
+        let mut stmt=self.connection.prepare("SELECT day,provider,requests,characters,input_tokens,output_tokens FROM translation_usage ORDER BY day DESC,provider")?;
         Ok(stmt
             .query_map([], |r| {
                 Ok(panda_core::TranslationUsage {
@@ -1159,6 +1303,8 @@ impl Store {
                     provider: r.get(1)?,
                     requests: r.get::<_, u64>(2)?,
                     characters: r.get::<_, u64>(3)?,
+                    input_tokens: r.get::<_, u64>(4)?,
+                    output_tokens: r.get::<_, u64>(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -1301,7 +1447,11 @@ impl Store {
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
         self.connection.execute(
-            "UPDATE feeds SET custom_title=?1, folder=?2, feed_url=?3, auto_translate_titles=?4 WHERE id=?5 AND workspace=?6",
+            "UPDATE feeds SET custom_title=?1, folder=?2, feed_url=?3, auto_translate_titles=?4,
+                auto_translate_titles_after_article_id=CASE
+                    WHEN ?4=1 AND auto_translate_titles=0 THEN COALESCE((SELECT MAX(id) FROM articles WHERE feed_id=feeds.id),0)
+                    WHEN ?4=0 THEN NULL ELSE auto_translate_titles_after_article_id END
+             WHERE id=?5 AND workspace=?6",
             params![title, folder, feed_url, auto_translate_titles, id, self.workspace],
         )?;
         Ok(())
@@ -1309,10 +1459,22 @@ impl Store {
 
     pub fn set_feed_auto_translate_titles(&self, id: i64, enabled: bool) -> anyhow::Result<()> {
         let changed = self.connection.execute(
-            "UPDATE feeds SET auto_translate_titles=?1 WHERE id=?2 AND workspace=?3",
+            "UPDATE feeds SET auto_translate_titles=?1,
+                auto_translate_titles_after_article_id=CASE
+                    WHEN ?1=1 AND auto_translate_titles=0 THEN COALESCE((SELECT MAX(id) FROM articles WHERE feed_id=feeds.id),0)
+                    WHEN ?1=0 THEN NULL ELSE auto_translate_titles_after_article_id END
+             WHERE id=?2 AND workspace=?3",
             params![enabled, id, self.workspace],
         )?;
         anyhow::ensure!(changed == 1, "Feed not found in this workspace");
+        Ok(())
+    }
+
+    pub fn reset_auto_title_translation_cutoffs(&self) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE feeds SET auto_translate_titles_after_article_id=COALESCE((SELECT MAX(id) FROM articles WHERE feed_id=feeds.id),0) WHERE workspace=?1 AND auto_translate_titles=1",
+            [&self.workspace],
+        )?;
         Ok(())
     }
 
@@ -2588,14 +2750,15 @@ fn migrate_workspace_schema(connection: &Connection) -> anyhow::Result<()> {
                 source TEXT NOT NULL DEFAULT 'local',
                 remote_id INTEGER,
                 auto_translate_titles INTEGER NOT NULL DEFAULT 0,
+                auto_translate_titles_after_article_id INTEGER,
                 workspace TEXT NOT NULL DEFAULT 'local',
                 UNIQUE(workspace,feed_url)
              );",
         )?;
         let account_workspace = "provider:miniflux";
         connection.execute(
-            "INSERT INTO feeds_workspace(id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,workspace)
-             SELECT id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,
+            "INSERT INTO feeds_workspace(id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,auto_translate_titles_after_article_id,workspace)
+             SELECT id,feed_url,title,site_url,folder,etag,last_modified,last_error,added_at,source,remote_id,auto_translate_titles,auto_translate_titles_after_article_id,
                     CASE WHEN source='miniflux' THEN ?1 ELSE 'local' END FROM feeds",
             [&account_workspace],
         )?;
@@ -3194,7 +3357,7 @@ mod tests {
             .record_translation_usage("2026-10-01", "azure", 2, 99)
             .unwrap();
         store
-            .record_translation_usage("2026-10-01", "azure", 1, 40)
+            .record_translation_usage_with_tokens("2026-10-01", "azure", 1, 40, 23, 11)
             .unwrap();
         store
             .record_translation_usage("2026-09-30", "volcengine", 1, 10)
@@ -3219,11 +3382,67 @@ mod tests {
             ),
             ("2026-09-30", "volcengine", 1, 10)
         );
+        assert_eq!((usage[0].input_tokens, usage[0].output_tokens), (23, 11));
         store.connection.execute("UPDATE articles SET title='The government announces a different policy for the country' WHERE id=7",[]).unwrap();
         let updated = store.article(7).unwrap();
         assert_ne!(
             panda_translate::title_source_hash(&updated.summary.title),
             updated.summary.auto_translated_title_source_hash.unwrap()
+        );
+    }
+
+    #[test]
+    fn translation_segment_cache_is_scoped_by_article_language_backend_and_prompt() {
+        let (_directory, store) = test_store();
+        store
+            .save_translation_segment(
+                7,
+                "zh-Hans",
+                "openai:model-a",
+                "prompt-v2",
+                "title-hash",
+                "segment-a",
+                "source-a",
+                "<p>译文</p>",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .translation_segments(7, "zh-Hans", "openai:model-a", "prompt-v2", "title-hash")
+                .unwrap()
+                .get("segment-a")
+                .map(String::as_str),
+            Some("<p>译文</p>")
+        );
+        assert!(
+            store
+                .translation_segments(7, "ja", "openai:model-a", "prompt-v2", "title-hash")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .translation_segments(7, "zh-Hans", "openai:model-b", "prompt-v2", "title-hash")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .translation_segments(7, "zh-Hans", "openai:model-a", "prompt-v3", "title-hash")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .translation_segments(
+                    7,
+                    "zh-Hans",
+                    "openai:model-a",
+                    "prompt-v2",
+                    "different-title"
+                )
+                .unwrap()
+                .is_empty()
         );
     }
 

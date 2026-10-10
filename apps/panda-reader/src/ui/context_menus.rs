@@ -326,6 +326,14 @@ impl ReaderWindow {
                     let title = title.clone();
                     move |_, _, cx| copy_text(cx, title.clone())
                 }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::text(language, "Translate title")).on_click({
+                    let app = app.clone();
+                    move |_, _, cx| {
+                        let _ = app.update(cx, |this, cx| this.translate_title_manually(id, cx));
+                    }
+                }),
             );
 
         if let Some(url) = url.clone() {

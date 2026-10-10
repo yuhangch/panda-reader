@@ -5733,6 +5733,7 @@ version = "0.2.5"
 dependencies = [
  "anyhow",
  "chrono",
+ "futures",
  "hex",
  "hmac",
  "panda-content",

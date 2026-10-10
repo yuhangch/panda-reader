@@ -55,6 +55,201 @@ pub struct HtmlTranslation {
     pub detected_source_lang: Option<String>,
 }
 
+/// A stable, host-owned HTML block prepared for a translation provider.
+/// `input` contains placeholders for markup so the provider can translate prose
+/// without becoming responsible for preserving tags or attributes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtmlTranslationSegment {
+    pub id: String,
+    pub source_hash: String,
+    pub input: String,
+    pub block_index: usize,
+    placeholders: Vec<String>,
+    source_block: String,
+}
+
+impl HtmlTranslationSegment {
+    /// Restore the source markup into translated text. Placeholder loss,
+    /// duplication, or reordering is rejected so invalid markup is never saved.
+    pub fn restore(&self, translated: &str) -> anyhow::Result<String> {
+        let mut output = translated.trim().to_owned();
+        let mut positions = Vec::with_capacity(self.placeholders.len());
+        for index in 0..self.placeholders.len() {
+            let token = placeholder_token(index);
+            let mut matches = output.match_indices(&token);
+            let Some((position, _)) = matches.next() else {
+                bail!("Translation response is missing HTML placeholder {index}");
+            };
+            if matches.next().is_some() {
+                bail!("Translation response duplicated HTML placeholder {index}");
+            }
+            positions.push(position);
+        }
+        if positions.windows(2).any(|window| window[0] > window[1]) {
+            bail!("Translation response reordered HTML placeholders");
+        }
+        for (index, raw) in self.placeholders.iter().enumerate().rev() {
+            output = output.replace(&placeholder_token(index), raw);
+        }
+        if output.trim().is_empty() {
+            bail!("Translation response is empty");
+        }
+        // The outer block is owned by the source document. Require the model
+        // to return its original wrapper and replace that wrapper verbatim.
+        let source_name = leading_tag_name(&self.source_block);
+        if let Some(tag) = source_name {
+            let open_end = find_tag_end(&self.source_block, 0).unwrap_or(0);
+            let close_start = self
+                .source_block
+                .to_ascii_lowercase()
+                .rfind(&format!("</{tag}"));
+            if open_end > 0
+                && let Some(close_start) = close_start
+            {
+                let inner = output
+                    .trim()
+                    .strip_prefix(&self.source_block[..open_end])
+                    .and_then(|value| value.strip_suffix(&self.source_block[close_start..]));
+                if let Some(inner) = inner {
+                    return Ok(format!(
+                        "{}{}{}",
+                        &self.source_block[..open_end],
+                        inner,
+                        &self.source_block[close_start..]
+                    ));
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+/// Prepare stable translation units from canonical article HTML. Non-prose
+/// blocks such as code are deliberately excluded.
+pub fn prepare_html_translation_segments(html: &str) -> Vec<HtmlTranslationSegment> {
+    let mut segments = Vec::new();
+    let mut occurrences = std::collections::HashMap::<String, usize>::new();
+    for (block_index, block) in split_blocks(html).into_iter().enumerate() {
+        if !block_needs_translation(&block) || is_code_block(&block) {
+            continue;
+        }
+        let mut input = String::with_capacity(block.len());
+        let mut placeholders = Vec::new();
+        let mut cursor = 0;
+        while cursor < block.len() {
+            let Some(relative_start) = block[cursor..].find('<') else {
+                input.push_str(&block[cursor..]);
+                break;
+            };
+            let start = cursor + relative_start;
+            input.push_str(&block[cursor..start]);
+            if let Some((end, raw)) = protected_markup_at(&block, start) {
+                let index = placeholders.len();
+                input.push_str(&placeholder_token(index));
+                placeholders.push(raw);
+                cursor = end;
+            } else {
+                input.push('<');
+                cursor = start + 1;
+            }
+        }
+        let source_hash = hex::encode(Sha256::digest(block.as_bytes()));
+        let occurrence = occurrences.entry(source_hash.clone()).or_default();
+        let id = format!("s{source_hash}-{}", *occurrence);
+        *occurrence += 1;
+        segments.push(HtmlTranslationSegment {
+            id,
+            source_hash,
+            input,
+            block_index,
+            placeholders,
+            source_block: block,
+        });
+    }
+    segments
+}
+
+/// Assemble validated, restored translations using the source block order.
+pub fn assemble_html_translation(
+    html: &str,
+    segments: &[HtmlTranslationSegment],
+    translations: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let blocks = split_blocks(html);
+    let mut output = blocks.clone();
+    for segment in segments {
+        let translated = translations
+            .get(&segment.id)
+            .ok_or_else(|| anyhow::anyhow!("Translation is missing segment {}", segment.id))?;
+        output[segment.block_index] = translated.clone();
+    }
+    Ok(output.join("\n"))
+}
+
+/// Assemble any completed block translations while leaving unfinished blocks
+/// in their original positions. This is intended for progressive rendering;
+/// callers must still keep the result marked as incomplete until all segments
+/// have been translated.
+pub fn assemble_partial_html_translation(
+    html: &str,
+    translations: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let blocks = split_blocks(html);
+    let mut output = blocks.clone();
+    for segment in prepare_html_translation_segments(html) {
+        if let Some(translated) = translations.get(&segment.id) {
+            output[segment.block_index] = translated.clone();
+        }
+    }
+    Ok(output.join("\n"))
+}
+
+fn placeholder_token(index: usize) -> String {
+    format!("⟪PANDA_HTML_{index:04}⟫")
+}
+
+fn protected_markup_at(html: &str, start: usize) -> Option<(usize, String)> {
+    let lower = html[start..].to_ascii_lowercase();
+    // Preserve code, including its contents, as one indivisible unit.
+    for tag in ["code", "pre", "math", "svg"] {
+        if lower.starts_with(&format!("<{tag}")) {
+            let close = lower.find(&format!("</{tag}>"))? + tag.len() + 3;
+            return Some((start + close, html[start..start + close].to_owned()));
+        }
+    }
+    let end = find_tag_end(html, start)?;
+    Some((end, html[start..end].to_owned()))
+}
+
+fn find_tag_end(html: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (offset, ch) in html[start..].char_indices() {
+        match (quote, ch) {
+            (Some(active), current) if active == current => quote = None,
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '>') => return Some(start + offset + 1),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn leading_tag_name(block: &str) -> Option<String> {
+    let rest = block.trim_start().strip_prefix('<')?;
+    let name: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+fn is_code_block(block: &str) -> bool {
+    matches!(
+        leading_tag_name(block).as_deref(),
+        Some("pre" | "code" | "math" | "svg")
+    )
+}
+
 /// Translate top-level HTML blocks while preserving their position and markup.
 /// Provider-specific request formats and limits are supplied by the caller.
 pub async fn translate_html_blocks<F, Fut>(
@@ -471,5 +666,90 @@ mod tests {
         assert!(!block_needs_translation("<hr>"));
         assert!(!block_needs_translation("<p>   </p>"));
         assert!(block_needs_translation("<p>Hello</p>"));
+    }
+
+    #[test]
+    fn translation_segments_keep_markup_and_inline_code_host_owned() {
+        let source = r#"<p>Use <a href="https://example.com?a=1&amp;b=2"><strong>Rust</strong></a> with <code>Vec&lt;T&gt;</code><img src="/chart.png" alt="chart"></p><pre>fn main() {}</pre>"#;
+        let segments = prepare_html_translation_segments(source);
+        assert_eq!(segments.len(), 1);
+        assert!(!segments[0].input.contains("https://example.com"));
+        assert!(!segments[0].input.contains("Vec&lt;T&gt;"));
+        assert!(segments[0].input.contains("Rust"));
+
+        let translated = segments[0].input.replace("Rust", "Rust语言");
+        let restored = segments[0].restore(&translated).unwrap();
+        assert!(restored.contains("href=\"https://example.com?a=1&amp;b=2\""));
+        assert!(restored.contains("<strong>Rust语言</strong>"));
+        assert!(restored.contains("<code>Vec&lt;T&gt;</code>"));
+        assert!(restored.contains("<img src=\"/chart.png\" alt=\"chart\">"));
+    }
+
+    #[test]
+    fn nested_preformatted_code_is_never_sent_as_prose() {
+        let segment = prepare_html_translation_segments(
+            "<blockquote><pre>fn main() { println!(\"Rust\"); }</pre><p>Explanation</p></blockquote>",
+        )
+        .remove(0);
+        assert!(!segment.input.contains("println!"));
+        assert!(segment.input.contains("Explanation"));
+        let restored = segment
+            .restore(&segment.input.replace("Explanation", "说明"))
+            .unwrap();
+        assert!(restored.contains("fn main() { println!(\"Rust\"); }"));
+        assert!(restored.contains("说明"));
+    }
+
+    #[test]
+    fn translation_segment_ids_survive_insertions_and_distinguish_duplicates() {
+        let original = prepare_html_translation_segments("<p>Same block</p><p>Other block</p>");
+        let inserted = prepare_html_translation_segments(
+            "<p>New block</p><p>Same block</p><p>Other block</p>",
+        );
+        assert_eq!(original[0].id, inserted[1].id);
+        assert_eq!(original[1].id, inserted[2].id);
+
+        let duplicates = prepare_html_translation_segments("<p>Same block</p><p>Same block</p>");
+        assert_ne!(duplicates[0].id, duplicates[1].id);
+    }
+
+    #[test]
+    fn translation_segment_rejects_lost_or_reordered_markup_tokens() {
+        let segment =
+            prepare_html_translation_segments("<p><b>one</b> and <i>two</i></p>").remove(0);
+        let tokens: Vec<_> = (0..segment.placeholders.len())
+            .map(placeholder_token)
+            .collect();
+        assert!(segment.restore("translated without tokens").is_err());
+        assert!(
+            segment
+                .restore(&format!("{}{}{}{}", tokens[1], "x", tokens[0], "y"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn assembly_uses_source_order_and_preserves_non_text_blocks() {
+        let html = "<p>First</p><img src=\"/cover.png\"><p>Last</p>";
+        let segments = prepare_html_translation_segments(html);
+        let translations = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.id.clone(),
+                    segment
+                        .restore(
+                            &segment
+                                .input
+                                .replace("First", "第一")
+                                .replace("Last", "最后"),
+                        )
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let output = assemble_html_translation(html, &segments, &translations).unwrap();
+        assert!(output.find("<p>第一</p>").unwrap() < output.find("<img").unwrap());
+        assert!(output.find("<img").unwrap() < output.find("<p>最后</p>").unwrap());
     }
 }
