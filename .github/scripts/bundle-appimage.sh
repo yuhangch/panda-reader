@@ -64,7 +64,17 @@ convert apps/panda-reader/assets/app-icon.png -resize 256x256 "$TOOLS/panda-read
   --desktop-file "$TOOLS/panda-reader.desktop" \
   --icon-file "$TOOLS/panda-reader.png"
 
-"$APPIMAGETOOL" "$APPDIR" "dist/${NAME}.AppImage"
+APPIMAGE_PATH="dist/${NAME}.AppImage"
+if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+  RELEASE_TAG="${GITHUB_REF#refs/tags/}"
+  UPDATE_INFO="zsync|https://github.com/yuhangch/panda-reader/releases/download/${RELEASE_TAG}/${NAME}.AppImage.zsync"
+  "$APPIMAGETOOL" -u "$UPDATE_INFO" "$APPDIR" "$APPIMAGE_PATH"
+  test -s "${APPIMAGE_PATH}.zsync"
+else
+  # Non-tag workflow_dispatch builds are artifacts, not published releases, so
+  # they must not advertise a zsync endpoint that does not exist yet.
+  "$APPIMAGETOOL" "$APPDIR" "$APPIMAGE_PATH"
+fi
 chmod +x "dist/${NAME}.AppImage"
 test -s "dist/${NAME}.AppImage"
 "dist/${NAME}.AppImage" --appimage-extract >/dev/null
@@ -72,4 +82,4 @@ test -x squashfs-root/usr/bin/panda-reader
 test -x squashfs-root/usr/bin/panda-reader-updater
 rm -rf squashfs-root
 rm -rf "$APPDIR" "$TOOLS"
-echo "OK dist/${NAME}.AppImage"
+echo "OK ${APPIMAGE_PATH}"

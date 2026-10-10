@@ -28,7 +28,13 @@ export default defineConfig({
       ],
       customCss: ['./src/styles/typography.css', './src/styles/starlight.css'],
       sidebar: [
-        { label: 'Start here', items: [{ label: 'Documentation', link: '/docs/' }] },
+        {
+          label: 'Start here',
+          items: [
+            { label: 'Documentation', link: '/docs/' },
+            { label: 'Linux support', link: '/docs/linux/' },
+          ],
+        },
         {
           label: 'Sync',
           items: [{ label: 'Provider setup', link: '/docs/providers/' }],

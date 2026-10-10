@@ -101,6 +101,7 @@ jobs:
             dist/*.zip
             dist/*.tar.gz
             dist/*.AppImage
+            dist/*.AppImage.zsync
             dist/*-setup.exe
             dist/*-signing-status.txt
           retention-days: 1

@@ -13,6 +13,12 @@ and FreshRSS.
 
 [Set up a provider →](./providers/)
 
+## Run on Linux
+
+Linux release compatibility and graphics requirements are listed in the Linux notes.
+
+[Linux notes →](./linux/)
+
 ## Make publisher pages readable
 
 Install community plugins or build your own with declarative rules or WebAssembly.

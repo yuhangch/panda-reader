@@ -12,7 +12,7 @@ cargo test --workspace --locked
 cargo check --workspace --locked
 ```
 
-The GitHub Actions workflow builds the desktop app on Windows, macOS, and Linux. Community plugin catalog consistency is checked locally with `python scripts/generate_community_plugin_index.py --check`; regenerate it after plugin changes with `python scripts/generate_community_plugin_index.py`. On the maintainer's Windows machine, keep `.cargo/config.toml` unchanged because it places linker output on a local disk.
+The `Release` GitHub Actions workflow builds and packages Windows, macOS, and Linux artifacts when a `v*` tag is pushed; run the checks above locally before opening a pull request. Community plugin catalog consistency is checked locally with `python scripts/generate_community_plugin_index.py --check`; regenerate it after plugin changes with `python scripts/generate_community_plugin_index.py`. On the maintainer's Windows machine, keep `.cargo/config.toml` unchanged because it places linker output on a local disk.
 
 ## Pull requests
 
