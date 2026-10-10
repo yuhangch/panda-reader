@@ -19,9 +19,7 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
-    h_flex,
-    menu::{ContextMenuExt as _, PopupMenuItem},
-    v_flex,
+    h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -286,9 +284,6 @@ impl Focusable for ReaderWindow {
 
 impl ReaderWindow {
     fn render_image_viewer(&self, url: String, cx: &mut Context<Self>) -> impl IntoElement {
-        let image_app = cx.entity().downgrade();
-        let language = self.preferences.language;
-        let copy_url = url.clone();
         div()
             .absolute()
             .inset_0()
@@ -310,24 +305,7 @@ impl ReaderWindow {
                     .max_h_full()
                     .p_5()
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(
-                        div()
-                            .child(img(url).max_w(px(1400.)).max_h(px(1000.)).max_w_full())
-                            .context_menu(move |menu, _, _| {
-                                menu.item(
-                                    PopupMenuItem::new(i18n::text(language, "Copy image"))
-                                        .on_click({
-                                            let app = image_app.clone();
-                                            let url = copy_url.clone();
-                                            move |_, _, cx| {
-                                                let _ = app.update(cx, |this, cx| {
-                                                    this.copy_article_image(url.clone(), cx);
-                                                });
-                                            }
-                                        }),
-                                )
-                            }),
-                    )
+                    .child(img(url).max_w(px(1400.)).max_h(px(1000.)).max_w_full())
                     .child(
                         Button::new("close-image-viewer")
                             .absolute()

@@ -4,58 +4,10 @@ use crate::ui::settings::SettingsPage;
 use crate::ui::window::ReaderWindow;
 use gpui_kit::*;
 use panda_core::{MarkField, Scope, TranslationLayout};
-use std::{
-    borrow::Cow,
-    io::Cursor,
-    sync::{Arc, OnceLock},
-};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 
 impl ReaderWindow {
-    pub(in crate::ui) fn copy_article_image(&mut self, url: String, cx: &mut Context<Self>) {
-        let referer = self
-            .reader
-            .article
-            .as_ref()
-            .and_then(|article| article.url.as_deref().or(article.summary.url.as_deref()))
-            .and_then(|url| url::Url::parse(url).ok())
-            .map(|mut url| {
-                // Image hosts can require the source page, but its query may contain private tokens.
-                let _ = url.set_username("");
-                let _ = url.set_password(None);
-                url.set_query(None);
-                url.set_fragment(None);
-                url
-            });
-        let weak = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
-            let result = match fetch_article_image(&url, referer.as_ref()).await {
-                Ok(image) => {
-                    cx.background_executor()
-                        .spawn(async move {
-                            let mut clipboard =
-                                arboard::Clipboard::new().map_err(|error| error.to_string())?;
-                            clipboard
-                                .set_image(image)
-                                .map_err(|error| error.to_string())
-                        })
-                        .await
-                }
-                Err(error) => Err(error),
-            };
-            let _ = weak.update(cx, |this, cx| match result {
-                Ok(()) => {
-                    this.set_flash(this.t("Image copied"), cx);
-                }
-                Err(error) => {
-                    eprintln!("could not copy article image: {error}");
-                    this.set_flash(this.t("Could not copy image"), cx);
-                }
-            });
-        })
-        .detach();
-    }
-
     pub(in crate::ui) fn share_article(&mut self, cx: &mut Context<Self>) {
         let Some(article) = self.reader.article.as_ref() else {
             return;
@@ -702,90 +654,6 @@ impl ReaderWindow {
     pub(in crate::ui) fn translation_target_code(&self) -> &'static str {
         self.preferences.translation_language.translator_code()
     }
-}
-
-const MAX_CLIPBOARD_IMAGE_BYTES: usize = 32 * 1024 * 1024;
-const MAX_CLIPBOARD_IMAGE_PIXELS: u64 = 40_000_000;
-
-async fn fetch_article_image(
-    url: &str,
-    referer: Option<&url::Url>,
-) -> Result<arboard::ImageData<'static>, String> {
-    let parsed = url::Url::parse(url).map_err(|error| error.to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("only HTTP and HTTPS images can be copied".into());
-    }
-
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(concat!("PandaReader/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(20))
-            .build()
-            .expect("article image client configuration is valid")
-    });
-    let mut request = client.get(parsed);
-    if let Some(referer) = referer {
-        request = request.header(reqwest::header::REFERER, referer.as_str());
-    }
-    let mut response = request
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_CLIPBOARD_IMAGE_BYTES as u64)
-    {
-        return Err("image exceeds the 32 MiB copy limit".into());
-    }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_CLIPBOARD_IMAGE_BYTES {
-            return Err("image exceeds the 32 MiB copy limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    let png = match image::load_from_memory(&bytes) {
-        Ok(decoded) => {
-            let (width, height) = image::GenericImageView::dimensions(&decoded);
-            if u64::from(width) * u64::from(height) > MAX_CLIPBOARD_IMAGE_PIXELS {
-                return Err("image dimensions exceed the copy limit".into());
-            }
-            let mut png = Cursor::new(Vec::new());
-            decoded
-                .write_to(&mut png, image::ImageFormat::Png)
-                .map_err(|error| error.to_string())?;
-            png.into_inner()
-        }
-        Err(raster_error) => {
-            let svg = std::str::from_utf8(&bytes).map_err(|_| raster_error.to_string())?;
-            let tree =
-                resvg::usvg::Tree::from_data(svg.as_bytes(), &resvg::usvg::Options::default())
-                    .map_err(|_| raster_error.to_string())?;
-            let size = tree.size().to_int_size();
-            if u64::from(size.width()) * u64::from(size.height()) > MAX_CLIPBOARD_IMAGE_PIXELS {
-                return Err("image dimensions exceed the copy limit".into());
-            }
-            let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())
-                .ok_or_else(|| "could not allocate image for copying".to_owned())?;
-            resvg::render(
-                &tree,
-                resvg::tiny_skia::Transform::identity(),
-                &mut pixmap.as_mut(),
-            );
-            pixmap.encode_png().map_err(|error| error.to_string())?
-        }
-    };
-    let decoded = image::load_from_memory(&png).map_err(|error| error.to_string())?;
-    let rgba = decoded.to_rgba8();
-    Ok(arboard::ImageData {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        bytes: Cow::Owned(rgba.into_raw()),
-    })
 }
 
 impl ReaderWindow {
