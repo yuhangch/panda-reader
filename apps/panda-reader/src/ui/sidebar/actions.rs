@@ -155,8 +155,9 @@ impl ReaderWindow {
                 .unwrap_or_else(|| feed.feed_url.clone());
             let icons_dir = self.sidebar.icons_dir.clone();
             let weak = cx.entity().downgrade();
+            let http_client = cx.http_client();
             cx.spawn(async move |_, cx| {
-                let result = fetch_favicon(&host, &site_url, &icons_dir).await;
+                let result = fetch_favicon(http_client, &host, &site_url, &icons_dir).await;
                 if let Err(error) = result {
                     eprintln!("could not fetch feed icon for {host}: {error}");
                 }

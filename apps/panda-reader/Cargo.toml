@@ -20,6 +20,7 @@ arboard.workspace = true
 base64 = "=0.22.1"
 chrono.workspace = true
 directories.workspace = true
+futures.workspace = true
 gpui-kit.workspace = true
 image.workspace = true
 panda-content = { path = "../../crates/panda-content" }

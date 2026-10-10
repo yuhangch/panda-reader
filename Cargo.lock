@@ -5670,6 +5670,7 @@ dependencies = [
  "chrono",
  "directories",
  "embed-resource",
+ "futures",
  "gpui-kit",
  "gpui-pre-reqwest-client",
  "image",

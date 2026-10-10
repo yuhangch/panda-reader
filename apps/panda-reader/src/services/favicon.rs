@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::Arc;
+
+use futures::AsyncReadExt as _;
+use gpui_kit::gpui::http_client::{AsyncBody, HttpClient, HttpRequestExt};
 
 const MAX_FAVICON_BYTES: usize = 2 * 1024 * 1024;
-
-static FAVICON_LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-static FAVICON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub fn sanitize_host(host: &str) -> String {
     host.chars()
@@ -20,6 +20,7 @@ pub fn sanitize_host(host: &str) -> String {
 
 /// Fetch feed icons outside the shared service worker pool so slow icon hosts cannot delay sync.
 pub async fn fetch_favicon(
+    client: Arc<dyn HttpClient>,
     host: &str,
     site_url: &str,
     icons_dir: &Path,
@@ -30,25 +31,6 @@ pub async fn fetch_favicon(
     if path.is_file() {
         return Ok(path);
     }
-
-    let _permit = FAVICON_LIMIT
-        .get_or_init(|| tokio::sync::Semaphore::new(6))
-        .acquire()
-        .await
-        .map_err(|error| error.to_string())?;
-    // Another feed may have requested the same host while this task waited for a permit.
-    if path.is_file() {
-        return Ok(path);
-    }
-
-    let client = FAVICON_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent(concat!("PandaReader/", env!("CARGO_PKG_VERSION")))
-            .connect_timeout(std::time::Duration::from_secs(2))
-            .timeout(std::time::Duration::from_secs(4))
-            .build()
-            .expect("favicon HTTP client configuration is valid")
-    });
 
     let site_icon_url = url::Url::parse(site_url).ok().and_then(|mut url| {
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -63,7 +45,7 @@ pub async fn fetch_favicon(
     let site_icon_url =
         site_icon_url.ok_or_else(|| "site URL is not a valid HTTP(S) URL".to_owned())?;
     // Keep icon lookup on the feed's own origin; a missing icon falls back to the UI initials.
-    let bytes = download_icon(client, site_icon_url.as_str())
+    let bytes = download_icon(client.as_ref(), site_icon_url.as_str())
         .await
         .and_then(|bytes| normalize_icon(&bytes))?;
 
@@ -83,26 +65,37 @@ pub async fn fetch_favicon(
     }
 }
 
-async fn download_icon(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
-    let mut response = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
+async fn download_icon(client: &dyn HttpClient, url: &str) -> Result<Vec<u8>, String> {
+    let request = gpui_kit::gpui::http_client::Request::builder()
+        .uri(url)
+        .timeout(std::time::Duration::from_secs(4))
+        .body(AsyncBody::empty())
         .map_err(|error| error.to_string())?;
+    let mut response = client
+        .send(request)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("favicon request returned {}", response.status()));
+    }
     if response
-        .content_length()
+        .headers()
+        .get("content-length")
+        .and_then(|length| length.to_str().ok())
+        .and_then(|length| length.parse::<u64>().ok())
         .is_some_and(|length| length > MAX_FAVICON_BYTES as u64)
     {
         return Err("favicon exceeds the 2 MiB size limit".into());
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
-        if bytes.len().saturating_add(chunk.len()) > MAX_FAVICON_BYTES {
-            return Err("favicon exceeds the 2 MiB size limit".into());
-        }
-        bytes.extend_from_slice(&chunk);
+    response
+        .body_mut()
+        .take((MAX_FAVICON_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_FAVICON_BYTES {
+        return Err("favicon exceeds the 2 MiB size limit".into());
     }
     if bytes.is_empty() {
         return Err("empty favicon".into());
