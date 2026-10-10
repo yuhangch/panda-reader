@@ -7,7 +7,7 @@ use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    menu::ContextMenuExt as _,
+    menu::{ContextMenuExt as _, PopupMenuItem},
     text::{TextView, TextViewStyle},
     v_flex,
 };
@@ -374,6 +374,7 @@ impl ArticleView {
                                                     ),
                                                     image_urls: self.image_urls.clone(),
                                                     image_viewer_app: image_viewer_app.clone(),
+                                                    language,
                                                 })
                                                 .plugin(ArticleHeadingMarkdown {
                                                     style: article_style.clone(),
@@ -392,6 +393,7 @@ impl ArticleView {
                                                 .plugin(ArticleImageMarkdown {
                                                     image_urls: self.image_urls.clone(),
                                                     app: image_viewer_app.clone(),
+                                                    language,
                                                 })
                                                 .scrollable(false)
                                                 .w_full()
@@ -463,6 +465,7 @@ struct TranslationMarkdown {
     heading_gap: gpui::Rems,
     image_urls: Vec<String>,
     image_viewer_app: gpui::WeakEntity<ReaderWindow>,
+    language: crate::app::preferences::Language,
 }
 
 impl MarkdownPlugin for TranslationMarkdown {
@@ -509,6 +512,7 @@ impl MarkdownPlugin for TranslationMarkdown {
             .plugin(ArticleImageMarkdown {
                 image_urls: self.image_urls.clone(),
                 app: self.image_viewer_app.clone(),
+                language: self.language,
             })
             .font(self.font.clone())
             .text_size(self.font_size)
@@ -526,6 +530,7 @@ struct ArticleImageData {
 struct ArticleImageMarkdown {
     image_urls: Vec<String>,
     app: gpui::WeakEntity<ReaderWindow>,
+    language: crate::app::preferences::Language,
 }
 
 impl MarkdownPlugin for ArticleImageMarkdown {
@@ -573,18 +578,38 @@ impl MarkdownPlugin for ArticleImageMarkdown {
         if let Some(image) = node.data::<ArticleImageData>() {
             let index = image.index;
             let app = self.app.clone();
+            let menu_app = self.app.clone();
+            let url = image.url.clone();
+            let language = self.language;
             container = container.child(
-                img(image.url.clone())
-                    .id(("article-body-image", index as u64))
-                    .max_w_full()
-                    .cursor_pointer()
-                    .on_click(move |_, _, cx| {
-                        let _ = app.update(cx, |this, cx| {
-                            this.reader.image_viewer_url =
-                                this.reader.image_urls.get(index).cloned();
-                            cx.notify();
-                        });
-                    }),
+                div()
+                    .context_menu(move |menu, _, _| {
+                        menu.item(
+                            PopupMenuItem::new(crate::ui::i18n::text(language, "Copy image"))
+                                .on_click({
+                                    let app = menu_app.clone();
+                                    let url = url.clone();
+                                    move |_, _, cx| {
+                                        let _ = app.update(cx, |this, cx| {
+                                            this.copy_article_image(url.clone(), cx);
+                                        });
+                                    }
+                                }),
+                        )
+                    })
+                    .child(
+                        img(image.url.clone())
+                            .id(("article-body-image", index as u64))
+                            .max_w_full()
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                let _ = app.update(cx, |this, cx| {
+                                    this.reader.image_viewer_url =
+                                        this.reader.image_urls.get(index).cloned();
+                                    cx.notify();
+                                });
+                            }),
+                    ),
             );
         }
         container
