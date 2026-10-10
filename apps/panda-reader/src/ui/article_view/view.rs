@@ -611,15 +611,9 @@ impl MarkdownPlugin for ArticleImageMarkdown {
             let language = self.language;
             container = container.child(
                 div()
-                    .w_full()
-                    .max_w_full()
-                    .min_w_0()
-                    .flex()
-                    .justify_center()
-                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .context_menu(move |menu, _, _| {
                         menu.item(
-                            PopupMenuItem::new(crate::ui::i18n::text(language, "Copy"))
+                            PopupMenuItem::new(crate::ui::i18n::text(language, "Copy image"))
                                 .on_click({
                                     let app = menu_app.clone();
                                     let url = url.clone();
