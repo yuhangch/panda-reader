@@ -146,6 +146,33 @@ impl Settings {
                 .child(div().pt_4().pb_2().text_sm().child(owner.t("Secret Access Key")))
                 .child(text_input(&self.volcengine_sk_input).mask_toggle())
             })
+            .when(
+                owner.translator_config.provider == Provider::OpenAiCompatible,
+                |view| {
+                    view.child(div().pt_4().pb_2().text_sm().child(owner.t("API URL")))
+                        .child(text_input(&self.openai_url_input))
+                        .child(div().pt_4().pb_2().text_sm().child(owner.t("API key")))
+                        .child(text_input(&self.openai_key_input).mask_toggle())
+                        .child(div().pt_4().pb_2().text_sm().child(owner.t("Model")))
+                        .child(text_input(&self.openai_model_input))
+                },
+            )
+            .when(owner.translator_config.provider == Provider::Anthropic, |view| {
+                view.child(div().pt_4().pb_2().text_sm().child(owner.t("API URL")))
+                    .child(text_input(&self.anthropic_url_input))
+                    .child(div().pt_4().pb_2().text_sm().child(owner.t("API key")))
+                    .child(text_input(&self.anthropic_key_input).mask_toggle())
+                    .child(div().pt_4().pb_2().text_sm().child(owner.t("Model")))
+                    .child(text_input(&self.anthropic_model_input))
+            })
+            .when(owner.translator_config.provider == Provider::Gemini, |view| {
+                view.child(div().pt_4().pb_2().text_sm().child(owner.t("API URL")))
+                    .child(text_input(&self.gemini_url_input))
+                    .child(div().pt_4().pb_2().text_sm().child(owner.t("API key")))
+                    .child(text_input(&self.gemini_key_input).mask_toggle())
+                    .child(div().pt_4().pb_2().text_sm().child(owner.t("Model")))
+                    .child(text_input(&self.gemini_model_input))
+            })
             .when(owner.translator_config.provider.is_ready(), |view| {
                 view.child(
                     div().pt_4().child(

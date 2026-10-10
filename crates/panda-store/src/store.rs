@@ -1109,16 +1109,20 @@ impl Store {
     pub fn persist_translation(
         &self,
         article_id: i64,
+        expected_content_revision: i64,
         target_lang: &str,
         source_hash: &str,
         translated_html: &str,
         translated_title: Option<&str>,
     ) -> anyhow::Result<()> {
-        self.connection.execute(
+        let updated = self.connection.execute(
             "UPDATE articles SET translated_html=?1, translated_title=?2, translated_lang=?3, translation_source_hash=?4,
-                content_revision=content_revision+1 WHERE id=?5",
-            params![translated_html, translated_title, target_lang, source_hash, article_id],
+                content_revision=content_revision+1 WHERE id=?5 AND content_revision=?6",
+            params![translated_html, translated_title, target_lang, source_hash, article_id, expected_content_revision],
         )?;
+        if updated == 0 {
+            anyhow::bail!("Article content changed while translation was running");
+        }
         sync_article_fts(&self.connection, article_id)?;
         Ok(())
     }

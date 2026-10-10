@@ -26,6 +26,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+pub(super) type TranslationJobKey = (String, i64, String, i64, String, String);
+
 const MAX_PLUGIN_DOWNLOAD_BYTES: usize = 8 * 1024 * 1024;
 const COMMUNITY_PLUGIN_CATALOG_URL: &str = "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/index.json";
 const MAX_PLUGIN_CATALOG_BYTES: usize = 2 * 1024 * 1024;
@@ -167,6 +169,8 @@ impl AppServices {
                         body_cache,
                         title_translation_lock: Arc::new(Mutex::new(())),
                         title_translation_attempted: Arc::new(Mutex::new(HashMap::new())),
+                        translation_jobs: Arc::new(Mutex::new(HashMap::new())),
+                        latest_translation: Arc::new(Mutex::new(HashMap::new())),
                         article_work_cancellations: worker_article_work_cancellations,
                     };
                     loop {
@@ -243,6 +247,15 @@ pub struct WorkerState {
     pub body_cache: Arc<Mutex<RenderCache>>,
     pub title_translation_lock: Arc<Mutex<()>>,
     pub title_translation_attempted: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    pub translation_jobs: Arc<
+        Mutex<
+            HashMap<
+                TranslationJobKey,
+                Vec<oneshot::Sender<Result<panda_core::PreparedArticle, String>>>,
+            >,
+        >,
+    >,
+    pub(super) latest_translation: Arc<Mutex<HashMap<(String, i64), TranslationJobKey>>>,
     pub(super) article_work_cancellations: ArticleWorkCancellations,
 }
 

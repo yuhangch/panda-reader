@@ -74,6 +74,8 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
         Command::Translate {
             id,
             target_lang,
+            content_revision,
+            translator_id,
             translation_layout,
             hide_images,
             paragraph_indent,
@@ -81,6 +83,8 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
         } => super::articles::translate(
             id,
             target_lang,
+            content_revision,
+            translator_id,
             translation_layout,
             hide_images,
             paragraph_indent,

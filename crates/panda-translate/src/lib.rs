@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 mod azure;
+mod llm;
 pub mod html {
     pub use panda_content::html::*;
 }
@@ -15,6 +16,7 @@ pub use html::{
     split_text_for_translate, translate_html_blocks, translation_cache_hash,
     translation_revision_hash,
 };
+pub use llm::{LlmApi, LlmTranslator};
 pub use volcengine::VolcengineTranslator;
 
 pub fn title_source_hash(title: &str) -> String {
@@ -27,14 +29,20 @@ pub enum Provider {
     #[default]
     Azure,
     Volcengine,
+    OpenAiCompatible,
+    Anthropic,
+    Gemini,
     DeepL,
     LibreTranslate,
 }
 
 impl Provider {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 7] = [
         Self::Azure,
         Self::Volcengine,
+        Self::OpenAiCompatible,
+        Self::Anthropic,
+        Self::Gemini,
         Self::DeepL,
         Self::LibreTranslate,
     ];
@@ -43,6 +51,9 @@ impl Provider {
         match self {
             Self::Azure => "azure",
             Self::Volcengine => "volcengine",
+            Self::OpenAiCompatible => "openai-compatible",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
             Self::DeepL => "deepl",
             Self::LibreTranslate => "libretranslate",
         }
@@ -52,13 +63,23 @@ impl Provider {
         match self {
             Self::Azure => "Azure Translator",
             Self::Volcengine => "Volcengine",
+            Self::OpenAiCompatible => "OpenAI-compatible",
+            Self::Anthropic => "Anthropic",
+            Self::Gemini => "Gemini",
             Self::DeepL => "DeepL",
             Self::LibreTranslate => "LibreTranslate",
         }
     }
 
     pub fn is_ready(self) -> bool {
-        matches!(self, Self::Azure | Self::Volcengine)
+        matches!(
+            self,
+            Self::Azure
+                | Self::Volcengine
+                | Self::OpenAiCompatible
+                | Self::Anthropic
+                | Self::Gemini
+        )
     }
 
     pub fn index(self) -> usize {
@@ -77,6 +98,15 @@ pub struct TranslatorConfig {
     pub azure_region: String,
     pub volcengine_access_key: String,
     pub volcengine_secret_key: String,
+    pub openai_url: String,
+    pub openai_key: String,
+    pub openai_model: String,
+    pub anthropic_url: String,
+    pub anthropic_key: String,
+    pub anthropic_model: String,
+    pub gemini_url: String,
+    pub gemini_key: String,
+    pub gemini_model: String,
 }
 
 impl Default for TranslatorConfig {
@@ -87,6 +117,15 @@ impl Default for TranslatorConfig {
             azure_region: "eastasia".into(),
             volcengine_access_key: String::new(),
             volcengine_secret_key: String::new(),
+            openai_url: "https://api.openai.com/v1".into(),
+            openai_key: String::new(),
+            openai_model: "gpt-4.1-mini".into(),
+            anthropic_url: "https://api.anthropic.com/v1".into(),
+            anthropic_key: String::new(),
+            anthropic_model: "claude-haiku-4-5-20251001".into(),
+            gemini_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+            gemini_key: String::new(),
+            gemini_model: "gemini-2.5-flash".into(),
         }
     }
 }
@@ -129,9 +168,56 @@ impl TranslatorConfig {
                 !self.volcengine_access_key.trim().is_empty()
                     && !self.volcengine_secret_key.trim().is_empty()
             }
+            Provider::OpenAiCompatible => {
+                !self.openai_url.trim().is_empty()
+                    && !self.openai_key.trim().is_empty()
+                    && !self.openai_model.trim().is_empty()
+            }
+            Provider::Anthropic => {
+                !self.anthropic_url.trim().is_empty()
+                    && !self.anthropic_key.trim().is_empty()
+                    && !self.anthropic_model.trim().is_empty()
+            }
+            Provider::Gemini => {
+                !self.gemini_url.trim().is_empty()
+                    && !self.gemini_key.trim().is_empty()
+                    && !self.gemini_model.trim().is_empty()
+            }
             Provider::DeepL | Provider::LibreTranslate => false,
         }
     }
+
+    pub fn cache_id(&self) -> String {
+        match self.provider {
+            Provider::Azure => "azure".into(),
+            Provider::Volcengine => "volcengine".into(),
+            Provider::OpenAiCompatible => translation_backend_cache_id(
+                "openai-compatible",
+                &self.openai_url,
+                &self.openai_model,
+            ),
+            Provider::Anthropic => translation_backend_cache_id(
+                "anthropic",
+                &self.anthropic_url,
+                &self.anthropic_model,
+            ),
+            Provider::Gemini => {
+                translation_backend_cache_id("gemini", &self.gemini_url, &self.gemini_model)
+            }
+            Provider::DeepL => "deepl".into(),
+            Provider::LibreTranslate => "libretranslate".into(),
+        }
+    }
+}
+
+pub(crate) fn translation_backend_cache_id(id: &str, url: &str, model: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    hasher.update([0]);
+    hasher.update(url.trim().trim_end_matches('/').as_bytes());
+    hasher.update([0]);
+    hasher.update(model.trim().as_bytes());
+    format!("{id}:{}", hex::encode(hasher.finalize()))
 }
 
 #[derive(Clone, Debug)]
@@ -161,6 +247,9 @@ pub trait Translator: Send + Sync {
 pub enum AnyTranslator {
     Azure(AzureTranslator),
     Volcengine(VolcengineTranslator),
+    OpenAiCompatible(LlmTranslator),
+    Anthropic(LlmTranslator),
+    Gemini(LlmTranslator),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -181,6 +270,9 @@ impl AnyTranslator {
         match self {
             Self::Azure(translator) => translator.id(),
             Self::Volcengine(translator) => translator.id(),
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => translator.id(),
         }
     }
 
@@ -188,6 +280,9 @@ impl AnyTranslator {
         match self {
             Self::Azure(translator) => translator.display_name(),
             Self::Volcengine(translator) => translator.display_name(),
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => translator.display_name(),
         }
     }
 
@@ -195,6 +290,9 @@ impl AnyTranslator {
         match self {
             Self::Azure(translator) => translator.translate(req).await,
             Self::Volcengine(translator) => translator.translate(req).await,
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => translator.translate(req).await,
         }
     }
 
@@ -206,6 +304,19 @@ impl AnyTranslator {
         match self {
             Self::Azure(translator) => translator.translate_titles(titles, target_lang).await,
             Self::Volcengine(translator) => translator.translate_titles(titles, target_lang).await,
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => translator.translate_titles(titles, target_lang).await,
+        }
+    }
+
+    pub fn cache_id(&self) -> String {
+        match self {
+            Self::Azure(_) => "azure".into(),
+            Self::Volcengine(_) => "volcengine".into(),
+            Self::OpenAiCompatible(translator)
+            | Self::Anthropic(translator)
+            | Self::Gemini(translator) => translator.cache_id(),
         }
     }
 }
@@ -219,6 +330,24 @@ pub fn build(config: &TranslatorConfig) -> anyhow::Result<AnyTranslator> {
         Provider::Volcengine => Ok(AnyTranslator::Volcengine(VolcengineTranslator::new(
             config.volcengine_access_key.trim(),
             config.volcengine_secret_key.trim(),
+        )?)),
+        Provider::OpenAiCompatible => Ok(AnyTranslator::OpenAiCompatible(LlmTranslator::new(
+            LlmApi::OpenAiCompatible,
+            &config.openai_url,
+            &config.openai_key,
+            &config.openai_model,
+        )?)),
+        Provider::Anthropic => Ok(AnyTranslator::Anthropic(LlmTranslator::new(
+            LlmApi::Anthropic,
+            &config.anthropic_url,
+            &config.anthropic_key,
+            &config.anthropic_model,
+        )?)),
+        Provider::Gemini => Ok(AnyTranslator::Gemini(LlmTranslator::new(
+            LlmApi::Gemini,
+            &config.gemini_url,
+            &config.gemini_key,
+            &config.gemini_model,
         )?)),
         Provider::DeepL => bail!("DeepL is not available yet"),
         Provider::LibreTranslate => bail!("LibreTranslate is not available yet"),

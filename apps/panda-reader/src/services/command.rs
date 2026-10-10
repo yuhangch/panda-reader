@@ -135,6 +135,8 @@ pub enum Command {
     Translate {
         id: i64,
         target_lang: String,
+        content_revision: i64,
+        translator_id: String,
         translation_layout: TranslationLayout,
         hide_images: bool,
         paragraph_indent: bool,

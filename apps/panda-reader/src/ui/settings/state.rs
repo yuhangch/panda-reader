@@ -34,6 +34,15 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) azure_region_input: Entity<InputState>,
     pub(in crate::ui) volcengine_ak_input: Entity<InputState>,
     pub(in crate::ui) volcengine_sk_input: Entity<InputState>,
+    pub(in crate::ui) openai_url_input: Entity<InputState>,
+    pub(in crate::ui) openai_key_input: Entity<InputState>,
+    pub(in crate::ui) openai_model_input: Entity<InputState>,
+    pub(in crate::ui) anthropic_url_input: Entity<InputState>,
+    pub(in crate::ui) anthropic_key_input: Entity<InputState>,
+    pub(in crate::ui) anthropic_model_input: Entity<InputState>,
+    pub(in crate::ui) gemini_url_input: Entity<InputState>,
+    pub(in crate::ui) gemini_key_input: Entity<InputState>,
+    pub(in crate::ui) gemini_model_input: Entity<InputState>,
     pub(in crate::ui) plugin_path_input: Entity<InputState>,
     pub(in crate::ui) plugins: Vec<PluginSummary>,
     pub(in crate::ui) plugins_checked: bool,
@@ -158,6 +167,54 @@ impl Settings {
                 .placeholder("Secret Access Key")
                 .masked(true)
                 .default_value(translator_config.volcengine_secret_key.as_str())
+        });
+        let openai_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://api.openai.com/v1")
+                .default_value(translator_config.openai_url.as_str())
+        });
+        let openai_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("API key")
+                .masked(true)
+                .default_value(translator_config.openai_key.as_str())
+        });
+        let openai_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("gpt-4.1-mini")
+                .default_value(translator_config.openai_model.as_str())
+        });
+        let anthropic_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://api.anthropic.com/v1")
+                .default_value(translator_config.anthropic_url.as_str())
+        });
+        let anthropic_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("API key")
+                .masked(true)
+                .default_value(translator_config.anthropic_key.as_str())
+        });
+        let anthropic_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("claude-haiku-4-5-20251001")
+                .default_value(translator_config.anthropic_model.as_str())
+        });
+        let gemini_url_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://generativelanguage.googleapis.com/v1beta")
+                .default_value(translator_config.gemini_url.as_str())
+        });
+        let gemini_key_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("API key")
+                .masked(true)
+                .default_value(translator_config.gemini_key.as_str())
+        });
+        let gemini_model_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("gemini-2.5-flash")
+                .default_value(translator_config.gemini_model.as_str())
         });
         let plugin_path_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Plugin folder, ZIP path, or HTTPS ZIP URL")
@@ -293,6 +350,15 @@ impl Settings {
             azure_region_input,
             volcengine_ak_input,
             volcengine_sk_input,
+            openai_url_input,
+            openai_key_input,
+            openai_model_input,
+            anthropic_url_input,
+            anthropic_key_input,
+            anthropic_model_input,
+            gemini_url_input,
+            gemini_key_input,
+            gemini_model_input,
             plugin_path_input,
             plugins: Vec::new(),
             plugins_checked: false,

@@ -493,7 +493,7 @@ impl ReaderWindow {
         if self.reader.has_translation_for_ui(
             article,
             &self.preferences,
-            self.translator_config.provider.id(),
+            &self.translator_config.cache_id(),
         ) {
             self.reader.showing_translation = true;
             self.request_prepared_body(cx);
@@ -510,6 +510,8 @@ impl ReaderWindow {
             return;
         }
         let target_lang = self.translation_target_code().to_owned();
+        let content_revision = article.content_revision;
+        let translator_id = self.translator_config.cache_id();
         let translation_layout = self.preferences.translation_layout;
         let hide_images = self.preferences.hide_images;
         let paragraph_indent = self.preferences.paragraph_indent;
@@ -518,6 +520,8 @@ impl ReaderWindow {
         self.services.send(Command::Translate {
             id,
             target_lang,
+            content_revision,
+            translator_id,
             translation_layout,
             hide_images,
             paragraph_indent,

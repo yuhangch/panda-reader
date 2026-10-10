@@ -209,6 +209,37 @@ impl ReaderWindow {
         self.settings
             .volcengine_sk_input
             .update(cx, |input, cx| input.set_value("", window, cx));
+        self.settings.openai_url_input.update(cx, |input, cx| {
+            input.set_value("https://api.openai.com/v1", window, cx)
+        });
+        self.settings
+            .openai_key_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.settings
+            .openai_model_input
+            .update(cx, |input, cx| input.set_value("gpt-4.1-mini", window, cx));
+        self.settings.anthropic_url_input.update(cx, |input, cx| {
+            input.set_value("https://api.anthropic.com/v1", window, cx)
+        });
+        self.settings
+            .anthropic_key_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.settings.anthropic_model_input.update(cx, |input, cx| {
+            input.set_value("claude-haiku-4-5-20251001", window, cx)
+        });
+        self.settings.gemini_url_input.update(cx, |input, cx| {
+            input.set_value(
+                "https://generativelanguage.googleapis.com/v1beta",
+                window,
+                cx,
+            )
+        });
+        self.settings
+            .gemini_key_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.settings.gemini_model_input.update(cx, |input, cx| {
+            input.set_value("gemini-2.5-flash", window, cx)
+        });
 
         theme::apply_theme(&self.preferences.theme, cx);
         self.services
@@ -243,6 +274,44 @@ impl ReaderWindow {
         self.translator_config.volcengine_secret_key = self
             .settings
             .volcengine_sk_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.translator_config.openai_url =
+            self.settings.openai_url_input.read(cx).value().to_string();
+        self.translator_config.openai_key =
+            self.settings.openai_key_input.read(cx).value().to_string();
+        self.translator_config.openai_model = self
+            .settings
+            .openai_model_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.translator_config.anthropic_url = self
+            .settings
+            .anthropic_url_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.translator_config.anthropic_key = self
+            .settings
+            .anthropic_key_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.translator_config.anthropic_model = self
+            .settings
+            .anthropic_model_input
+            .read(cx)
+            .value()
+            .to_string();
+        self.translator_config.gemini_url =
+            self.settings.gemini_url_input.read(cx).value().to_string();
+        self.translator_config.gemini_key =
+            self.settings.gemini_key_input.read(cx).value().to_string();
+        self.translator_config.gemini_model = self
+            .settings
+            .gemini_model_input
             .read(cx)
             .value()
             .to_string();

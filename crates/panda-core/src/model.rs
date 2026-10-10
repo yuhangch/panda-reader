@@ -193,7 +193,7 @@ pub enum Scope {
     Folder(String),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkField {
     Read,
     Starred,

@@ -88,9 +88,12 @@ pub(in crate::ui) struct TranslatorProvider {
 }
 
 impl TranslatorProvider {
-    const PROVIDERS: [Provider; 4] = [
+    const PROVIDERS: [Provider; 7] = [
         Provider::Azure,
         Provider::Volcengine,
+        Provider::OpenAiCompatible,
+        Provider::Anthropic,
+        Provider::Gemini,
         Provider::DeepL,
         Provider::LibreTranslate,
     ];
