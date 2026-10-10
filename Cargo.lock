@@ -5675,6 +5675,7 @@ dependencies = [
  "gpui-pre-reqwest-client",
  "image",
  "libc",
+ "markdown",
  "panda-content",
  "panda-core",
  "panda-miniflux",

@@ -113,8 +113,8 @@ impl RenderCache {
         // whitespace, monospace styling, and block layout.
         let markdown_source = preserve_figure_boundaries(&html);
         let markdown = quick_html2md::html_to_markdown(&markdown_source);
+        let (markdown, image_urls) = process_markdown_images(markdown);
         let markdown = wrap_translation_markdown(&markdown);
-        let (markdown, image_urls) = add_image_view_links(&markdown_source, markdown);
         let markdown = if options.paragraph_indent {
             indent_markdown_paragraphs(&markdown)
         } else {
@@ -259,47 +259,75 @@ fn preserve_figure_boundaries(html: &str) -> String {
         .replace("</figcaption>", "</figcaption>\n\n")
 }
 
-fn add_image_view_links(source_html: &str, markdown: String) -> (String, Vec<String>) {
-    let fragment = scraper::Html::parse_fragment(source_html);
-    let Ok(selector) = scraper::Selector::parse("img[src]") else {
+/// Turn Markdown image nodes into reader image blocks before translation
+/// sections are wrapped in their own Markdown fence. This is a built-in
+/// rendering step: feed and site-specific plugins should not need to repair
+/// ordinary Markdown image syntax or linked-image wrappers.
+fn process_markdown_images(markdown: String) -> (String, Vec<String>) {
+    let Ok(tree) = markdown::to_mdast(&markdown, &markdown::ParseOptions::default()) else {
         return (markdown, Vec::new());
     };
-    let mut markdown = markdown;
-    let mut cursor = 0;
-    let mut image_urls = Vec::new();
+    let mut replacements = Vec::new();
+    collect_markdown_images(&tree, &mut replacements);
+    replacements.sort_by_key(|replacement| replacement.range.start);
 
-    for image in fragment.select(&selector) {
-        let Some(src) = image.value().attr("src") else {
-            continue;
-        };
-
-        let Some(relative_start) = markdown[cursor..].find("![") else {
-            continue;
-        };
-        let start = cursor + relative_start;
-        let Some(label_end_relative) = markdown[start..].find("](") else {
-            continue;
-        };
-        let url_start = start + label_end_relative + 2;
-        let Some(url_end_relative) = markdown[url_start..].find(')') else {
-            continue;
-        };
-        let end = url_start + url_end_relative + 1;
-        let image_index = image_urls.len();
-        image_urls.push(src.to_owned());
-        let alt = image
-            .value()
-            .attr("alt")
-            .unwrap_or_default()
-            .replace('\n', " ");
-        let replacement = format!(
-            "\n\n{IMAGE_FENCE}panda-reader-image\npanda-image:{image_index}\n{alt}\n{IMAGE_FENCE}\n\n"
+    let mut image_urls = Vec::with_capacity(replacements.len());
+    let mut output = markdown;
+    for (index, replacement) in replacements.iter().enumerate().rev() {
+        image_urls.push((index, replacement.url.clone()));
+        let alt = replacement.alt.replace(['\r', '\n'], " ");
+        let block = format!(
+            "\n\n{IMAGE_FENCE}panda-reader-image\npanda-image:{index}\n{alt}\n{IMAGE_FENCE}\n\n"
         );
-        markdown.replace_range(start..end, &replacement);
-        cursor = start + replacement.len();
+        output.replace_range(replacement.range.clone(), &block);
+    }
+    image_urls.sort_by_key(|(index, _)| *index);
+    (output, image_urls.into_iter().map(|(_, url)| url).collect())
+}
+
+struct MarkdownImageReplacement {
+    range: std::ops::Range<usize>,
+    url: String,
+    alt: String,
+}
+
+fn collect_markdown_images(
+    node: &markdown::mdast::Node,
+    replacements: &mut Vec<MarkdownImageReplacement>,
+) {
+    use markdown::mdast::Node;
+
+    // HTML-to-Markdown represents a linked image as [![alt](image)](link).
+    // Replace the complete link so its Markdown brackets do not leak into
+    // the article as visible punctuation after the image becomes a block.
+    if let Node::Link(link) = node
+        && let [Node::Image(image)] = link.children.as_slice()
+        && let Some(position) = node.position()
+    {
+        replacements.push(MarkdownImageReplacement {
+            range: position.start.offset..position.end.offset,
+            url: image.url.clone(),
+            alt: image.alt.clone(),
+        });
+        return;
     }
 
-    (markdown, image_urls)
+    if let Node::Image(image) = node
+        && let Some(position) = node.position()
+    {
+        replacements.push(MarkdownImageReplacement {
+            range: position.start.offset..position.end.offset,
+            url: image.url.clone(),
+            alt: image.alt.clone(),
+        });
+        return;
+    }
+
+    if let Some(children) = node.children() {
+        for child in children {
+            collect_markdown_images(child, replacements);
+        }
+    }
 }
 
 const IMAGE_FENCE: &str = "````````````````";

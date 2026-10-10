@@ -22,6 +22,10 @@ const API_VERSION: u32 = 1;
 const MAX_PLUGIN_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PLUGIN_ARCHIVE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PLUGIN_ARCHIVE_ENTRIES: usize = 64;
+const BUILTIN_WIKI_CATEAT_MANIFEST: &str =
+    include_str!("../../../plugins/builtin.wiki-cateat/manifest.toml");
+const BUILTIN_WIKI_CATEAT_RULES: &str =
+    include_str!("../../../plugins/builtin.wiki-cateat/rules.toml");
 
 #[derive(Clone, Debug)]
 pub struct PluginSummary {
@@ -148,7 +152,9 @@ impl PluginRegistry {
     pub fn load(root: &Path, settings: &PluginSettings, generation: u64) -> Self {
         let mut registry = Self {
             generation,
-            plugins: Vec::new(),
+            plugins: vec![load_builtin_wiki_cateat(
+                !settings.disabled.contains("builtin.wiki-cateat"),
+            )],
             diagnostics: Vec::new(),
             runtime_errors: Mutex::new(HashMap::new()),
         };
@@ -549,6 +555,30 @@ impl PluginRegistry {
             fs::remove_dir_all(directory)?;
         }
         Ok(())
+    }
+}
+
+fn load_builtin_wiki_cateat(enabled: bool) -> PluginEntry {
+    let manifest: PluginManifest = toml::from_str(BUILTIN_WIKI_CATEAT_MANIFEST)
+        .expect("bundled wiki.cateat plugin manifest is valid");
+    let rules: RuleSet = toml::from_str(BUILTIN_WIKI_CATEAT_RULES)
+        .expect("bundled wiki.cateat plugin rules are valid");
+    rules
+        .validate()
+        .expect("bundled wiki.cateat plugin rules pass validation");
+    let mut hasher = Sha256::new();
+    hasher.update(BUILTIN_WIKI_CATEAT_MANIFEST.as_bytes());
+    hasher.update(BUILTIN_WIKI_CATEAT_RULES.as_bytes());
+    PluginEntry {
+        summary: PluginSummary {
+            manifest,
+            enabled,
+            bundled: true,
+            content_hash: hex::encode(hasher.finalize()),
+            last_error: None,
+        },
+        rules: Some(rules),
+        wasm: None,
     }
 }
 

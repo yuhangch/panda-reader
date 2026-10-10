@@ -43,6 +43,7 @@ pub enum RuleAction {
         selector: String,
         name: String,
     },
+    UnwrapImageLinks,
     LazyImages {
         attributes: Vec<String>,
     },
@@ -248,6 +249,38 @@ impl ArticleDocument {
         Ok(())
     }
 
+    fn unwrap_image_links(&mut self) -> anyhow::Result<()> {
+        let selector = Selector::parse("a").expect("static selector is valid");
+        let replacements = self
+            .html
+            .select(&selector)
+            .filter_map(|anchor| {
+                let mut has_image = false;
+                for child in anchor.children() {
+                    match child.value() {
+                        Node::Text(text) if text.trim().is_empty() => {}
+                        Node::Element(element) if element.name() == "img" => has_image = true,
+                        _ => return None,
+                    }
+                }
+                has_image.then(|| (anchor.html(), anchor.inner_html()))
+            })
+            .collect::<Vec<_>>();
+        if replacements.is_empty() {
+            return Ok(());
+        }
+
+        let mut html = self.html.html();
+        for (anchor, contents) in replacements {
+            html = html.replacen(&anchor, &contents, 1);
+        }
+        self.html = Html::parse_document(&html);
+        self.handles.clear();
+        self.invalid.clear();
+        self.modified = true;
+        Ok(())
+    }
+
     pub fn select_body(&mut self, handle: u32) -> anyhow::Result<()> {
         let body = self.html(handle)?;
         let element = Html::parse_fragment(&body);
@@ -304,7 +337,7 @@ impl RuleSet {
                 | RuleAction::RemoveTextContains { selector, .. }
                 | RuleAction::SetAttribute { selector, .. }
                 | RuleAction::RemoveAttribute { selector, .. } => Some(selector.as_str()),
-                RuleAction::LazyImages { .. } => None,
+                RuleAction::UnwrapImageLinks | RuleAction::LazyImages { .. } => None,
             };
             if let Some(selector) = selector {
                 Selector::parse(selector).map_err(|error| {
@@ -324,6 +357,7 @@ impl RuleSet {
                 | RuleAction::Remove { .. }
                 | RuleAction::RemoveText { .. }
                 | RuleAction::RemoveTextContains { .. } => None,
+                RuleAction::UnwrapImageLinks => None,
             };
             if let Some(attribute) = attribute {
                 validate_attribute_name(attribute)?;
@@ -415,6 +449,7 @@ pub fn apply_rules(document: &mut ArticleDocument, rules: &RuleSet) -> anyhow::R
                     document.set_attribute(handle, name, None)?;
                 }
             }
+            RuleAction::UnwrapImageLinks => document.unwrap_image_links()?,
             RuleAction::LazyImages { attributes } => {
                 for handle in document.query("img")? {
                     if document.attribute(handle, "src")?.is_some() {

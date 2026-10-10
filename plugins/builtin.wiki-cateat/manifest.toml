@@ -1,0 +1,9 @@
+id = "builtin.wiki-cateat"
+name = "Wiki.Cateat image cleanup"
+version = "1.0.0"
+api_version = 1
+kind = "rules"
+domains = ["wiki.cateat.fish"]
+stage = "cleanup"
+priority = 100
+capabilities = ["document_read", "document_write"]

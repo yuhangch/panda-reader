@@ -36,6 +36,7 @@ scraper.workspace = true
 resvg = "=0.45.1"
 qrcodegen = "1.8"
 quick_html2md.workspace = true
+markdown.workspace = true
 rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
