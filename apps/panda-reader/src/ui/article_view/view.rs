@@ -235,8 +235,17 @@ impl ArticleView {
                 color: Some(cx.theme().foreground),
                 ..Default::default()
             });
+            // Immersive translation places a translated block after each
+            // source block, so the normal paragraph gap looks doubled there.
+            let paragraph_gap = if self.showing_translation
+                && owner.preferences.translation_layout == TranslationLayout::Immersive
+            {
+                owner.preferences.reader_paragraph_spacing * 0.45
+            } else {
+                owner.preferences.reader_paragraph_spacing
+            };
             article_style = article_style
-                .paragraph_gap(rems(owner.preferences.reader_paragraph_spacing))
+                .paragraph_gap(rems(paragraph_gap))
                 .heading_font_size(|level, base| match level {
                     1 => base * 1.4,
                     2 => base * 1.22,
