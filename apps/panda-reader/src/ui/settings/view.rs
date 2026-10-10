@@ -16,6 +16,7 @@ impl Settings {
     ) -> impl IntoElement {
         let page = match self.page {
             SettingsPage::General => self.render_general_settings(owner, cx).into_any_element(),
+            SettingsPage::Developer => self.render_developer_settings(owner, cx).into_any_element(),
             SettingsPage::Appearance => self
                 .render_appearance_settings(owner, cx)
                 .into_any_element(),
@@ -119,6 +120,14 @@ impl Settings {
                                 "Plugins",
                                 bundled_icon(BundledIcon::Plugins),
                                 SettingsPage::Plugins,
+                                cx,
+                            ))
+                            .child(self.settings_nav_row(
+                                owner,
+                                "settings-developer",
+                                "Developer",
+                                Icon::new(IconName::Settings),
+                                SettingsPage::Developer,
                                 cx,
                             ))
                             .child(self.settings_nav_row(

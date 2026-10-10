@@ -14,7 +14,7 @@ use panda_providers::ProviderSettingsMap;
 use panda_translate::TranslatorConfig;
 use std::sync::Arc;
 
-use super::selectors::{LanguageOption, SettingsPage, TranslatorProvider};
+use super::selectors::{LanguageOption, LogRetentionOption, SettingsPage, TranslatorProvider};
 
 pub(in crate::ui) struct Settings {
     _subscriptions: Vec<Subscription>,
@@ -28,6 +28,7 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) translation_language_select:
         Entity<SelectState<SearchableVec<LanguageOption>>>,
     pub(in crate::ui) provider_select: Entity<SelectState<SearchableVec<TranslatorProvider>>>,
+    pub(in crate::ui) log_retention_select: Entity<SelectState<SearchableVec<LogRetentionOption>>>,
     pub(in crate::ui) upstream_select: Entity<SelectState<SearchableVec<LibrarySource>>>,
     pub(in crate::ui) azure_key_input: Entity<InputState>,
     pub(in crate::ui) azure_region_input: Entity<InputState>,
@@ -126,6 +127,16 @@ impl Settings {
                 cx,
             )
         });
+        let log_retention_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(LogRetentionOption::all(preferences.language)),
+                Some(IndexPath::new(LogRetentionOption::index(
+                    preferences.sync_log_retention_days,
+                ))),
+                window,
+                cx,
+            )
+        });
         let azure_key_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Azure Translator key")
@@ -206,6 +217,18 @@ impl Settings {
             }),
         );
         _subscriptions.push(cx.subscribe_in(
+            &log_retention_select,
+            window,
+            |this, _, event, _, cx| {
+                if let SelectEvent::Confirm(Some(days)) = event {
+                    this.preferences.sync_log_retention_days = *days;
+                    this.services.set_log_retention_days(*days);
+                    this.save_preferences();
+                    cx.notify();
+                }
+            },
+        ));
+        _subscriptions.push(cx.subscribe_in(
             &upstream_select,
             window,
             |this, _, event, window, cx| {
@@ -264,6 +287,7 @@ impl Settings {
             language_select,
             translation_language_select,
             provider_select,
+            log_retention_select,
             upstream_select,
             azure_key_input,
             azure_region_input,

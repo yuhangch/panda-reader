@@ -8,7 +8,7 @@ use gpui_kit::*;
 use panda_core::Scope;
 use panda_translate::TranslatorConfig;
 
-use super::selectors::{LanguageOption, TranslatorProvider};
+use super::selectors::{LanguageOption, LogRetentionOption, TranslatorProvider};
 
 #[derive(Clone, Copy)]
 pub(super) enum ReaderSetting {
@@ -120,6 +120,9 @@ impl ReaderWindow {
 
     pub(in crate::ui) fn reset_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preferences = Preferences::default();
+        self.services.set_detailed_sync_logging(false);
+        self.services
+            .set_log_retention_days(self.preferences.sync_log_retention_days);
         self.settings.library_source = self.preferences.library_source;
         self.translator_config = TranslatorConfig::default();
         self.settings.pending_reset_settings = false;
@@ -160,6 +163,20 @@ impl ReaderWindow {
                 window,
                 cx,
             )
+        });
+        self.settings.log_retention_select.update(cx, |select, cx| {
+            select.set_items(
+                SearchableVec::new(LogRetentionOption::all(self.preferences.language)),
+                window,
+                cx,
+            );
+            select.set_selected_index(
+                Some(IndexPath::new(LogRetentionOption::index(
+                    self.preferences.sync_log_retention_days,
+                ))),
+                window,
+                cx,
+            );
         });
 
         self.settings.add_input.update(cx, |input, cx| {
@@ -282,6 +299,17 @@ impl ReaderWindow {
                 cx,
             );
             select.set_selected_index(Some(selected), window, cx);
+        });
+        let retention_index = IndexPath::new(LogRetentionOption::index(
+            self.preferences.sync_log_retention_days,
+        ));
+        self.settings.log_retention_select.update(cx, |select, cx| {
+            select.set_items(
+                SearchableVec::new(LogRetentionOption::all(language)),
+                window,
+                cx,
+            );
+            select.set_selected_index(Some(retention_index), window, cx);
         });
         self.save_preferences();
         cx.notify();

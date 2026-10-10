@@ -10,6 +10,40 @@ pub(in crate::ui) struct LanguageOption {
     interface_language: Language,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct LogRetentionOption {
+    days: u16,
+    language: Language,
+}
+
+impl LogRetentionOption {
+    pub(in crate::ui) fn all(language: Language) -> Vec<Self> {
+        [7, 30, 90]
+            .into_iter()
+            .map(|days| Self { days, language })
+            .collect()
+    }
+
+    pub(in crate::ui) fn index(days: u16) -> usize {
+        [7, 30, 90]
+            .iter()
+            .position(|option| *option == days)
+            .unwrap_or(1)
+    }
+}
+
+impl SearchableListItem for LogRetentionOption {
+    type Value = u16;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(i18n::format(self.language, "{} days", self.days))
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.days
+    }
+}
+
 impl LanguageOption {
     pub(in crate::ui) fn all(interface_language: Language) -> Vec<Self> {
         Language::ALL
@@ -100,5 +134,6 @@ pub(in crate::ui) enum SettingsPage {
     Reading,
     Translation,
     Plugins,
+    Developer,
     About,
 }
