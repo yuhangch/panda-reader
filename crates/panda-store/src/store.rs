@@ -1177,34 +1177,39 @@ impl Store {
             "SELECT a.id, a.remote_id FROM articles a JOIN feeds f ON f.id=a.feed_id
              WHERE f.workspace=? AND a.is_read=0 AND {filter}"
         );
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows: Vec<(i64, Option<i64>)> = match bind {
-            ScopeBind::FeedId(feed_id) => statement
-                .query_map(params![self.workspace, feed_id], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?,
-            ScopeBind::Folder(folder) => statement
-                .query_map(params![self.workspace, folder], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?
-                .collect::<Result<Vec<_>, _>>()?,
-            ScopeBind::None => statement
-                .query_map([&self.workspace], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .collect::<Result<Vec<_>, _>>()?,
+        // Keep the article updates and their pending provider marks in one transaction.
+        // A folder can contain thousands of rows, and autocommitting each row is expensive.
+        let transaction = self.connection.unchecked_transaction()?;
+        let rows: Vec<(i64, Option<i64>)> = {
+            let mut statement = transaction.prepare(&sql)?;
+            match bind {
+                ScopeBind::FeedId(feed_id) => statement
+                    .query_map(params![self.workspace, feed_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                ScopeBind::Folder(folder) => statement
+                    .query_map(params![self.workspace, folder], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+                ScopeBind::None => statement
+                    .query_map([&self.workspace], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
         };
         let count = rows.len();
         for (id, remote_id) in rows {
-            self.connection
-                .execute("UPDATE articles SET is_read=1 WHERE id=?1", [id])?;
+            transaction.execute("UPDATE articles SET is_read=1 WHERE id=?1", [id])?;
             if let Some(remote_id) = remote_id {
-                self.connection.execute(
+                transaction.execute(
                     "INSERT INTO pending_remote_marks(workspace,remote_id,field,value,revision) VALUES(?1,?2,'is_read',1,1)
                      ON CONFLICT(workspace,remote_id,field) DO UPDATE SET value=excluded.value,revision=pending_remote_marks.revision+1",
                     params![self.workspace, remote_id],
                 )?;
             }
         }
+        transaction.commit()?;
         Ok(count)
     }
 

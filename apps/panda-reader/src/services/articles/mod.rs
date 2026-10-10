@@ -221,13 +221,12 @@ pub(super) fn mark_all_read(
     let provider = state.provider_kind();
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
-    job(reply, move |runtime| {
+    job(reply, move |_| {
         let count = database.write(workspace.clone(), move |store| {
             store.mark_all_read(scope).map_err(Into::into)
         })?;
         if let (Some(kind), Some(config)) = (provider, config) {
-            let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
-            runtime.block_on(flush_remote_marks(&path, &workspace, &database, &remote))?;
+            queue_remote_mark_flush(path, workspace, database, kind, config);
         }
         Ok(count)
     });
@@ -245,7 +244,7 @@ pub(super) fn mark(
     let provider = state.provider_kind();
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
-    job(reply, move |runtime| {
+    job(reply, move |_| {
         let remote_id = database.write(workspace.clone(), move |store| {
             let remote_id = store.remote_entry_id(id)?;
             store.mark(id, field, value)?;
@@ -255,10 +254,32 @@ pub(super) fn mark(
             && !matches!(field, MarkField::Later)
             && let (Some(kind), Some(config)) = (provider, config)
         {
-            let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
-            runtime.block_on(flush_remote_marks(&path, &workspace, &database, &remote))?;
+            queue_remote_mark_flush(path, workspace, database, kind, config);
         }
         Ok(())
+    });
+}
+
+fn queue_remote_mark_flush(
+    path: std::path::PathBuf,
+    workspace: String,
+    database: DbWriter,
+    kind: panda_providers::ProviderKind,
+    config: panda_providers::ProviderSettings,
+) {
+    // Local read state is already committed; remote sync must not hold the UI response open.
+    let (reply, _result) = oneshot::channel();
+    job(reply, move |runtime| {
+        let result = match ProviderClient::new(kind, &config) {
+            Ok(remote) => {
+                runtime.block_on(flush_remote_marks(&path, &workspace, &database, &remote))
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &result {
+            eprintln!("could not sync article read state to {kind:?}: {error}");
+        }
+        result
     });
 }
 

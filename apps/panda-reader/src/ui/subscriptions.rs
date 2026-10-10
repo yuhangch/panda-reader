@@ -182,6 +182,7 @@ impl ReaderWindow {
         self.services.send(Command::Refresh { force, reply });
         self.sidebar.is_refreshing = true;
         self.set_busy(self.t("Syncing…"));
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let mut response = response;
             let result = loop {
