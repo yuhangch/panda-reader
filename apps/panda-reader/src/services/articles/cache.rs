@@ -201,32 +201,53 @@ fn body_size(body: &RenderDocument) -> usize {
 fn wrap_translation_markdown(markdown: &str) -> String {
     const FENCE: &str = "````````````panda-translation";
     let mut output = String::with_capacity(markdown.len());
-    for line in markdown.lines() {
-        match line.trim() {
-            TRANSLATION_MARKER_START => {
-                while output.ends_with('\n') && !output.ends_with("\n\n") {
-                    output.push('\n');
-                }
-                if !output.is_empty() && !output.ends_with("\n\n") {
-                    output.push_str("\n\n");
-                }
-                output.push_str(FENCE);
+    let mut rest = markdown;
+    let mut in_translation = false;
+
+    loop {
+        let next_start = rest
+            .find(TRANSLATION_MARKER_START)
+            .map(|index| (index, TRANSLATION_MARKER_START, true));
+        let next_end = rest
+            .find(TRANSLATION_MARKER_END)
+            .map(|index| (index, TRANSLATION_MARKER_END, false));
+        let next = match (next_start, next_end) {
+            (Some(start), Some(end)) => Some(if start.0 <= end.0 { start } else { end }),
+            (Some(marker), None) | (None, Some(marker)) => Some(marker),
+            (None, None) => None,
+        };
+        let Some((index, marker, is_start)) = next else {
+            output.push_str(rest);
+            break;
+        };
+
+        output.push_str(&rest[..index]);
+        rest = &rest[index + marker.len()..];
+        if is_start && !in_translation {
+            while output.ends_with('\n') && !output.ends_with("\n\n") {
                 output.push('\n');
             }
-            TRANSLATION_MARKER_END => {
-                while output.ends_with('\n') && !output.ends_with("\n\n") {
-                    output.pop();
-                }
-                if !output.ends_with('\n') {
-                    output.push('\n');
-                }
-                output.push_str("````````````\n\n");
+            if !output.is_empty() && !output.ends_with("\n\n") {
+                output.push_str("\n\n");
             }
-            _ => {
-                output.push_str(line);
-                output.push('\n');
+            output.push_str(FENCE);
+            output.push('\n');
+            in_translation = true;
+        } else if !is_start && in_translation {
+            while output.ends_with('\n') {
+                output.pop();
             }
+            output.push_str("\n````````````\n\n");
+            in_translation = false;
         }
+    }
+
+    // Do not leak an opening fence if malformed article HTML omitted the end marker.
+    if in_translation {
+        while output.ends_with('\n') {
+            output.pop();
+        }
+        output.push_str("\n````````````\n");
     }
     output
 }
@@ -548,5 +569,20 @@ mod tests {
         assert!(prepared.markdown.contains("```"));
         assert!(prepared.markdown.contains("    println!(\"hello\");"));
         assert!(prepared.markdown.contains("fn main() {\n"));
+    }
+
+    #[test]
+    fn translation_markers_are_hidden_when_html_conversion_joins_them_to_text() {
+        let markdown = format!(
+            "### Orchestration of Finite State Machines\n{}### 有限状态机的编排{}",
+            TRANSLATION_MARKER_START, TRANSLATION_MARKER_END
+        );
+
+        let wrapped = wrap_translation_markdown(&markdown);
+
+        assert!(!wrapped.contains(TRANSLATION_MARKER_START));
+        assert!(!wrapped.contains(TRANSLATION_MARKER_END));
+        assert!(wrapped.contains("````````````panda-translation"));
+        assert!(wrapped.contains("### 有限状态机的编排"));
     }
 }
