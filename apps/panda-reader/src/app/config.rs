@@ -18,6 +18,9 @@ pub(super) struct AppConfig {
 }
 
 fn data_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("PANDA_READER_DATA_DIR").filter(|path| !path.is_empty()) {
+        return PathBuf::from(path);
+    }
     ProjectDirs::from("com", "PandaReader", "PandaReader")
         .map(|dirs| dirs.data_local_dir().to_path_buf())
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("data"))
