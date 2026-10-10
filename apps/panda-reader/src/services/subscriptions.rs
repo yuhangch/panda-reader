@@ -14,13 +14,22 @@ pub(super) fn add_feed(
     let provider = state.provider_kind();
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
+    let detailed_logging = state.detailed_sync_logging.clone();
     job(reply, move |runtime| {
         if let (Some(kind), Some(config)) = (provider, config) {
             let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
             runtime
                 .block_on(remote.add_feed(&url))
                 .map_err(|e| e.to_string())?;
-            super::sync::sync_provider(&path, &workspace, &database, &remote, kind, runtime)?;
+            super::sync::sync_provider(
+                &path,
+                &workspace,
+                &database,
+                &remote,
+                kind,
+                &detailed_logging,
+                runtime,
+            )?;
         } else if provider.is_some() {
             return Err("Connect the selected provider before adding feeds".into());
         } else {
@@ -125,13 +134,22 @@ pub(super) fn import_opml(
     let provider = state.provider_kind();
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
+    let detailed_logging = state.detailed_sync_logging.clone();
     job(reply, move |runtime| {
         if let (Some(kind), Some(config)) = (provider, config) {
             let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
             runtime
                 .block_on(remote.import_opml(&content))
                 .map_err(|e| e.to_string())?;
-            super::sync::sync_provider(&path, &workspace, &database, &remote, kind, runtime)
+            super::sync::sync_provider(
+                &path,
+                &workspace,
+                &database,
+                &remote,
+                kind,
+                &detailed_logging,
+                runtime,
+            )
         } else if provider.is_some() {
             Err("Connect the selected provider before importing subscriptions".into())
         } else {

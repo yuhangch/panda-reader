@@ -1,33 +1,23 @@
 use super::articles::cache::RenderCache;
 use super::database::DbWriter;
+use super::diagnostics::{LogDetail, write_sync_log};
 use super::worker::{WorkerState, job};
 use panda_providers::{ProviderClient, ProviderKind, SyncMode};
 use panda_store::{PendingRemoteMark, Store};
-use std::fs::OpenOptions;
-use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
-fn sync_log(database_path: &Path, level: &str, message: impl AsRef<str>) {
-    let line = format!(
-        "{} [{level}] {}\n",
-        chrono::Utc::now().to_rfc3339(),
-        message.as_ref()
-    );
-    eprint!("{line}");
-    let Some(parent) = database_path.parent() else {
-        return;
-    };
-    let result = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(parent.join("sync.log"))
-        .and_then(|mut file| file.write_all(line.as_bytes()));
-    if let Err(error) = result {
-        eprintln!("[ERROR] could not write sync.log: {error}");
-    }
+fn sync_log(
+    database_path: &Path,
+    detailed_logging: &AtomicBool,
+    detail: LogDetail,
+    level: &str,
+    message: impl AsRef<str>,
+) {
+    write_sync_log(database_path, detailed_logging, detail, level, message);
 }
 
 pub(super) fn refresh_feed(
@@ -40,63 +30,120 @@ pub(super) fn refresh_feed(
     let provider = state.provider_kind();
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
+    let detailed_logging = state.detailed_sync_logging.clone();
     job(reply, move |runtime| {
-        if let (Some(kind), Some(config)) = (provider, config) {
-            let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
-            let input = Store::open_read_workspace(&path, &workspace)
-                .and_then(|store| store.remote_feed_id(id))
-                .map_err(|e| e.to_string())?
-                .ok_or_else(|| "Provider feed has no remote ID".to_owned())?;
-            let started = Instant::now();
-            if let Err(error) = runtime.block_on(remote.refresh_feed(input)) {
-                let message = format!("{} single-feed refresh failed: {error:#}", kind.key());
-                sync_log(&path, "ERROR", &message);
-                return Err(message);
+        let started = Instant::now();
+        let result = (|| {
+            if let (Some(kind), Some(config)) = (provider, config) {
+                let remote = match ProviderClient::new(kind, &config) {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        let message = format!("{} provider setup failed: {error:#}", kind.key());
+                        sync_log(
+                            &path,
+                            &detailed_logging,
+                            LogDetail::Summary,
+                            "ERROR",
+                            &message,
+                        );
+                        return Err(message);
+                    }
+                };
+                let input = Store::open_read_workspace(&path, &workspace)
+                    .and_then(|store| store.remote_feed_id(id))
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Provider feed has no remote ID".to_owned())?;
+                let started = Instant::now();
+                if let Err(error) = runtime.block_on(remote.refresh_feed(input)) {
+                    let message = format!("{} single-feed refresh failed: {error:#}", kind.key());
+                    sync_log(
+                        &path,
+                        &detailed_logging,
+                        LogDetail::Summary,
+                        "ERROR",
+                        &message,
+                    );
+                    return Err(message);
+                }
+                sync_log(
+                    &path,
+                    &detailed_logging,
+                    LogDetail::Summary,
+                    "INFO",
+                    format!(
+                        "provider={} single-feed refresh accepted elapsed_ms={}",
+                        kind.key(),
+                        started.elapsed().as_millis()
+                    ),
+                );
+                sync_provider(
+                    &path,
+                    &workspace,
+                    &database,
+                    &remote,
+                    kind,
+                    &detailed_logging,
+                    runtime,
+                )
+            } else if provider.is_some() {
+                Err("Connect the selected provider before syncing".into())
+            } else {
+                let input = Store::open_read_workspace(&path, &workspace)
+                    .and_then(|store| store.local_feed_refresh_input(id))
+                    .map_err(|e| e.to_string())?;
+                match runtime.block_on(Store::fetch_feed_data(
+                    &input.url,
+                    input.etag.as_deref(),
+                    input.modified.as_deref(),
+                )) {
+                    Ok(fetched) => {
+                        let revisions = Store::open_read_workspace(&path, &workspace)
+                            .and_then(|store| store.article_source_revisions(input.id))
+                            .map_err(|error| error.to_string())?;
+                        let prepared = Store::prepare_fetched_feed_with_revisions(
+                            &input.url, fetched, &revisions,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let changed = !prepared.is_not_modified();
+                        database.write(workspace, move |store| {
+                            store.persist_prepared_feed(&input.url, Some(input.id), prepared)?;
+                            Ok(usize::from(changed))
+                        })
+                    }
+                    Err(error) => {
+                        let message = error.to_string();
+                        let failure = message.clone();
+                        database.enqueue(workspace, move |store| {
+                            store.set_feed_refresh_error(id, Some(&failure))
+                        })?;
+                        Err(message)
+                    }
+                }
             }
-            sync_log(
+        })();
+        match &result {
+            Ok(count) => sync_log(
                 &path,
+                &detailed_logging,
+                LogDetail::Summary,
                 "INFO",
                 format!(
-                    "provider={} single-feed refresh accepted elapsed_ms={}",
-                    kind.key(),
+                    "single-feed refresh completed feed_id={id} saved={count} elapsed_ms={}",
                     started.elapsed().as_millis()
                 ),
-            );
-            sync_provider(&path, &workspace, &database, &remote, kind, runtime)
-        } else if provider.is_some() {
-            Err("Connect the selected provider before syncing".into())
-        } else {
-            let input = Store::open_read_workspace(&path, &workspace)
-                .and_then(|store| store.local_feed_refresh_input(id))
-                .map_err(|e| e.to_string())?;
-            match runtime.block_on(Store::fetch_feed_data(
-                &input.url,
-                input.etag.as_deref(),
-                input.modified.as_deref(),
-            )) {
-                Ok(fetched) => {
-                    let revisions = Store::open_read_workspace(&path, &workspace)
-                        .and_then(|store| store.article_source_revisions(input.id))
-                        .map_err(|error| error.to_string())?;
-                    let prepared =
-                        Store::prepare_fetched_feed_with_revisions(&input.url, fetched, &revisions)
-                            .map_err(|error| error.to_string())?;
-                    let changed = !prepared.is_not_modified();
-                    database.write(workspace, move |store| {
-                        store.persist_prepared_feed(&input.url, Some(input.id), prepared)?;
-                        Ok(usize::from(changed))
-                    })
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    let failure = message.clone();
-                    database.enqueue(workspace, move |store| {
-                        store.set_feed_refresh_error(id, Some(&failure))
-                    })?;
-                    Err(message)
-                }
-            }
+            ),
+            Err(error) => sync_log(
+                &path,
+                &detailed_logging,
+                LogDetail::Summary,
+                "ERROR",
+                format!(
+                    "single-feed refresh failed feed_id={id} elapsed_ms={} error={error}",
+                    started.elapsed().as_millis()
+                ),
+            ),
         }
+        result
     });
 }
 
@@ -111,10 +158,13 @@ pub(super) fn refresh(
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let cache = state.body_cache.clone();
     let database = state.database.clone();
+    let detailed_logging = state.detailed_sync_logging.clone();
     job(reply, move |runtime| {
         let started = Instant::now();
         sync_log(
             &path,
+            &detailed_logging,
+            LogDetail::Summary,
             "INFO",
             format!(
                 "sync started workspace={workspace} provider={} force={force}",
@@ -122,16 +172,37 @@ pub(super) fn refresh(
             ),
         );
         let result = if let (Some(kind), Some(config)) = (provider, config) {
-            let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
+            let remote = match ProviderClient::new(kind, &config) {
+                Ok(remote) => remote,
+                Err(error) => {
+                    let message = format!("{} provider setup failed: {error:#}", kind.key());
+                    sync_log(
+                        &path,
+                        &detailed_logging,
+                        LogDetail::Summary,
+                        "ERROR",
+                        &message,
+                    );
+                    return Err(message);
+                }
+            };
             if force {
                 let refresh_started = Instant::now();
                 if let Err(error) = runtime.block_on(remote.refresh_all()) {
                     let message = format!("{} refresh-all request failed: {error:#}", kind.key());
-                    sync_log(&path, "ERROR", &message);
+                    sync_log(
+                        &path,
+                        &detailed_logging,
+                        LogDetail::Summary,
+                        "ERROR",
+                        &message,
+                    );
                     return Err(message);
                 }
                 sync_log(
                     &path,
+                    &detailed_logging,
+                    LogDetail::Detailed,
                     "INFO",
                     format!(
                         "provider={} forced refresh-all accepted elapsed_ms={}",
@@ -142,6 +213,8 @@ pub(super) fn refresh(
             } else {
                 sync_log(
                     &path,
+                    &detailed_logging,
+                    LogDetail::Detailed,
                     "INFO",
                     format!(
                         "provider={} using current server state; refresh-all skipped",
@@ -149,7 +222,15 @@ pub(super) fn refresh(
                     ),
                 );
             }
-            sync_provider(&path, &workspace, &database, &remote, kind, runtime)
+            sync_provider(
+                &path,
+                &workspace,
+                &database,
+                &remote,
+                kind,
+                &detailed_logging,
+                runtime,
+            )
         } else if provider.is_some() {
             Err("Connect the selected provider before syncing".into())
         } else {
@@ -161,6 +242,8 @@ pub(super) fn refresh(
         match &result {
             Ok(count) => sync_log(
                 &path,
+                &detailed_logging,
+                LogDetail::Summary,
                 "INFO",
                 format!(
                     "sync completed saved={count} elapsed_ms={}",
@@ -169,6 +252,8 @@ pub(super) fn refresh(
             ),
             Err(error) => sync_log(
                 &path,
+                &detailed_logging,
+                LogDetail::Summary,
                 "ERROR",
                 format!(
                     "sync failed elapsed_ms={} error={error}",
@@ -270,9 +355,17 @@ pub(super) fn sync_provider(
     database: &DbWriter,
     remote: &ProviderClient,
     kind: ProviderKind,
+    detailed_logging: &AtomicBool,
     runtime: &tokio::runtime::Runtime,
 ) -> Result<usize, String> {
-    runtime.block_on(sync_provider_async(path, workspace, database, remote, kind))
+    runtime.block_on(sync_provider_async(
+        path,
+        workspace,
+        database,
+        remote,
+        kind,
+        detailed_logging,
+    ))
 }
 
 async fn sync_provider_async(
@@ -281,18 +374,27 @@ async fn sync_provider_async(
     database: &DbWriter,
     remote: &ProviderClient,
     kind: ProviderKind,
+    detailed_logging: &AtomicBool,
 ) -> Result<usize, String> {
     let stage_started = Instant::now();
     let identity = match remote.identity().await {
         Ok(identity) => identity,
         Err(error) => {
             let message = format!("provider={} identity request failed: {error:#}", kind.key());
-            sync_log(path, "ERROR", &message);
+            sync_log(
+                path,
+                detailed_logging,
+                LogDetail::Detailed,
+                "ERROR",
+                &message,
+            );
             return Err(message);
         }
     };
     sync_log(
         path,
+        detailed_logging,
+        LogDetail::Detailed,
         "INFO",
         format!(
             "provider={} identity request completed elapsed_ms={}",
@@ -305,12 +407,20 @@ async fn sync_provider_async(
         Ok(feeds) => feeds,
         Err(error) => {
             let message = format!("provider={} feeds request failed: {error:#}", kind.key());
-            sync_log(path, "ERROR", &message);
+            sync_log(
+                path,
+                detailed_logging,
+                LogDetail::Detailed,
+                "ERROR",
+                &message,
+            );
             return Err(message);
         }
     };
     sync_log(
         path,
+        detailed_logging,
+        LogDetail::Detailed,
         "INFO",
         format!(
             "provider={} feeds request completed feeds={} elapsed_ms={}",
@@ -357,6 +467,8 @@ async fn sync_provider_async(
     };
     sync_log(
         path,
+        detailed_logging,
+        LogDetail::Detailed,
         "INFO",
         format!(
             "provider={} sync mode={mode:?} feeds={} reset={reset} elapsed_ms={}",
@@ -407,6 +519,8 @@ async fn sync_provider_async(
         };
         sync_log(
             path,
+            detailed_logging,
+            LogDetail::Detailed,
             "INFO",
             format!(
                 "provider page={page_number} entries={} has_more={} fetch_ms={}",
@@ -442,6 +556,8 @@ async fn sync_provider_async(
         total += saved;
         sync_log(
             path,
+            detailed_logging,
+            LogDetail::Detailed,
             "INFO",
             format!(
                 "provider page={page_number} prepared={prepared_count} saved={saved} persist_ms={}",

@@ -67,6 +67,8 @@ pub fn run() {
         data_dir.join("plugins"),
         preferences.library_source.workspace(),
         provider_settings.clone(),
+        preferences.detailed_sync_logging,
+        preferences.sync_log_retention_days,
     );
     gpui_kit::application()
         .with_assets(AppAssets)

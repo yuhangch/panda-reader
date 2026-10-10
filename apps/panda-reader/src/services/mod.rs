@@ -5,6 +5,7 @@ mod articles;
 mod command;
 mod connections;
 mod database;
+mod diagnostics;
 mod dispatch;
 pub(crate) mod favicon;
 mod subscriptions;

@@ -164,6 +164,10 @@ pub struct Preferences {
     pub last_refresh_at: Option<String>,
     /// Check for and download stable releases in the background.
     pub check_for_updates: bool,
+    /// Include detailed provider connection and sync timings in sync.log.
+    pub detailed_sync_logging: bool,
+    /// Delete sync.log and its rotated copy when they exceed this age.
+    pub sync_log_retention_days: u16,
 }
 
 impl Default for Preferences {
@@ -195,6 +199,8 @@ impl Default for Preferences {
             share_template: "{title}\\n{url}".into(),
             last_refresh_at: None,
             check_for_updates: true,
+            detailed_sync_logging: false,
+            sync_log_retention_days: 30,
         }
     }
 }
@@ -231,5 +237,20 @@ mod tests {
         let parsed: Preferences =
             serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
         assert!(parsed.auto_translate_titles);
+    }
+
+    #[test]
+    fn detailed_sync_logging_defaults_off_and_survives_preference_round_trip() {
+        let legacy: Preferences = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(!legacy.detailed_sync_logging);
+        assert_eq!(legacy.sync_log_retention_days, 30);
+
+        let mut current = Preferences::default();
+        current.detailed_sync_logging = true;
+        current.sync_log_retention_days = 90;
+        let parsed: Preferences =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert!(parsed.detailed_sync_logging);
+        assert_eq!(parsed.sync_log_retention_days, 90);
     }
 }

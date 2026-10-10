@@ -1,11 +1,10 @@
-use super::worker::{WorkerState, job, lock_mutex};
-use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
-use tokio::sync::oneshot;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use std::path::Path;
+const MAX_FAVICON_BYTES: usize = 2 * 1024 * 1024;
 
-static FAVICON_LIMIT: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+static FAVICON_LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+static FAVICON_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 pub fn sanitize_host(host: &str) -> String {
     host.chars()
@@ -19,6 +18,7 @@ pub fn sanitize_host(host: &str) -> String {
         .collect()
 }
 
+/// Fetch feed icons outside the shared service worker pool so slow icon hosts cannot delay sync.
 pub async fn fetch_favicon(
     host: &str,
     site_url: &str,
@@ -30,80 +30,94 @@ pub async fn fetch_favicon(
     if path.is_file() {
         return Ok(path);
     }
-    let url = format!("https://www.google.com/s2/favicons?domain={host}&sz=64");
-    let _ = site_url;
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-    let client = CLIENT.get_or_init(|| {
+
+    let _permit = FAVICON_LIMIT
+        .get_or_init(|| tokio::sync::Semaphore::new(6))
+        .acquire()
+        .await
+        .map_err(|error| error.to_string())?;
+    // Another feed may have requested the same host while this task waited for a permit.
+    if path.is_file() {
+        return Ok(path);
+    }
+
+    let client = FAVICON_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            .user_agent("PandaReader/0.1")
-            .timeout(std::time::Duration::from_secs(10))
+            .user_agent(concat!("PandaReader/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .timeout(std::time::Duration::from_secs(4))
             .build()
             .expect("favicon HTTP client configuration is valid")
     });
-    let bytes = client
-        .get(&url)
+
+    let site_icon_url = url::Url::parse(site_url).ok().and_then(|mut url| {
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return None;
+        }
+        url.set_path("/favicon.ico");
+        url.set_query(None);
+        url.set_fragment(None);
+        Some(url)
+    });
+
+    let site_icon_url =
+        site_icon_url.ok_or_else(|| "site URL is not a valid HTTP(S) URL".to_owned())?;
+    // Keep icon lookup on the feed's own origin; a missing icon falls back to the UI initials.
+    let bytes = download_icon(client, site_icon_url.as_str())
+        .await
+        .and_then(|bytes| normalize_icon(&bytes))?;
+
+    let tmp = icons_dir.join(format!("{safe}.png.part"));
+    std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+    match std::fs::rename(&tmp, &path) {
+        Ok(()) => Ok(path),
+        // Another request for the same host may have won the race to publish the icon.
+        Err(_) if path.is_file() => {
+            let _ = std::fs::remove_file(tmp);
+            Ok(path)
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(tmp);
+            Err(error.to_string())
+        }
+    }
+}
+
+async fn download_icon(client: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|error| error.to_string())?
         .error_for_status()
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_FAVICON_BYTES as u64)
+    {
+        return Err("favicon exceeds the 2 MiB size limit".into());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_FAVICON_BYTES {
+            return Err("favicon exceeds the 2 MiB size limit".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
     if bytes.is_empty() {
         return Err("empty favicon".into());
     }
-    let tmp = icons_dir.join(format!("{safe}.png.part"));
-    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(path)
+    Ok(bytes)
 }
 
-pub(super) fn ensure_favicon(
-    host: String,
-    site_url: String,
-    icons_dir: PathBuf,
-    reply: oneshot::Sender<Result<PathBuf, String>>,
-    state: &WorkerState,
-) {
-    let inflight = state.favicon_inflight.clone();
-    job(reply, move |runtime| {
-        let safe = sanitize_host(&host);
-        let path = icons_dir.join(format!("{safe}.png"));
-        loop {
-            let already_running = {
-                let mut guard = lock_mutex(&inflight, "favicon in-flight");
-                if guard.contains_key(&host) {
-                    true
-                } else {
-                    guard.insert(host.clone(), ());
-                    false
-                }
-            };
-            if !already_running {
-                break;
-            }
-            if path.is_file() {
-                return Ok(path);
-            }
-            runtime.block_on(tokio::time::sleep(std::time::Duration::from_millis(40)));
-        }
-        let semaphore = FAVICON_LIMIT
-            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(6)))
-            .clone();
-        let request_host = host.clone();
-        let request_site_url = site_url.clone();
-        let request_icons_dir = icons_dir.clone();
-        let result = runtime.block_on(async move {
-            let _permit = semaphore
-                .acquire_owned()
-                .await
-                .map_err(|error| error.to_string())?;
-            fetch_favicon(&request_host, &request_site_url, &request_icons_dir).await
-        });
-        lock_mutex(&inflight, "favicon in-flight").remove(&host);
-        result
-    });
+fn normalize_icon(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| format!("unsupported favicon image: {error}"))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("could not encode favicon: {error}"))?;
+    Ok(png.into_inner())
 }
 
 pub(crate) fn host_from_url(raw: &str) -> Option<&str> {

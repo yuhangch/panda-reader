@@ -3,7 +3,6 @@ use panda_core::{
 };
 use panda_plugins::{CommunityPlugin, PluginSummary};
 use panda_providers::ProviderKind;
-use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 pub struct ConnectOutcome {
@@ -75,12 +74,6 @@ pub enum Command {
         id: i64,
         progress: f32,
         reply: oneshot::Sender<Result<(), String>>,
-    },
-    EnsureFavicon {
-        host: String,
-        site_url: String,
-        icons_dir: PathBuf,
-        reply: oneshot::Sender<Result<PathBuf, String>>,
     },
     Connect {
         kind: ProviderKind,

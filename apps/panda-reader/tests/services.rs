@@ -20,6 +20,8 @@ fn worker_routes_local_reads_and_checks_provider_operations() {
         dir.path().join("plugins"),
         "local",
         panda_providers::ProviderSettingsMap::new(),
+        false,
+        30,
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

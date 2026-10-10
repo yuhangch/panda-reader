@@ -4,6 +4,7 @@ use panda_providers::{ProviderKind, ProviderSettings, save_settings};
 
 use super::articles::cache::RenderCache;
 use super::database::DbWriter;
+use super::diagnostics;
 use super::{Command, dispatch};
 
 use anyhow::{Context as _, bail};
@@ -17,7 +18,9 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
-        mpsc as std_mpsc, mpsc::SyncSender,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+        mpsc::SyncSender,
     },
     thread,
 };
@@ -31,6 +34,8 @@ const MAX_PLUGIN_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 pub struct AppServices {
     sender: mpsc::UnboundedSender<Command>,
     workspace: Arc<RwLock<String>>,
+    detailed_sync_logging: Arc<AtomicBool>,
+    database_path: PathBuf,
 }
 
 impl AppServices {
@@ -41,12 +46,17 @@ impl AppServices {
         plugin_dir: PathBuf,
         active_workspace: &str,
         initial_settings: ProviderSettingsMap,
+        detailed_sync_logging: bool,
+        log_retention_days: u16,
     ) -> Self {
+        diagnostics::set_log_retention_days(log_retention_days, &path);
+        let database_path = path.clone();
         let settings = Arc::new(RwLock::new(initial_settings));
         let workspace = Arc::new(RwLock::new(active_workspace.to_owned()));
         let worker_workspace = workspace.clone();
+        let detailed_sync_logging = Arc::new(AtomicBool::new(detailed_sync_logging));
+        let worker_detailed_sync_logging = detailed_sync_logging.clone();
         let body_cache = Arc::new(Mutex::new(RenderCache::default()));
-        let favicon_inflight = Arc::new(Mutex::new(HashMap::<String, ()>::new()));
         let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
         thread::Builder::new()
             .name("panda-reader-services".into())
@@ -98,8 +108,8 @@ impl AppServices {
                         provider_settings_path,
                         provider_settings: settings.clone(),
                         active_workspace: worker_workspace,
+                        detailed_sync_logging: worker_detailed_sync_logging,
                         body_cache,
-                        favicon_inflight,
                         title_translation_lock: Arc::new(Mutex::new(())),
                         title_translation_attempted: Arc::new(Mutex::new(HashMap::new())),
                     };
@@ -121,7 +131,12 @@ impl AppServices {
                 });
             })
             .expect("failed to start Panda Reader services thread");
-        Self { sender, workspace }
+        Self {
+            sender,
+            workspace,
+            detailed_sync_logging,
+            database_path,
+        }
     }
 
     pub fn send(&self, command: Command) {
@@ -130,6 +145,14 @@ impl AppServices {
 
     pub fn set_workspace(&self, workspace: &str) {
         *write_lock(&self.workspace, "active workspace") = workspace.to_owned();
+    }
+
+    pub fn set_detailed_sync_logging(&self, enabled: bool) {
+        self.detailed_sync_logging.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_log_retention_days(&self, days: u16) {
+        diagnostics::set_log_retention_days(days, &self.database_path);
     }
 }
 
@@ -142,8 +165,8 @@ pub struct WorkerState {
     pub plugin_registry: Arc<RwLock<PluginRegistry>>,
     pub provider_settings: Arc<RwLock<ProviderSettingsMap>>,
     pub active_workspace: Arc<RwLock<String>>,
+    pub detailed_sync_logging: Arc<AtomicBool>,
     pub body_cache: Arc<Mutex<RenderCache>>,
-    pub favicon_inflight: Arc<Mutex<HashMap<String, ()>>>,
     pub title_translation_lock: Arc<Mutex<()>>,
     pub title_translation_attempted: Arc<Mutex<HashMap<String, std::time::Instant>>>,
 }

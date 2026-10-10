@@ -128,11 +128,5 @@ pub(super) fn handle(command: Command, state: &WorkerState) {
         Command::Disconnect { kind, reply } => super::connections::disconnect(kind, reply, state),
         Command::RefreshFeed { id, reply } => super::sync::refresh_feed(id, reply, state),
         Command::Refresh { force, reply } => super::sync::refresh(force, reply, state),
-        Command::EnsureFavicon {
-            host,
-            site_url,
-            icons_dir,
-            reply,
-        } => super::favicon::ensure_favicon(host, site_url, icons_dir, reply, state),
     }
 }

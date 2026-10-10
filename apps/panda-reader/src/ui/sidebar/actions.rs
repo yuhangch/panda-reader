@@ -1,10 +1,8 @@
-use crate::services::Command;
-use crate::services::favicon::{feed_host, local_favicon_path};
+use crate::services::favicon::{feed_host, fetch_favicon, local_favicon_path};
 use crate::ui::components::{BundledIcon, bundled_icon};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::component::{Icon, IconName, Sizable as _};
 use gpui_kit::*;
-use tokio::sync::oneshot;
 
 impl ReaderWindow {
     pub(in crate::ui) fn unread_total(&self) -> i64 {
@@ -156,16 +154,15 @@ impl ReaderWindow {
                 .clone()
                 .unwrap_or_else(|| feed.feed_url.clone());
             let icons_dir = self.sidebar.icons_dir.clone();
-            let (reply, response) = oneshot::channel();
-            self.services.send(Command::EnsureFavicon {
-                host,
-                site_url,
-                icons_dir,
-                reply,
-            });
-            cx.spawn(async move |this, cx| {
-                let _ = response.await;
-                let _ = this.update(cx, |_, cx| cx.notify());
+            let weak = cx.entity().downgrade();
+            cx.spawn(async move |_, cx| {
+                let result = fetch_favicon(&host, &site_url, &icons_dir).await;
+                if let Err(error) = result {
+                    eprintln!("could not fetch feed icon for {host}: {error}");
+                }
+                let _ = weak.update(cx, |_, cx| {
+                    cx.notify();
+                });
             })
             .detach();
         }
