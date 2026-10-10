@@ -9,6 +9,7 @@ license.workspace = true
 anyhow.workspace = true
 hex.workspace = true
 panda-content = { path = "../panda-content" }
+reqwest.workspace = true
 scraper.workspace = true
 semver.workspace = true
 serde.workspace = true

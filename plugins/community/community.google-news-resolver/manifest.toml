@@ -1,0 +1,11 @@
+id = "community.google-news-resolver"
+name = "Google News URL resolver"
+version = "1.0.0"
+api_version = 1
+min_app_version = "0.2.5"
+kind = "wasm"
+domains = ["news.google.com"]
+stage = "resolve_url"
+priority = 100
+capabilities = ["network_request", "article_url_write"]
+network_hosts = ["news.google.com"]

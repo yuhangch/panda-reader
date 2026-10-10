@@ -4,8 +4,11 @@ description: Learn what plugins can access and how the host contains failures.
 ---
 
 Plugins transform article content through a host-controlled API. They do not receive direct
-network, filesystem, database, process, or UI access. HTML parsing, URL handling, extraction, and
-final sanitization remain under the app's control.
+socket, filesystem, database, process, or UI access. The Wasm `resolve_url` stage can request
+brokered HTTPS calls only to exact DNS hosts listed in its manifest; the host limits each request
+and response to 1 MiB, allows at most four requests per invocation, applies a 12-second timeout,
+and disables redirects. HTML parsing, extraction, final URL validation, and final sanitization
+remain under the app's control.
 
 WASM execution is bounded by runtime limits: modules are limited to 4 MiB, guest memory to 16 MiB,
 each stage to 10 million units of Wasm fuel, and an invocation to 10,000 host calls. Decoded HTML

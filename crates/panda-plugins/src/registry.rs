@@ -66,6 +66,13 @@ pub struct PluginResult<'a> {
     pub diagnostics: Vec<PluginDiagnostic>,
 }
 
+#[derive(Clone, Debug)]
+pub struct UrlResolutionResult {
+    pub url: String,
+    pub matched_plugins: Vec<(String, String)>,
+    pub diagnostics: Vec<PluginDiagnostic>,
+}
+
 /// Immutable registry snapshot. A job keeps one generation for its full run.
 pub struct PluginRegistry {
     generation: u64,
@@ -335,6 +342,74 @@ impl PluginRegistry {
         output
     }
 
+    /// Run pre-fetch URL resolver plugins. Network access remains a host service and
+    /// each Wasm plugin can only contact hosts explicitly declared in its manifest.
+    pub fn resolve_article_url(&self, source_url: &str) -> UrlResolutionResult {
+        let mut output = UrlResolutionResult {
+            url: source_url.to_owned(),
+            matched_plugins: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let Ok(parsed_url) = Url::parse(source_url) else {
+            return output;
+        };
+        let Some(host) = parsed_url.host_str() else {
+            return output;
+        };
+        for plugin in &self.plugins {
+            let manifest = &plugin.summary.manifest;
+            if !plugin.summary.enabled
+                || manifest.stage != PluginStage::ResolveUrl
+                || !manifest_matches(manifest, host, &parsed_url)
+            {
+                continue;
+            }
+            if manifest.kind != PluginKind::Wasm {
+                output.diagnostics.push(PluginDiagnostic {
+                    plugin_id: manifest.id.clone(),
+                    message: "URL resolver plugins must use the Wasm kind".into(),
+                });
+                continue;
+            }
+            let Some(bytes) = plugin.wasm.as_deref() else {
+                output.diagnostics.push(PluginDiagnostic {
+                    plugin_id: manifest.id.clone(),
+                    message: "Wasm module was not loaded".into(),
+                });
+                continue;
+            };
+            match wasm::resolve_url(
+                bytes,
+                &plugin.summary.content_hash,
+                source_url,
+                &manifest.capabilities,
+                &manifest.network_hosts,
+            ) {
+                Ok(Some(resolved)) => {
+                    output.url = resolved;
+                    output
+                        .matched_plugins
+                        .push((manifest.id.clone(), plugin.summary.content_hash.clone()));
+                    self.lock_runtime_errors().remove(&manifest.id);
+                    break;
+                }
+                Ok(None) => {
+                    self.lock_runtime_errors().remove(&manifest.id);
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    self.lock_runtime_errors()
+                        .insert(manifest.id.clone(), message.clone());
+                    output.diagnostics.push(PluginDiagnostic {
+                        plugin_id: manifest.id.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+        output
+    }
+
     pub fn set_enabled(&mut self, plugin_id: &str, enabled: bool) -> anyhow::Result<()> {
         let plugin = self
             .plugins
@@ -561,10 +636,43 @@ fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
         bail!("manifest requires name, version, and at least one domain");
     }
     for domain in &manifest.domains {
-        let bare = domain.strip_prefix("*.").unwrap_or(domain);
-        if bare.contains(['/', ':', '@']) || Url::parse(&format!("https://{bare}/")).is_err() {
+        if !valid_domain_pattern(domain) {
             bail!("invalid plugin domain pattern: {domain}");
         }
+    }
+    for domain in &manifest.network_hosts {
+        if !valid_network_host(domain) {
+            bail!("invalid network host pattern: {domain}");
+        }
+    }
+    if manifest
+        .capabilities
+        .contains(&PluginCapability::NetworkRequest)
+        != !manifest.network_hosts.is_empty()
+    {
+        bail!("network.request requires an explicit non-empty network_hosts list");
+    }
+    if manifest
+        .capabilities
+        .contains(&PluginCapability::NetworkRequest)
+        && manifest.stage != PluginStage::ResolveUrl
+    {
+        bail!("network.request is only available to URL resolver plugins");
+    }
+    if manifest.stage == PluginStage::ResolveUrl
+        && (manifest.kind != PluginKind::Wasm
+            || !manifest
+                .capabilities
+                .contains(&PluginCapability::ArticleUrlWrite))
+    {
+        bail!("URL resolver plugins must be Wasm and declare article.url.write");
+    }
+    if manifest.stage != PluginStage::ResolveUrl
+        && manifest
+            .capabilities
+            .contains(&PluginCapability::ArticleUrlWrite)
+    {
+        bail!("article.url.write is only available to URL resolver plugins");
     }
     if manifest
         .path_prefixes
@@ -574,6 +682,34 @@ fn validate_manifest(manifest: &PluginManifest) -> anyhow::Result<()> {
         bail!("path prefixes must start with `/`");
     }
     Ok(())
+}
+
+fn valid_domain_pattern(domain: &str) -> bool {
+    let bare = domain.strip_prefix("*.").unwrap_or(domain);
+    !bare.is_empty()
+        && !bare.contains(['/', ':', '@', '*'])
+        && Url::parse(&format!("https://{bare}/")).is_ok_and(|url| {
+            url.host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case(bare))
+                && url.path() == "/"
+        })
+}
+
+fn valid_network_host(domain: &str) -> bool {
+    if domain.starts_with("*.") || !valid_domain_pattern(domain) {
+        return false;
+    }
+    let Ok(url) = Url::parse(&format!("https://{domain}/")) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.parse::<std::net::IpAddr>().is_err()
+        && !host.eq_ignore_ascii_case("localhost")
+        && !host.to_ascii_lowercase().ends_with(".localhost")
+        && !host.to_ascii_lowercase().ends_with(".local")
+        && !host.to_ascii_lowercase().ends_with(".internal")
 }
 
 fn validate_plugin_id(id: &str) -> anyhow::Result<()> {
@@ -612,6 +748,15 @@ fn manifest_matches(manifest: &PluginManifest, host: &str, url: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn network_hosts_must_be_explicit_public_dns_names() {
+        assert!(valid_network_host("news.google.com"));
+        assert!(!valid_network_host("*.google.com"));
+        assert!(!valid_network_host("127.0.0.1"));
+        assert!(!valid_network_host("localhost"));
+        assert!(!valid_network_host("service.internal"));
+    }
 
     #[test]
     fn loads_rules_matches_root_and_subdomains_and_respects_disable_state() {

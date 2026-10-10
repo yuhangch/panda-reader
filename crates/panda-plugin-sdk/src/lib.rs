@@ -10,9 +10,11 @@ pub mod result {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
 pub enum Stage {
-    Prepare,
-    Cleanup,
+    Prepare = 0,
+    Cleanup = 1,
+    ResolveUrl = 2,
 }
 
 impl TryFrom<i32> for Stage {
@@ -22,6 +24,7 @@ impl TryFrom<i32> for Stage {
         match value {
             0 => Ok(Self::Prepare),
             1 => Ok(Self::Cleanup),
+            2 => Ok(Self::ResolveUrl),
             _ => Err(format!("unknown Panda Reader plugin stage: {value}")),
         }
     }
@@ -30,9 +33,16 @@ impl TryFrom<i32> for Stage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Node(pub u32);
 
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub url: String,
+    pub body: String,
+}
+
 #[cfg(target_arch = "wasm32")]
 mod host {
-    use super::Node;
+    use super::{HttpResponse, Node};
     use serde::{Deserialize, Serialize};
 
     #[link(wasm_import_module = "panda_v1")]
@@ -72,6 +82,10 @@ mod host {
 
     fn request(request: &Request<'_>) -> Result<serde_json::Value, String> {
         let input = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+        request_bytes(&input)
+    }
+
+    fn request_bytes(input: &[u8]) -> Result<serde_json::Value, String> {
         let handle = unsafe { host_call(input.as_ptr() as i32, input.len() as i32) };
         if handle <= 0 {
             return Err(format!("Panda Reader host call failed ({handle})"));
@@ -231,6 +245,42 @@ mod host {
             .map(str::to_owned)
             .ok_or_else(|| "invalid URL response".into())
     }
+    pub fn set_resolved_url(url: &str) -> Result<(), String> {
+        call_empty(&Request {
+            op: "set_resolved_url",
+            selector: None,
+            node: None,
+            name: None,
+            value: None,
+            html: None,
+            url: Some(url),
+        })
+    }
+    pub fn http_request(
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Result<HttpResponse, String> {
+        #[derive(Serialize)]
+        struct NetworkRequest<'a> {
+            op: &'static str,
+            method: &'a str,
+            url: &'a str,
+            headers: std::collections::BTreeMap<&'a str, &'a str>,
+            body: &'a str,
+        }
+        let request = NetworkRequest {
+            op: "http_request",
+            method,
+            url,
+            headers: headers.iter().copied().collect(),
+            body,
+        };
+        let input = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
+        let response: serde_json::Value = request_bytes(&input)?;
+        serde_json::from_value(response).map_err(|error| error.to_string())
+    }
     pub fn log(message: &str) -> Result<(), String> {
         call_empty(&Request {
             op: "log",
@@ -249,8 +299,8 @@ mod host {
 
 #[cfg(target_arch = "wasm32")]
 pub use host::{
-    attribute, context, html, log, query, remove, remove_attribute, replace_html, resolve_url,
-    set_attribute, set_body, text,
+    attribute, context, html, http_request, log, query, remove, remove_attribute, replace_html,
+    resolve_url, set_attribute, set_body, set_resolved_url, text,
 };
 
 /// Export a Rust handler using the application ABI's standard stage/result values.

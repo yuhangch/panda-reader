@@ -27,6 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use panda_providers::ProviderSettingsMap;
 use panda_translate::TranslatorConfig;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -51,6 +52,8 @@ pub struct ReaderWindow {
     pub(in crate::ui) update_status: UpdateStatus,
     pub(in crate::ui) update_events: UnboundedSender<UpdateStatus>,
     pub(in crate::ui) startup_sync_pending: bool,
+    pub(in crate::ui) mark_revisions: HashMap<(i64, panda_core::MarkField), u64>,
+    pub(in crate::ui) next_mark_revision: u64,
 }
 
 impl ReaderWindow {
@@ -103,6 +106,8 @@ impl ReaderWindow {
             update_status,
             update_events: update_events.clone(),
             startup_sync_pending: true,
+            mark_revisions: HashMap::new(),
+            next_mark_revision: 0,
         };
         view.subscribe_palette_input(window, cx);
         view.load_snapshot(cx);

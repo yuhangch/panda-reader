@@ -15,6 +15,7 @@ pub(in crate::ui) struct ArticleView {
     pub(in crate::ui) showing_translation: bool,
     pub(in crate::ui) request_epoch: RequestEpoch,
     pub(in crate::ui) is_extracting: bool,
+    pub(in crate::ui) requested_article_id: Option<i64>,
 }
 
 impl ArticleView {

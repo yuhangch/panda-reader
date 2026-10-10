@@ -12,7 +12,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use panda_plugins::{CommunityPlugin, PluginSummary};
+use panda_plugins::{CommunityPlugin, PluginCapability, PluginSummary};
 use tokio::sync::oneshot;
 
 #[derive(Clone)]
@@ -246,6 +246,11 @@ impl Settings {
             installed.is_some_and(|item| is_newer(&plugin.version, &item.manifest.version));
         let is_current = installed.is_some() && !is_update;
         let compatible = is_compatible(&plugin);
+        let network_access = plugin
+            .capabilities
+            .contains(&PluginCapability::NetworkRequest)
+            .then(|| format!(" · HTTPS: {}", plugin.network_hosts.join(", ")))
+            .unwrap_or_default();
         let label = if !compatible {
             "Requires newer app"
         } else if is_current {
@@ -274,7 +279,10 @@ impl Settings {
                         div()
                             .text_xs()
                             .text_color(cx.theme().muted_foreground)
-                            .child(format!("{} · v{}", plugin.id, plugin.version)),
+                            .child(format!(
+                                "{} · v{}{}",
+                                plugin.id, plugin.version, network_access
+                            )),
                     ),
             )
             .child(
@@ -303,6 +311,12 @@ impl Settings {
         let remove_id = id.clone();
         let toggle_label = plugin.manifest.name.clone();
         let enabled = plugin.enabled;
+        let network_access = plugin
+            .manifest
+            .capabilities
+            .contains(&PluginCapability::NetworkRequest)
+            .then(|| format!(" · HTTPS: {}", plugin.manifest.network_hosts.join(", ")))
+            .unwrap_or_default();
         h_flex()
             .w_full()
             .items_center()
@@ -326,7 +340,7 @@ impl Settings {
                                 "{} · {} · {}",
                                 id,
                                 plugin.manifest.version,
-                                plugin.manifest.domains.join(", ")
+                                format!("{}{}", plugin.manifest.domains.join(", "), network_access)
                             )),
                     )
                     .when_some(plugin.last_error, |view, error| {

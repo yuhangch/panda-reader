@@ -3,7 +3,10 @@ mod content;
 
 use super::command::{TitleTranslationInput, TitleTranslationOutcome, TitleTranslationStatus};
 use super::database::DbWriter;
-use super::worker::{WorkerState, job, lock_mutex, read_lock};
+use super::worker::{
+    WorkerState, finish_article_work, job, lock_mutex, read_lock,
+    register_article_work, remote_mark_lock, try_job, wait_for_article_work_cancel,
+};
 use panda_core::{
     ArticleCursor, CanonicalArticle, CanonicalHtml, MarkField, PreparedArticle, RawHtml,
     ReaderSnapshot, RenderOptions, Scope, TranslationLayout,
@@ -269,11 +272,13 @@ fn queue_remote_mark_flush(
 ) {
     // Local read state is already committed; remote sync must not hold the UI response open.
     let (reply, _result) = oneshot::channel();
+    let remote_lock = remote_mark_lock(&workspace);
     job(reply, move |runtime| {
         let result = match ProviderClient::new(kind, &config) {
-            Ok(remote) => {
-                runtime.block_on(flush_remote_marks(&path, &workspace, &database, &remote))
-            }
+            Ok(remote) => runtime.block_on(async {
+                let _guard = remote_lock.lock().await;
+                flush_remote_marks(&path, &workspace, &database, &remote).await
+            }),
             Err(error) => Err(error.to_string()),
         };
         if let Err(error) = &result {
@@ -340,16 +345,36 @@ pub(super) fn extract(
     let cache = state.body_cache.clone();
     let plugins = state.plugin_registry.clone();
     let database = state.database.clone();
-    job(reply, move |runtime| {
-        let store = Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
-        let plugins = read_lock(&plugins, "plugin registry");
-        let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
-        let prepared = runtime
-            .block_on(store.prepare_extraction_using(
+    let cancellations = state.article_work_cancellations.clone();
+    let (cancel_id, cancel_receiver) = register_article_work(&cancellations, &workspace, id);
+    let cleanup_cancellations = cancellations.clone();
+    let cleanup_workspace = workspace.clone();
+    let submitted = try_job(reply, move |runtime| {
+        let result = (|| -> Result<(), String> {
+            let store = Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
+            let plugins = read_lock(&plugins, "plugin registry");
+            let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
+            let prepared = runtime.block_on(async {
+            tokio::select! {
+                _ = wait_for_article_work_cancel(cancel_receiver) => Err("Article task cancelled".to_owned()),
+                result = store.prepare_extraction_using(
                 id,
                 force,
                 extractor,
                 &pipeline_hash,
+                |url| {
+                    let resolved = plugins.resolve_article_url(url);
+                    for diagnostic in &resolved.diagnostics {
+                        eprintln!(
+                            "article URL resolver {} failed: {}",
+                            diagnostic.plugin_id, diagnostic.message
+                        );
+                    }
+                    if let Some(diagnostic) = resolved.diagnostics.first() {
+                        return Err(anyhow::anyhow!(diagnostic.message.clone()));
+                    }
+                    Ok(resolved.url)
+                },
                 |raw, url, title| {
                     let raw = RawHtml::new(raw.to_owned());
                     let prepared = plugins.process(raw.as_str(), url, title, PluginStage::Prepare);

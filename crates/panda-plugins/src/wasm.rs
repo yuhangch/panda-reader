@@ -15,6 +15,8 @@ const MAX_GUEST_MEMORY: usize = 16 * 1024 * 1024;
 const MAX_HOST_VALUE: usize = 2 * 1024 * 1024;
 const MAX_HOST_RESULT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_HOST_READ_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PLUGIN_HTTP_BYTES: usize = 1024 * 1024;
+const MAX_PLUGIN_HTTP_REQUESTS: u8 = 4;
 const MAX_HOST_CALLS: u32 = 10_000;
 const FUEL_PER_STAGE: u64 = 10_000_000;
 const MODULE_CACHE_CAPACITY: usize = 16;
@@ -28,12 +30,15 @@ pub(super) struct HostState {
     url: String,
     stage: PluginStage,
     capabilities: Vec<PluginCapability>,
+    network_hosts: Vec<String>,
     results: HashMap<i32, Vec<u8>>,
     result_bytes: usize,
     read_bytes: usize,
     next_result: i32,
     calls: u32,
     body: Option<String>,
+    resolved_url: Option<String>,
+    network_requests: u8,
     limits: StoreLimits,
 }
 
@@ -62,12 +67,15 @@ pub(super) fn process(
         url: url.to_owned(),
         stage,
         capabilities: capabilities.to_vec(),
+        network_hosts: Vec::new(),
         results: HashMap::new(),
         result_bytes: 0,
         read_bytes: 0,
         next_result: 1,
         calls: 0,
         body: None,
+        resolved_url: None,
+        network_requests: 0,
         limits,
     };
     let mut store = Store::new(&engine, state);
@@ -108,6 +116,117 @@ pub(super) fn process(
         }
         other => bail!("Wasm plugin returned failure code {other}"),
     }
+}
+
+pub(super) fn resolve_url(
+    module_bytes: &[u8],
+    module_hash: &str,
+    source_url: &str,
+    capabilities: &[PluginCapability],
+    network_hosts: &[String],
+) -> anyhow::Result<Option<String>> {
+    if module_bytes.len() > MAX_MODULE_BYTES {
+        bail!("Wasm plugin exceeds the 4 MiB module limit");
+    }
+    let module_bytes = module_bytes.to_vec();
+    let module_hash = module_hash.to_owned();
+    let source_url = source_url.to_owned();
+    let capabilities = capabilities.to_vec();
+    let network_hosts = network_hosts.to_vec();
+    // Network host calls use reqwest's blocking client. Isolate Wasmi from the
+    // async extraction runtime so blocking HTTP never stalls that runtime.
+    std::thread::Builder::new()
+        .name("panda-plugin-url-resolver".into())
+        .spawn(move || {
+            resolve_url_blocking(
+                &module_bytes,
+                &module_hash,
+                &source_url,
+                capabilities,
+                network_hosts,
+            )
+        })?
+        .join()
+        .map_err(|_| anyhow::anyhow!("Wasm URL resolver thread panicked"))?
+}
+
+fn resolve_url_blocking(
+    module_bytes: &[u8],
+    module_hash: &str,
+    source_url: &str,
+    capabilities: Vec<PluginCapability>,
+    network_hosts: Vec<String>,
+) -> anyhow::Result<Option<String>> {
+    let (engine, module) = cached_module(module_hash, module_bytes)?;
+    let document = ArticleDocument::parse("")?;
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(MAX_GUEST_MEMORY)
+        .memories(1)
+        .tables(1)
+        .table_elements(100_000)
+        .build();
+    let state = HostState {
+        document,
+        title: String::new(),
+        url: source_url.to_owned(),
+        stage: PluginStage::ResolveUrl,
+        capabilities,
+        network_hosts,
+        results: HashMap::new(),
+        result_bytes: 0,
+        read_bytes: 0,
+        next_result: 1,
+        calls: 0,
+        body: None,
+        resolved_url: None,
+        network_requests: 0,
+        limits,
+    };
+    let mut store = Store::new(&engine, state);
+    store.limiter(|state| &mut state.limits);
+    store.set_fuel(FUEL_PER_STAGE)?;
+    let mut linker = Linker::new(&engine);
+    linker.func_wrap("panda_v1", "host_call", host_call)?;
+    linker.func_wrap("panda_v1", "result_len", result_len)?;
+    linker.func_wrap("panda_v1", "result_read", result_read)?;
+    linker.func_wrap("panda_v1", "result_drop", result_drop)?;
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .context("instantiate Wasm URL resolver")?;
+    let entry = instance
+        .get_typed_func::<i32, i32>(&store, "panda_process")
+        .context("plugin must export panda_process(i32) -> i32")?;
+    let result = entry
+        .call(&mut store, PluginStage::ResolveUrl as i32)
+        .context("Wasm URL resolver execution failed")?;
+    let state = store.into_data();
+    match result {
+        0 => Ok(None),
+        1 => {
+            let Some(url) = state.resolved_url else {
+                bail!("URL resolver returned success without setting a URL");
+            };
+            validate_resolved_url(source_url, &url)?;
+            Ok((url != source_url).then_some(url))
+        }
+        other => bail!("Wasm URL resolver returned failure code {other}"),
+    }
+}
+
+fn validate_resolved_url(source: &str, resolved: &str) -> anyhow::Result<()> {
+    let source = Url::parse(source)?;
+    let resolved = Url::parse(resolved)?;
+    if !matches!(resolved.scheme(), "http" | "https")
+        || !resolved.username().is_empty()
+        || resolved.password().is_some()
+        || resolved.host_str().is_none()
+    {
+        bail!("URL resolver returned an unsafe destination URL");
+    }
+    if resolved.host_str() == source.host_str() && resolved == source {
+        bail!("URL resolver did not change the URL");
+    }
+    Ok(())
 }
 
 fn cached_module(hash: &str, bytes: &[u8]) -> anyhow::Result<(Engine, Module)> {
@@ -239,11 +358,19 @@ fn dispatch_host_call(state: &mut HostState, request: Value) -> Result<Value, wa
         .ok_or_else(|| wasmi::Error::new("host request is missing op"))?;
     match op {
         "context" => {
-            require(state, PluginCapability::DocumentRead)?;
+            if !state.capabilities.contains(&PluginCapability::DocumentRead)
+                && !state
+                    .capabilities
+                    .contains(&PluginCapability::NetworkRequest)
+            {
+                return Err(wasmi::Error::new(
+                    "plugin must declare document.read or network_request to read context",
+                ));
+            }
             Ok(json!({
                 "title": state.title,
                 "url": state.url,
-                "stage": match state.stage { PluginStage::Prepare => "prepare", PluginStage::Cleanup => "cleanup" },
+                "stage": match state.stage { PluginStage::Prepare => "prepare", PluginStage::Cleanup => "cleanup", PluginStage::ResolveUrl => "resolve_url" },
             }))
         }
         "query" => {
@@ -308,6 +435,17 @@ fn dispatch_host_call(state: &mut HostState, request: Value) -> Result<Value, wa
                 .map_err(host_error)?;
             Ok(json!({ "url": resolved.as_str() }))
         }
+        "http_request" => plugin_http_request(state, &request),
+        "set_resolved_url" => {
+            require(state, PluginCapability::ArticleUrlWrite)?;
+            if state.stage != PluginStage::ResolveUrl {
+                return Err(wasmi::Error::new(
+                    "set_resolved_url is only available during resolve_url",
+                ));
+            }
+            state.resolved_url = Some(required_string(&request, "url")?.to_owned());
+            Ok(json!({ "updated": true }))
+        }
         "log" => {
             let message = required_string(&request, "value")?;
             if message.len() > 4096 {
@@ -319,6 +457,111 @@ fn dispatch_host_call(state: &mut HostState, request: Value) -> Result<Value, wa
         _ => Err(wasmi::Error::new(format!(
             "unsupported host operation `{op}`"
         ))),
+    }
+}
+
+fn plugin_http_request(state: &mut HostState, request: &Value) -> Result<Value, wasmi::Error> {
+    require(state, PluginCapability::NetworkRequest)?;
+    if state.stage != PluginStage::ResolveUrl {
+        return Err(wasmi::Error::new(
+            "network requests are only available during resolve_url",
+        ));
+    }
+    state.network_requests = state.network_requests.saturating_add(1);
+    if state.network_requests > MAX_PLUGIN_HTTP_REQUESTS {
+        return Err(wasmi::Error::new("plugin HTTP request budget exceeded"));
+    }
+    let url = Url::parse(required_string(request, "url")?)
+        .map_err(|error| wasmi::Error::new(format!("invalid plugin request URL: {error}")))?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some_and(|port| port != 443)
+        || !state
+            .network_hosts
+            .iter()
+            .any(|host| network_host_matches(host, url.host_str().unwrap_or_default()))
+    {
+        return Err(wasmi::Error::new(
+            "plugin request URL is outside its HTTPS host allowlist",
+        ));
+    }
+    let method = required_string(request, "method")?;
+    let method = match method {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        _ => return Err(wasmi::Error::new("plugin HTTP method must be GET or POST")),
+    };
+    if let Some(headers) = request.get("headers").and_then(Value::as_object)
+        && headers.len() > 32
+    {
+        return Err(wasmi::Error::new(
+            "plugin HTTP request has too many headers",
+        ));
+    }
+    let body = request
+        .get("body")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if body.len() > MAX_PLUGIN_HTTP_BYTES {
+        return Err(wasmi::Error::new("plugin HTTP request body is too large"));
+    }
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("PandaReader/0.2")
+        .build()
+        .map_err(host_error)?;
+    let mut outgoing = client.request(method, url.clone());
+    if let Some(headers) = request.get("headers").and_then(Value::as_object) {
+        for (name, value) in headers {
+            let value = value
+                .as_str()
+                .ok_or_else(|| wasmi::Error::new("plugin HTTP header values must be strings"))?;
+            let name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(host_error)?;
+            let value = reqwest::header::HeaderValue::from_str(value).map_err(host_error)?;
+            if matches!(
+                name,
+                reqwest::header::HOST | reqwest::header::CONTENT_LENGTH
+            ) {
+                return Err(wasmi::Error::new(
+                    "plugin cannot override Host or Content-Length",
+                ));
+            }
+            outgoing = outgoing.header(name, value);
+        }
+    }
+    if !body.is_empty() {
+        outgoing = outgoing.body(body.to_owned());
+    }
+    let mut response = outgoing.send().map_err(host_error)?;
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let mut bytes = Vec::new();
+    use std::io::Read as _;
+    response
+        .by_ref()
+        .take((MAX_PLUGIN_HTTP_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(host_error)?;
+    if bytes.len() > MAX_PLUGIN_HTTP_BYTES {
+        return Err(wasmi::Error::new("plugin HTTP response exceeds 1 MiB"));
+    }
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(json!({ "status": status, "url": final_url, "body": text }))
+}
+
+fn network_host_matches(pattern: &str, host: &str) -> bool {
+    match pattern.strip_prefix("*.") {
+        Some(domain) => {
+            host.eq_ignore_ascii_case(domain)
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|prefix| prefix.ends_with('.'))
+        }
+        None => host.eq_ignore_ascii_case(pattern),
     }
 }
 
@@ -452,5 +695,89 @@ mod tests {
         .err()
         .unwrap();
         assert!(format!("{error:#}").contains("fuel"));
+    }
+
+    #[test]
+    fn plugin_http_requests_require_https_and_declared_hosts() {
+        let limits = StoreLimitsBuilder::new().build();
+        let mut state = HostState {
+            document: ArticleDocument::parse("<html></html>").unwrap(),
+            title: String::new(),
+            url: "https://news.google.com/rss/articles/id".into(),
+            stage: PluginStage::ResolveUrl,
+            capabilities: vec![PluginCapability::NetworkRequest],
+            network_hosts: vec!["news.google.com".into()],
+            results: HashMap::new(),
+            result_bytes: 0,
+            read_bytes: 0,
+            next_result: 1,
+            calls: 0,
+            body: None,
+            resolved_url: None,
+            network_requests: 0,
+            limits,
+        };
+        let unlisted = plugin_http_request(
+            &mut state,
+            &json!({"method":"GET","url":"https://example.com/"}),
+        );
+        assert!(unlisted.is_err());
+        assert_eq!(state.network_requests, 1);
+
+        let insecure = plugin_http_request(
+            &mut state,
+            &json!({"method":"GET","url":"http://news.google.com/"}),
+        );
+        assert!(insecure.is_err());
+        assert_eq!(state.network_requests, 2);
+    }
+
+    #[test]
+    fn resolver_destination_rejects_credentials_and_non_web_schemes() {
+        assert!(
+            validate_resolved_url(
+                "https://news.google.com/article",
+                "https://user:pass@example.com/story"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_resolved_url("https://news.google.com/article", "file:///etc/passwd").is_err()
+        );
+        assert!(
+            validate_resolved_url(
+                "https://news.google.com/article",
+                "https://example.com/story"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn resolver_stage_runs_the_wasm_abi_without_network_access() {
+        let error = resolve_url(
+            &applied_module(),
+            "resolver-test-module",
+            "https://news.google.com/rss/articles/example",
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("without setting a URL"));
+    }
+
+    #[test]
+    fn bundled_google_resolver_wasm_starts_without_implicit_network_permission() {
+        let module =
+            include_bytes!("../../../plugins/community/community.google-news-resolver/plugin.wasm");
+        let error = resolve_url(
+            module,
+            "google-resolver-fixture",
+            "https://news.google.com/rss/articles/example",
+            &[],
+            &["news.google.com".into()],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("declare document.read or network_request"));
     }
 }

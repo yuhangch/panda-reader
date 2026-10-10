@@ -156,3 +156,55 @@ pub enum Command {
         reply: oneshot::Sender<Result<String, String>>,
     },
 }
+
+impl Command {
+    pub fn reject(self, message: String) {
+        match self {
+            Self::CommunityPluginCatalog { reply } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::InstallCommunityPlugin { reply, .. }
+            | Self::PluginList { reply }
+            | Self::ReloadPlugins { reply }
+            | Self::SetPluginEnabled { reply, .. }
+            | Self::ImportPlugin { reply, .. }
+            | Self::RemovePlugin { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::Snapshot { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::Article { reply, .. } | Self::Translate { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::SaveReadingProgress { reply, .. }
+            | Self::Disconnect { reply, .. }
+            | Self::AddFeed { reply, .. }
+            | Self::RemoveFeed { reply, .. }
+            | Self::UpdateFeed { reply, .. }
+            | Self::SetFeedAutoTranslateTitles { reply, .. }
+            | Self::Mark { reply, .. }
+            | Self::Extract { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::Connect { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::RefreshFeed { reply, .. }
+            | Self::Refresh { reply, .. }
+            | Self::MarkAllRead { reply, .. }
+            | Self::ImportOpml { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::TranslateTitles { reply, .. } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::TranslationUsage { reply } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::ExportOpml { reply } => {
+                let _ = reply.send(Err(message));
+            }
+        }
+    }
+}

@@ -20,7 +20,8 @@ VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$")
 
 def normalized_bytes(path: Path) -> bytes:
     # Git stores repository text with LF even when a Windows checkout uses CRLF.
-    return path.read_bytes().replace(b"\r\n", b"\n")
+    contents = path.read_bytes()
+    return contents if path.suffix == ".wasm" else contents.replace(b"\r\n", b"\n")
 
 
 def generate_index(root: Path) -> dict[str, Any]:
@@ -40,6 +41,8 @@ def generate_index(root: Path) -> dict[str, Any]:
         api_version = manifest.get("api_version")
         min_app_version = manifest.get("min_app_version")
         kind = manifest.get("kind")
+        capabilities = manifest.get("capabilities", [])
+        network_hosts = manifest.get("network_hosts", [])
 
         if not isinstance(plugin_id, str) or not plugin_id.startswith("community."):
             raise ValueError(f"{manifest_path}: plugin ID must start with 'community.'")
@@ -59,6 +62,14 @@ def generate_index(root: Path) -> dict[str, Any]:
             raise ValueError(f"{manifest_path}: min_app_version must use semantic version syntax")
         if kind not in {"rules", "wasm"}:
             raise ValueError(f"{manifest_path}: kind must be 'rules' or 'wasm'")
+        if not isinstance(capabilities, list) or not all(
+            isinstance(item, str) for item in capabilities
+        ):
+            raise ValueError(f"{manifest_path}: capabilities must be a list of strings")
+        if not isinstance(network_hosts, list) or not all(
+            isinstance(item, str) for item in network_hosts
+        ):
+            raise ValueError(f"{manifest_path}: network_hosts must be a list of strings")
 
         payload_name = "rules.toml" if kind == "rules" else "plugin.wasm"
         file_entries: dict[str, dict[str, str]] = {}
@@ -84,6 +95,8 @@ def generate_index(root: Path) -> dict[str, Any]:
                 "api_version": api_version,
                 "min_app_version": min_app_version,
                 "kind": kind,
+                "capabilities": capabilities,
+                "network_hosts": network_hosts,
                 "files": file_entries,
             }
         )

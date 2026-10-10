@@ -15,7 +15,7 @@ min_app_version = "0.2.0"
 kind = "rules" # or "wasm"
 domains = ["example.com", "*.example.net"]
 path_prefixes = ["/articles/"]
-stage = "cleanup" # or "prepare"
+stage = "cleanup" # "prepare" or "resolve_url" for Wasm plugins
 priority = 20
 capabilities = ["document_read", "document_write"]
 ```
@@ -31,6 +31,12 @@ both the domain and path must match.
 `prepare` plugins can repair source HTML before extraction; `cleanup` plugins process RSS content
 or extracted article content. Plugins run by descending `priority`, then by plugin ID. Capabilities
 declare which host document operations the plugin needs; undeclared operations are rejected.
+
+Wasm URL resolvers run before the host downloads an article page. They must declare
+`article_url_write`; plugins that perform requests must also declare `network_request` and an exact
+`network_hosts` allowlist, for example `network_hosts = ["news.google.com"]`. Network requests are
+available only during `resolve_url`, use HTTPS, and are made by the host with size and time limits.
+Wildcard network hosts and IP literals are rejected.
 
 See the [rules example](https://github.com/yuhangch/panda-reader/tree/main/docs/plugins/examples/rules)
 for a complete manifest and payload.

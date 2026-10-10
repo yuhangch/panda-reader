@@ -20,7 +20,7 @@ use std::{
         Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc,
-        mpsc::SyncSender,
+        mpsc::{SyncSender, TrySendError},
     },
     thread,
 };
@@ -29,13 +29,66 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_PLUGIN_DOWNLOAD_BYTES: usize = 8 * 1024 * 1024;
 const COMMUNITY_PLUGIN_CATALOG_URL: &str = "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/index.json";
 const MAX_PLUGIN_CATALOG_BYTES: usize = 2 * 1024 * 1024;
+const COMMAND_QUEUE_CAPACITY: usize = 512;
 
 #[derive(Clone)]
 pub struct AppServices {
-    sender: mpsc::UnboundedSender<Command>,
+    sender: mpsc::Sender<Command>,
     workspace: Arc<RwLock<String>>,
     detailed_sync_logging: Arc<AtomicBool>,
     database_path: PathBuf,
+    pub(super) article_work_cancellations: ArticleWorkCancellations,
+}
+
+type ArticleWorkKey = (String, i64);
+type ArticleWorkCancellations =
+    Arc<Mutex<HashMap<ArticleWorkKey, Vec<(u64, tokio::sync::watch::Sender<bool>)>>>>;
+
+pub(super) fn register_article_work(
+    cancellations: &ArticleWorkCancellations,
+    workspace: &str,
+    article_id: i64,
+) -> (u64, tokio::sync::watch::Receiver<bool>) {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let (sender, receiver) = tokio::sync::watch::channel(false);
+    lock_mutex(cancellations, "article task cancellation")
+        .entry((workspace.to_owned(), article_id))
+        .or_default()
+        .push((id, sender));
+    (id, receiver)
+}
+
+pub(super) fn finish_article_work(
+    cancellations: &ArticleWorkCancellations,
+    workspace: &str,
+    article_id: i64,
+    id: u64,
+) {
+    let mut cancellations = lock_mutex(cancellations, "article task cancellation");
+    let key = (workspace.to_owned(), article_id);
+    if let Some(tasks) = cancellations.get_mut(&key) {
+        tasks.retain(|(task_id, _)| *task_id != id);
+        if tasks.is_empty() {
+            cancellations.remove(&key);
+        }
+    }
+}
+
+fn cancel_article_work(cancellations: &ArticleWorkCancellations, workspace: &str, article_id: i64) {
+    if let Some(tasks) = lock_mutex(cancellations, "article task cancellation")
+        .get(&(workspace.to_owned(), article_id))
+    {
+        for (_, sender) in tasks {
+            sender.send_replace(true);
+        }
+    }
+}
+
+pub(super) async fn wait_for_article_work_cancel(mut receiver: tokio::sync::watch::Receiver<bool>) {
+    if !*receiver.borrow() {
+        let _ = receiver.changed().await;
+    }
 }
 
 impl AppServices {
@@ -54,10 +107,12 @@ impl AppServices {
         let settings = Arc::new(RwLock::new(initial_settings));
         let workspace = Arc::new(RwLock::new(active_workspace.to_owned()));
         let worker_workspace = workspace.clone();
+        let article_work_cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let worker_article_work_cancellations = article_work_cancellations.clone();
         let detailed_sync_logging = Arc::new(AtomicBool::new(detailed_sync_logging));
         let worker_detailed_sync_logging = detailed_sync_logging.clone();
         let body_cache = Arc::new(Mutex::new(RenderCache::default()));
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Command>();
+        let (sender, mut receiver) = mpsc::channel::<Command>(COMMAND_QUEUE_CAPACITY);
         thread::Builder::new()
             .name("panda-reader-services".into())
             .spawn(move || {
@@ -112,6 +167,7 @@ impl AppServices {
                         body_cache,
                         title_translation_lock: Arc::new(Mutex::new(())),
                         title_translation_attempted: Arc::new(Mutex::new(HashMap::new())),
+                        article_work_cancellations: worker_article_work_cancellations,
                     };
                     loop {
                         let Some(command) = receiver.recv().await else {
@@ -136,11 +192,29 @@ impl AppServices {
             workspace,
             detailed_sync_logging,
             database_path,
+            article_work_cancellations,
         }
     }
 
     pub fn send(&self, command: Command) {
-        let _ = self.sender.send(command);
+        if let Err(error) = self.sender.try_send(command) {
+            let (command, message) = match error {
+                mpsc::error::TrySendError::Full(command) => (
+                    command,
+                    "Panda Reader is busy; the command queue is full".to_owned(),
+                ),
+                mpsc::error::TrySendError::Closed(command) => (
+                    command,
+                    "Panda Reader background services are unavailable".to_owned(),
+                ),
+            };
+            command.reject(message);
+        }
+    }
+
+    pub fn cancel_article_work(&self, article_id: i64) {
+        let workspace = read_lock(&self.workspace, "active workspace").clone();
+        cancel_article_work(&self.article_work_cancellations, &workspace, article_id);
     }
 
     pub fn set_workspace(&self, workspace: &str) {
@@ -169,6 +243,16 @@ pub struct WorkerState {
     pub body_cache: Arc<Mutex<RenderCache>>,
     pub title_translation_lock: Arc<Mutex<()>>,
     pub title_translation_attempted: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    pub(super) article_work_cancellations: ArticleWorkCancellations,
+}
+
+pub(super) fn remote_mark_lock(workspace: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_mutex(locks, "remote mark serialization")
+        .entry(workspace.to_owned())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn load_plugin_registry(plugin_dir: &std::path::Path) -> PluginRegistry {
@@ -535,6 +619,13 @@ pub(super) fn job<T: Send + 'static>(
     reply: oneshot::Sender<Result<T, String>>,
     run: impl FnOnce(&tokio::runtime::Runtime) -> Result<T, String> + Send + 'static,
 ) {
+    let _ = try_job(reply, run);
+}
+
+pub(super) fn try_job<T: Send + 'static>(
+    reply: oneshot::Sender<Result<T, String>>,
+    run: impl FnOnce(&tokio::runtime::Runtime) -> Result<T, String> + Send + 'static,
+) -> bool {
     type BackgroundJob = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
     static JOBS: OnceLock<SyncSender<BackgroundJob>> = OnceLock::new();
     let sender = JOBS.get_or_init(|| {
@@ -562,6 +653,8 @@ pub(super) fn job<T: Send + 'static>(
         }
         sender
     });
+    let reply_slot = Arc::new(Mutex::new(Some(reply)));
+    let worker_reply = reply_slot.clone();
     let task: BackgroundJob = Box::new(move |runtime| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(runtime)))
             .unwrap_or_else(|panic| {
@@ -570,9 +663,28 @@ pub(super) fn job<T: Send + 'static>(
                     panic_message(&*panic)
                 ))
             });
-        let _ = reply.send(result);
+        if let Some(reply) = lock_mutex(&worker_reply, "background job reply").take() {
+            let _ = reply.send(result);
+        }
     });
-    let _ = sender.send(task);
+    match sender.try_send(task) {
+        Ok(()) => true,
+        Err(error) => {
+            let (task, message) = match error {
+                TrySendError::Full(task) => {
+                    (task, "Background task queue is full; try again shortly")
+                }
+                TrySendError::Disconnected(task) => {
+                    (task, "Background task workers are unavailable")
+                }
+            };
+            drop(task);
+            if let Some(reply) = lock_mutex(&reply_slot, "background job reply").take() {
+                let _ = reply.send(Err(message.to_owned()));
+            }
+            false
+        }
+    }
 }
 
 fn panic_message(panic: &(dyn Any + Send)) -> &str {
@@ -581,6 +693,53 @@ fn panic_message(panic: &(dyn Any + Send)) -> &str {
         .copied()
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("unknown panic")
+}
+
+#[cfg(test)]
+mod article_cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelling_an_article_notifies_all_running_tasks_for_that_workspace() {
+        let cancellations = Arc::new(Mutex::new(HashMap::new()));
+        let (first_id, mut first) = register_article_work(&cancellations, "local", 7);
+        let (second_id, mut second) = register_article_work(&cancellations, "local", 7);
+        let (_, other_workspace) = register_article_work(&cancellations, "provider:miniflux", 7);
+
+        cancel_article_work(&cancellations, "local", 7);
+
+        assert!(*first.borrow_and_update());
+        assert!(*second.borrow_and_update());
+        assert!(!*other_workspace.borrow());
+        finish_article_work(&cancellations, "local", 7, first_id);
+        finish_article_work(&cancellations, "local", 7, second_id);
+        assert_eq!(lock_mutex(&cancellations, "test cancellations").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_mark_flushes_share_a_workspace_serialization_lock() {
+        let first = remote_mark_lock("provider:miniflux");
+        let second = remote_mark_lock("provider:miniflux");
+        let other = remote_mark_lock("provider:freshrss");
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &other));
+
+        let guard = first.lock().await;
+        let (started_tx, started_rx) = oneshot::channel();
+        let (finished_tx, mut finished_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let _ = started_tx.send(());
+            let _guard = second.lock().await;
+            let _ = finished_tx.send(());
+        });
+        started_rx.await.unwrap();
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        drop(guard);
+        finished_rx.await.unwrap();
+    }
 }
 
 pub(super) fn lock_mutex<'a, T>(lock: &'a Mutex<T>, name: &str) -> MutexGuard<'a, T> {

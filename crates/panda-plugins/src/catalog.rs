@@ -1,6 +1,6 @@
 //! Validated metadata and payload verification for the community plugin catalog.
 
-use crate::{PluginKind, PluginManifest};
+use crate::{PluginCapability, PluginKind, PluginManifest};
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -30,6 +30,10 @@ pub struct CommunityPlugin {
     pub api_version: u32,
     pub min_app_version: String,
     pub kind: PluginKind,
+    #[serde(default)]
+    pub capabilities: Vec<PluginCapability>,
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
     pub files: BTreeMap<String, CommunityPluginFile>,
 }
 
@@ -75,6 +79,16 @@ impl CommunityPlugin {
         }
         if self.name.trim().is_empty() || self.api_version == 0 {
             bail!("community plugin {} has incomplete metadata", self.id);
+        }
+        if self
+            .capabilities
+            .contains(&PluginCapability::NetworkRequest)
+            != !self.network_hosts.is_empty()
+        {
+            bail!(
+                "community plugin {} has incomplete network metadata",
+                self.id
+            );
         }
         let payload_name = match self.kind {
             PluginKind::Rules => "rules.toml",
@@ -133,6 +147,8 @@ pub(crate) fn install_verified(
         || manifest.version != plugin.version
         || manifest.api_version != plugin.api_version
         || manifest.kind != plugin.kind
+        || manifest.capabilities != plugin.capabilities
+        || manifest.network_hosts != plugin.network_hosts
     {
         bail!("downloaded plugin manifest does not match the catalog entry");
     }
@@ -210,6 +226,17 @@ mod tests {
                 .iter()
                 .any(|plugin| plugin.id == "community.qbitai")
         );
+        let google = catalog
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "community.google-news-resolver")
+            .unwrap();
+        assert!(
+            google
+                .capabilities
+                .contains(&PluginCapability::NetworkRequest)
+        );
+        assert_eq!(google.network_hosts, ["news.google.com"]);
     }
 
     #[test]
@@ -231,6 +258,11 @@ capabilities = ["document_read", "document_write"]
             api_version: 1,
             min_app_version: "0.2.0".into(),
             kind: PluginKind::Rules,
+            capabilities: vec![
+                PluginCapability::DocumentRead,
+                PluginCapability::DocumentWrite,
+            ],
+            network_hosts: Vec::new(),
             files: BTreeMap::from([
                 (
                     "manifest.toml".into(),
@@ -275,6 +307,8 @@ capabilities = ["document_read", "document_write"]
                 api_version: 1,
                 min_app_version: "0.2.0".into(),
                 kind: PluginKind::Rules,
+                capabilities: Vec::new(),
+                network_hosts: Vec::new(),
                 files: BTreeMap::from([
                     (
                         "manifest.toml".into(),

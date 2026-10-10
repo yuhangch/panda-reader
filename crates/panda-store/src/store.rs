@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
+
+const MAX_FEED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ARTICLE_PAGE_BYTES: usize = 20 * 1024 * 1024;
 use url::Url;
 
 pub struct Store {
@@ -130,6 +133,51 @@ impl Store {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let schema_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let has_existing_schema: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_legacy_feeds_table: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='feeds')",
+            [],
+            |row| row.get(0),
+        )?;
+        let feed_columns = if has_legacy_feeds_table {
+            let mut statement = connection.prepare("PRAGMA table_info(feeds)")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let needs_foreign_key_toggle =
+            has_legacy_feeds_table && !feed_columns.iter().any(|column| column == "workspace");
+        if schema_version < 5 && has_existing_schema {
+            connection.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            let timestamp = chrono::Utc::now().timestamp_millis();
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+            let backup_path =
+                path.with_file_name(format!("{file_name}.pre-migration-{timestamp}.bak"));
+            std::fs::copy(path, &backup_path)?;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&backup_path)?
+                .sync_all()?;
+        }
+        if needs_foreign_key_toggle {
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+        }
+        // SQLite DDL and user_version changes are transactional. If any step below
+        // fails, dropping the connection rolls back the entire migration.
+        connection.execute_batch("BEGIN IMMEDIATE")?;
         if schema_version < 4 {
             connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS feeds (
@@ -349,6 +397,25 @@ impl Store {
             )?;
             connection.pragma_update(None, "user_version", 5)?;
         }
+        if schema_version < 5 {
+            let integrity: String =
+                connection.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;
+            if integrity != "ok" {
+                anyhow::bail!("database integrity check failed after migration: {integrity}");
+            }
+            let foreign_key_errors: usize = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if foreign_key_errors != 0 {
+                anyhow::bail!(
+                    "database migration left {foreign_key_errors} foreign-key violations"
+                );
+            }
+        }
+        connection.execute_batch("COMMIT")?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         Ok(())
     }
 
@@ -501,9 +568,9 @@ impl Store {
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
-        let bytes = response.bytes().await?;
+        let bytes = read_response_limited(response, MAX_FEED_RESPONSE_BYTES, "RSS feed").await?;
         Ok(FetchedFeed {
-            parsed: Some(feed_rs::parser::parse(bytes.as_ref())?),
+            parsed: Some(feed_rs::parser::parse(bytes.as_slice())?),
             etag: next_etag,
             modified: next_modified,
         })
@@ -1347,23 +1414,62 @@ impl Store {
         last_full_sync_at: Option<&str>,
         reset: bool,
     ) -> anyhow::Result<()> {
+        let transaction = self.connection.unchecked_transaction()?;
         if reset {
-            self.connection.execute(
-                "DELETE FROM feeds WHERE source=?1 AND workspace=?2",
-                params![kind.key(), self.workspace],
+            transaction.execute(
+                "DELETE FROM feeds WHERE workspace=?1 AND source IS NOT NULL AND source<>'local'",
+                [&self.workspace],
             )?;
-            self.connection.execute(
+            transaction.execute(
                 "DELETE FROM pending_remote_marks WHERE workspace=?1",
                 [&self.workspace],
             )?;
         }
-        self.connection.execute(
+        transaction.execute(
             "INSERT INTO remote_state(workspace,provider,account,sync_cursor,last_sync_at,last_full_sync_at)
              VALUES(?1,?2,?3,?4,NULL,?5)
              ON CONFLICT(workspace) DO UPDATE SET provider=excluded.provider,account=excluded.account,
                 sync_cursor=excluded.sync_cursor,last_full_sync_at=excluded.last_full_sync_at",
             params![self.workspace, kind.key(), account, cursor.map(|value| value.value.as_str()), last_full_sync_at],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Replace an active provider workspace with a fully synchronized staging workspace.
+    /// Keeping the old workspace visible until this transaction commits prevents an account
+    /// switch from discarding its cached subscriptions when network synchronization fails.
+    pub fn promote_provider_workspace(
+        &mut self,
+        provider: ProviderKind,
+        staging_workspace: &str,
+    ) -> anyhow::Result<()> {
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM feeds WHERE workspace=?1 AND source IS NOT NULL AND source<>'local'",
+            [&self.workspace],
+        )?;
+        transaction.execute(
+            "DELETE FROM pending_remote_marks WHERE workspace=?1",
+            [&self.workspace],
+        )?;
+        transaction.execute(
+            "DELETE FROM remote_state WHERE workspace=?1",
+            [&self.workspace],
+        )?;
+        transaction.execute(
+            "UPDATE feeds SET workspace=?1 WHERE workspace=?2 AND source=?3",
+            params![self.workspace, staging_workspace, provider.key()],
+        )?;
+        transaction.execute(
+            "UPDATE pending_remote_marks SET workspace=?1 WHERE workspace=?2",
+            params![self.workspace, staging_workspace],
+        )?;
+        transaction.execute(
+            "UPDATE remote_state SET workspace=?1 WHERE workspace=?2",
+            params![self.workspace, staging_workspace],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2027,7 +2133,14 @@ impl Store {
         prepare: impl FnOnce(&str, &str, &str) -> anyhow::Result<Option<(String, bool)>>,
     ) -> anyhow::Result<()> {
         if let Some(prepared) = self
-            .prepare_extraction_using(article_id, force, extractor, pipeline_hash, prepare)
+            .prepare_extraction_using(
+                article_id,
+                force,
+                extractor,
+                pipeline_hash,
+                |url| Ok(url.to_owned()),
+                prepare,
+            )
             .await?
         {
             self.persist_extraction(prepared)?;
@@ -2041,6 +2154,7 @@ impl Store {
         force: bool,
         extractor: ContentExtractor,
         pipeline_hash: &str,
+        resolve_url: impl FnOnce(&str) -> anyhow::Result<String>,
         prepare: impl FnOnce(&str, &str, &str) -> anyhow::Result<Option<(String, bool)>>,
     ) -> anyhow::Result<Option<PreparedExtraction>> {
         let (existing, existing_hash, cached_page): (Option<String>, Option<String>, Option<Vec<u8>>) = self.connection.query_row(
@@ -2065,8 +2179,9 @@ impl Store {
         let (resolved, raw) = if !force && let Some(cached) = cached_page {
             (url.clone(), decompress_html(&cached)?)
         } else {
-            let resolved = resolve_readable_url(&self.client, &url).await?;
-            let raw = fetch_html(&self.client, &resolved, Some("https://news.google.com/")).await?;
+            let resolved = resolve_url(&url)?;
+            let referer = (resolved != url).then_some(url.as_str());
+            let raw = fetch_html(&self.client, &resolved, referer).await?;
             (resolved, raw)
         };
         let mut cache_hasher = Sha256::new();
@@ -2455,8 +2570,7 @@ fn migrate_workspace_schema(connection: &Connection) -> anyhow::Result<()> {
     };
     if !has_workspace {
         connection.execute_batch(
-            "PRAGMA foreign_keys=OFF;
-             BEGIN IMMEDIATE;
+            "SAVEPOINT workspace_migration;
              CREATE TABLE feeds_workspace (
                 id INTEGER PRIMARY KEY,
                 feed_url TEXT NOT NULL,
@@ -2484,8 +2598,7 @@ fn migrate_workspace_schema(connection: &Connection) -> anyhow::Result<()> {
         connection.execute_batch(
             "DROP TABLE feeds;
              ALTER TABLE feeds_workspace RENAME TO feeds;
-             COMMIT;
-             PRAGMA foreign_keys=ON;",
+             RELEASE SAVEPOINT workspace_migration;",
         )?;
     }
 
@@ -2603,31 +2716,6 @@ fn resolve_url(base: &str, value: &str) -> String {
 }
 
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-const GOOGLE_CONSENT_COOKIE: &str = "SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg";
-
-fn google_news_article_id(url: &str) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
-    if parsed.host_str() != Some("news.google.com") {
-        return None;
-    }
-    let mut segments = parsed.path_segments()?.peekable();
-    while let Some(segment) = segments.next() {
-        if segment == "articles" {
-            let id = segments.next()?;
-            if !id.is_empty() {
-                return Some(id.to_owned());
-            }
-        }
-    }
-    None
-}
-
-fn html_attr_value<'a>(html: &'a str, name: &str) -> Option<&'a str> {
-    let needle = format!("{name}=\"");
-    let start = html.find(&needle)? + needle.len();
-    let end = html[start..].find('"')? + start;
-    Some(&html[start..end])
-}
 
 async fn fetch_html(client: &Client, url: &str, referer: Option<&str>) -> anyhow::Result<String> {
     let mut request = client
@@ -2641,9 +2729,6 @@ async fn fetch_html(client: &Client, url: &str, referer: Option<&str>) -> anyhow
             reqwest::header::ACCEPT_LANGUAGE,
             "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
         );
-    if google_news_article_id(url).is_some() {
-        request = request.header(reqwest::header::COOKIE, GOOGLE_CONSENT_COOKIE);
-    }
     if let Some(referer) = referer {
         request = request.header(reqwest::header::REFERER, referer);
     }
@@ -2654,103 +2739,49 @@ async fn fetch_html(client: &Client, url: &str, referer: Option<&str>) -> anyhow
             "Publisher blocked automated article downloads ({status}). Open the original page instead."
         );
     }
-    Ok(response.error_for_status()?.text().await?)
+    let response = response.error_for_status()?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let bytes = read_response_limited(response, MAX_ARTICLE_PAGE_BYTES, "article page").await?;
+    let charset = content_type
+        .split(';')
+        .find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("charset")
+                .then_some(value.trim())
+        })
+        .unwrap_or("utf-8")
+        .trim_matches([' ', '\'', '"']);
+    let encoding =
+        encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
+    Ok(encoding.decode(&bytes).0.into_owned())
 }
 
-async fn resolve_readable_url(client: &Client, url: &str) -> anyhow::Result<String> {
-    let Some(article_id) = google_news_article_id(url) else {
-        return Ok(url.to_owned());
-    };
-    let page = fetch_html(client, url, None).await?;
-    let signature = html_attr_value(&page, "data-n-a-sg")
-        .ok_or_else(|| anyhow::anyhow!("Google News page is missing a decode signature"))?;
-    let timestamp = html_attr_value(&page, "data-n-a-ts")
-        .ok_or_else(|| anyhow::anyhow!("Google News page is missing a decode timestamp"))?
-        .parse::<i64>()
-        .context("Invalid Google News decode timestamp")?;
-    let shell = serde_json::json!([
-        [
-            "X",
-            "X",
-            ["X", "X"],
-            null,
-            null,
-            1,
-            1,
-            "US:en",
-            null,
-            1,
-            null,
-            null,
-            null,
-            null,
-            null,
-            0,
-            1
-        ],
-        "X",
-        "X",
-        1,
-        [1, 1, 1],
-        1,
-        1,
-        null,
-        0,
-        0,
-        null,
-        0
-    ]);
-    let inner = serde_json::json!(["garturlreq", shell, article_id, timestamp, signature]);
-    let f_req = serde_json::json!([[["Fbv4je", inner.to_string(), null, "generic"]]]);
-    let response = client
-        .post("https://news.google.com/_/DotsSplashUi/data/batchexecute")
-        .header(reqwest::header::USER_AGENT, BROWSER_UA)
-        .header(reqwest::header::COOKIE, GOOGLE_CONSENT_COOKIE)
-        .header(reqwest::header::REFERER, "https://news.google.com/")
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded;charset=UTF-8",
-        )
-        .form(&[("f.req", f_req.to_string())])
-        .send()
-        .await?
-        .error_for_status()?
-        .text()
-        .await?;
-    parse_google_news_batch_url(&response)
-        .ok_or_else(|| anyhow::anyhow!("Could not decode Google News article URL"))
-}
-
-fn parse_google_news_batch_url(body: &str) -> Option<String> {
-    let trimmed = body.trim_start();
-    let trimmed = trimmed
-        .strip_prefix(")]}'")
-        .map(str::trim_start)
-        .unwrap_or(trimmed);
-    let json_start = trimmed.find('[')?;
-    let envelopes: Vec<serde_json::Value> = serde_json::from_str(&trimmed[json_start..]).ok()?;
-    for envelope in envelopes {
-        let Some(rows) = envelope.as_array() else {
-            continue;
-        };
-        if rows.first().and_then(|value| value.as_str()) != Some("wrb.fr") {
-            continue;
-        }
-        if rows.get(1).and_then(|value| value.as_str()) != Some("Fbv4je") {
-            continue;
-        }
-        let payload = rows.get(2)?.as_str()?;
-        let decoded: serde_json::Value = serde_json::from_str(payload).ok()?;
-        let rows = decoded.as_array()?;
-        if rows.first().and_then(|value| value.as_str()) != Some("garturlres") {
-            continue;
-        }
-        let url = rows.get(1)?.as_str()?;
-        if url.starts_with("http://") || url.starts_with("https://") {
-            return Some(url.to_owned());
-        }
+async fn read_response_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("{label} response exceeds the {limit}-byte limit");
     }
-    None
+    let mut bytes =
+        Vec::with_capacity(response.content_length().unwrap_or(0).min(limit as u64) as usize);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("{label} response exceeds the {limit}-byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 fn collect_outlines(
@@ -2813,6 +2844,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!((last_id, complete), (0, 0));
+        assert!(
+            std::fs::read_dir(directory.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("pre-migration-"))
+        );
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
@@ -2829,6 +2869,33 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sqlite_schema", [], |row| row.get(0))
             .unwrap();
         assert_eq!(before, after);
+    }
+
+    #[tokio::test]
+    async fn feed_download_rejects_oversized_declared_and_streamed_bodies() {
+        use std::{io::Write as _, net::TcpListener};
+
+        for response in [
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/feed", listener.local_addr().unwrap());
+            let response = response.to_vec();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut request = [0u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let _ = stream.write_all(&response);
+            });
+            let response = Client::new().get(url).send().await.unwrap();
+            let error = read_response_limited(response, 5, "test feed")
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("5-byte limit"));
+            server.join().unwrap();
+        }
     }
 
     #[test]
@@ -3220,6 +3287,80 @@ mod tests {
                 .feeds[0]
                 .title,
             "Remote feed"
+        );
+    }
+
+    #[test]
+    fn provider_workspace_promotion_keeps_active_data_until_commit() {
+        let (directory, mut active) = test_store_for("provider:miniflux");
+        let path = directory.path().join("reader.sqlite3");
+        active.connection.execute(
+            "INSERT INTO feeds(id,feed_url,title,source,remote_id,workspace) VALUES(1,'https://old.example/feed','Old account','miniflux',1,'provider:miniflux')",
+            [],
+        ).unwrap();
+        active
+            .connection
+            .execute(
+                "INSERT INTO articles(id,feed_id,guid,title) VALUES(11,1,'old-guid','Old article')",
+                [],
+            )
+            .unwrap();
+        active.connection.execute(
+            "INSERT INTO feeds(id,feed_url,title,source,remote_id,workspace) VALUES(2,'https://local.example/feed','Local feed','local',NULL,'local')",
+            [],
+        ).unwrap();
+
+        let staging = Store::open_writer(&path, "provider:miniflux:staging").unwrap();
+        staging.connection.execute(
+            "INSERT INTO feeds(id,feed_url,title,source,remote_id,workspace) VALUES(3,'https://new.example/feed','New account','miniflux',1,'provider:miniflux:staging')",
+            [],
+        ).unwrap();
+        staging
+            .connection
+            .execute(
+                "INSERT INTO articles(id,feed_id,guid,title) VALUES(33,3,'new-guid','New article')",
+                [],
+            )
+            .unwrap();
+        staging.connection.execute(
+            "INSERT INTO remote_state(workspace,provider,account) VALUES('provider:miniflux:staging','miniflux','new-account')",
+            [],
+        ).unwrap();
+
+        assert_eq!(
+            active
+                .snapshot(Scope::All, "", 20, None, true)
+                .unwrap()
+                .feeds[0]
+                .title,
+            "Old account"
+        );
+        active
+            .promote_provider_workspace(ProviderKind::Miniflux, "provider:miniflux:staging")
+            .unwrap();
+
+        assert_eq!(
+            active
+                .snapshot(Scope::All, "", 20, None, true)
+                .unwrap()
+                .feeds[0]
+                .title,
+            "New account"
+        );
+        assert_eq!(active.article(33).unwrap().summary.title, "New article");
+        assert!(active.article(11).is_err());
+        assert_eq!(
+            active.provider_sync_state().unwrap().unwrap().account,
+            "new-account"
+        );
+        let local = Store::open_writer(&path, "local").unwrap();
+        assert_eq!(
+            local
+                .snapshot(Scope::All, "", 20, None, true)
+                .unwrap()
+                .feeds[0]
+                .title,
+            "Local feed"
         );
     }
 
@@ -4087,43 +4228,6 @@ mod tests {
         assert!(!text.contains("Related ads"));
         assert!(!html.to_ascii_lowercase().contains("<nav"));
         assert!(!html.to_ascii_lowercase().contains("<footer"));
-    }
-
-    #[test]
-    fn google_news_wrapper_ids_are_detected_from_article_urls() {
-        assert_eq!(
-            google_news_article_id("https://news.google.com/rss/articles/CBMiEXAMPLE?oc=5")
-                .as_deref(),
-            Some("CBMiEXAMPLE")
-        );
-        assert_eq!(
-            google_news_article_id("https://news.google.com/articles/CBMiEXAMPLE").as_deref(),
-            Some("CBMiEXAMPLE")
-        );
-        assert_eq!(
-            google_news_article_id("https://www.theguardian.com/world/article"),
-            None
-        );
-    }
-
-    #[test]
-    fn google_news_batch_response_yields_publisher_url() {
-        let body = r#")]}'
-
-26
-[["wrb.fr","Fbv4je","[\"garturlres\",\"https://www.example.com/story\",1]",null,null,null,"generic"]]
-"#;
-        assert_eq!(
-            parse_google_news_batch_url(body).as_deref(),
-            Some("https://www.example.com/story")
-        );
-        assert_eq!(
-            html_attr_value(
-                r#"<div data-n-a-sg="sig123" data-n-a-ts="42"></div>"#,
-                "data-n-a-sg"
-            ),
-            Some("sig123")
-        );
     }
 
     #[test]

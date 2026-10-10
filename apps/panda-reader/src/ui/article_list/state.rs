@@ -17,6 +17,7 @@ pub(in crate::ui) struct ArticleList {
     pub(in crate::ui) snapshot_revision: u64,
     pub(in crate::ui) is_loading: bool,
     pub(in crate::ui) is_loading_more: bool,
+    pub(in crate::ui) pending_navigation: Option<(isize, bool, usize)>,
 }
 
 impl ArticleList {
@@ -61,6 +62,7 @@ impl ArticleList {
             snapshot_revision: 0,
             is_loading: true,
             is_loading_more: false,
+            pending_navigation: None,
             _subscriptions,
         }
     }

@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 dom_smoothie.workspace = true
 decruft.workspace = true
+encoding_rs.workspace = true
 rs-trafilatura.workspace = true
 feed-rs.workspace = true
 flate2.workspace = true

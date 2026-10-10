@@ -66,6 +66,12 @@ impl ReaderWindow {
 
     pub(in crate::ui) fn open_article(&mut self, id: i64, cx: &mut Context<Self>) {
         self.save_current_reading_progress();
+        if let Some(previous_id) = self.reader.requested_article_id
+            && previous_id != id
+        {
+            self.services.cancel_article_work(previous_id);
+        }
+        self.reader.requested_article_id = Some(id);
         let revision = self.reader.request_epoch.next();
         self.reader.progress_epoch = self.reader.progress_epoch.wrapping_add(1);
         self.reader.restore_progress = None;
@@ -94,7 +100,7 @@ impl ReaderWindow {
                     .sidebar
                     .feeds
                     .iter_mut()
-                    .find(|feed| feed.title == summary.feed_title)
+                    .find(|feed| feed.id == summary.feed_id)
                 {
                     feed.unread = feed.unread.saturating_sub(1);
                 }
@@ -287,6 +293,9 @@ impl ReaderWindow {
             });
         let feed_id = current.map(|(feed_id, _)| feed_id);
         let old_read = current.map(|(_, is_read)| is_read).unwrap_or(!value);
+        self.next_mark_revision = self.next_mark_revision.wrapping_add(1);
+        let mark_revision = self.next_mark_revision;
+        self.mark_revisions.insert((id, field), mark_revision);
         let remove_from_scope = matches!(
             (&self.list.scope, field, value),
             (Scope::Unread, MarkField::Read, true)
@@ -337,6 +346,9 @@ impl ReaderWindow {
                 .await
                 .unwrap_or_else(|_| Err("Background service stopped".to_string()));
             let _ = this.update(cx, |this, cx| {
+                if this.mark_revisions.get(&(id, field)) != Some(&mark_revision) {
+                    return;
+                }
                 if let Err(error) = result {
                     if let Some(article) = &mut this.reader.article {
                         if article.summary.id == id {
@@ -372,6 +384,9 @@ impl ReaderWindow {
                 } else if remove_from_scope {
                     Arc::make_mut(&mut this.list.articles).retain(|article| article.id != id);
                     this.load_snapshot(cx);
+                }
+                if this.mark_revisions.get(&(id, field)) == Some(&mark_revision) {
+                    this.mark_revisions.remove(&(id, field));
                 }
                 cx.notify();
             });

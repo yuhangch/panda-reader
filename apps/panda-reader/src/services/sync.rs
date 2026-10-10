@@ -1,7 +1,7 @@
 use super::articles::cache::RenderCache;
 use super::database::DbWriter;
 use super::diagnostics::{LogDetail, write_sync_log};
-use super::worker::{WorkerState, job};
+use super::worker::{WorkerState, job, remote_mark_lock};
 use panda_providers::{ProviderClient, ProviderKind, SyncMode};
 use panda_store::{PendingRemoteMark, Store};
 use std::path::Path;
@@ -275,7 +275,7 @@ fn refresh_local_feeds(
     let feeds = Store::open_read_workspace(path, workspace)
         .and_then(|store| store.local_feeds_to_refresh())
         .map_err(|error| error.to_string())?;
-    let fetched = runtime.block_on(async {
+    let (refreshed, failures) = runtime.block_on(async {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
         let mut tasks = tokio::task::JoinSet::new();
         for feed in feeds {
@@ -299,47 +299,51 @@ fn refresh_local_feeds(
                 Ok::<_, String>((feed, result))
             });
         }
-        let mut output = Vec::new();
+        let mut refreshed = 0;
+        let mut failures = Vec::new();
         while let Some(result) = tasks.join_next().await {
-            output.push(result.map_err(|error| format!("Feed refresh task failed: {error}"))??);
+            let (feed, result) =
+                result.map_err(|error| format!("Feed refresh task failed: {error}"))??;
+            match result {
+                Ok(fetched) => {
+                    let revisions = Store::open_read_workspace(path, workspace)
+                        .and_then(|store| store.article_source_revisions(feed.id))
+                        .map_err(|error| error.to_string());
+                    let prepared = revisions.and_then(|revisions| {
+                        Store::prepare_fetched_feed_with_revisions(&feed.url, fetched, &revisions)
+                            .map_err(|error| error.to_string())
+                    });
+                    match prepared {
+                        Ok(prepared) => {
+                            let changed = !prepared.is_not_modified();
+                            let url = feed.url.clone();
+                            let display_url = url.clone();
+                            let id = feed.id;
+                            match database.write(workspace.to_owned(), move |store| {
+                                store.persist_prepared_feed(&url, Some(id), prepared)?;
+                                Ok(usize::from(changed))
+                            }) {
+                                Ok(count) => refreshed += count,
+                                Err(error) => failures.push(format!("{display_url}: {error}")),
+                            }
+                        }
+                        Err(error) => failures.push(format!("{}: {error}", feed.url)),
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let failure = message.clone();
+                    database
+                        .enqueue(workspace.to_owned(), move |store| {
+                            store.set_feed_refresh_error(feed.id, Some(&failure))
+                        })
+                        .map_err(|enqueue_error| format!("{message}; {enqueue_error}"))?;
+                    failures.push(format!("{}: {message}", feed.url));
+                }
+            }
         }
-        Ok::<_, String>(output)
+        Ok::<_, String>((refreshed, failures))
     })?;
-    let mut refreshed = 0;
-    let mut failures = Vec::new();
-    for (feed, result) in fetched {
-        match result {
-            Ok(fetched) => {
-                let revisions = Store::open_read_workspace(path, workspace)
-                    .and_then(|store| store.article_source_revisions(feed.id))
-                    .map_err(|error| error.to_string())?;
-                let prepared =
-                    Store::prepare_fetched_feed_with_revisions(&feed.url, fetched, &revisions)
-                        .map_err(|error| format!("{}: {error}", feed.url))?;
-                let changed = !prepared.is_not_modified();
-                let url = feed.url.clone();
-                let display_url = url.clone();
-                let id = feed.id;
-                database
-                    .write(workspace.to_owned(), move |store| {
-                        store.persist_prepared_feed(&url, Some(id), prepared)?;
-                        Ok(usize::from(changed))
-                    })
-                    .map_err(|error| format!("{display_url}: {error}"))?;
-                refreshed += changed as usize;
-            }
-            Err(error) => {
-                let message = error.to_string();
-                let failure = message.clone();
-                database
-                    .enqueue(workspace.to_owned(), move |store| {
-                        store.set_feed_refresh_error(feed.id, Some(&failure))
-                    })
-                    .map_err(|enqueue_error| format!("{message}; {enqueue_error}"))?;
-                failures.push(format!("{}: {message}", feed.url));
-            }
-        }
-    }
     if refreshed == 0 && !failures.is_empty() {
         return Err(format!(
             "All feeds failed to refresh: {}",
@@ -439,6 +443,12 @@ async fn sync_provider_async(
         .as_ref()
         .is_some_and(|state| !state.provider.is_empty() && state.provider != kind.key());
     let reset = account_changed || provider_changed;
+    let staging_workspace = format!("{workspace}:staging");
+    let sync_workspace = if reset {
+        staging_workspace.as_str()
+    } else {
+        workspace
+    };
     let cursor = if reset {
         None
     } else {
@@ -482,7 +492,7 @@ async fn sync_provider_async(
     let cursor_for_write = cursor.clone();
     let full_sync_for_write = full_sync_at.clone();
     database
-        .write(workspace.to_owned(), move |store| {
+        .write(sync_workspace.to_owned(), move |store| {
             store.begin_provider_sync(
                 kind,
                 &account,
@@ -493,10 +503,14 @@ async fn sync_provider_async(
         })
         .map_err(|e| e.to_string())?;
 
-    flush_remote_marks(path, workspace, database, remote).await?;
+    if !reset {
+        let remote_lock = remote_mark_lock(workspace);
+        let _guard = remote_lock.lock().await;
+        flush_remote_marks(path, workspace, database, remote).await?;
+    }
 
     let feed_ids = database
-        .write(workspace.to_owned(), move |store| {
+        .write(sync_workspace.to_owned(), move |store| {
             store.save_remote_feeds(&feeds, kind)
         })
         .map_err(|e| e.to_string())?;
@@ -534,7 +548,7 @@ async fn sync_provider_async(
         let cursor_for_write = next_cursor.clone();
         let full_at = (!page.has_more && full_sync).then(|| chrono::Utc::now().to_rfc3339());
         let full_at_for_write = full_at.clone();
-        let known_revisions = Store::open_read_workspace(path, workspace)
+        let known_revisions = Store::open_read_workspace(path, sync_workspace)
             .and_then(|store| store.remote_content_revisions())
             .map_err(|error| error.to_string())?;
         let entries =
@@ -544,7 +558,7 @@ async fn sync_provider_async(
         let ids = feed_ids.clone();
         let persist_started = Instant::now();
         let saved = database
-            .write(workspace.to_owned(), move |store| {
+            .write(sync_workspace.to_owned(), move |store| {
                 let saved = store.save_prepared_remote_entries(&entries, &ids)?;
                 store.update_provider_sync_cursor(
                     cursor_for_write.as_ref(),
@@ -571,6 +585,14 @@ async fn sync_provider_async(
             return Err("Provider returned another sync page without a continuation cursor".into());
         }
         cursor = next_cursor;
+    }
+    if reset {
+        let staging_workspace = staging_workspace.to_owned();
+        database
+            .write(workspace.to_owned(), move |store| {
+                store.promote_provider_workspace(kind, &staging_workspace)
+            })
+            .map_err(|error| error.to_string())?;
     }
     Ok(total)
 }

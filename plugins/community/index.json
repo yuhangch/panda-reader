@@ -8,6 +8,11 @@
       "api_version": 1,
       "min_app_version": "0.2.0",
       "kind": "rules",
+      "capabilities": [
+        "document_read",
+        "document_write"
+      ],
+      "network_hosts": [],
       "files": {
         "manifest.toml": {
           "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.chinanews/manifest.toml",
@@ -20,12 +25,42 @@
       }
     },
     {
+      "id": "community.google-news-resolver",
+      "name": "Google News URL resolver",
+      "version": "1.0.0",
+      "api_version": 1,
+      "min_app_version": "0.2.5",
+      "kind": "wasm",
+      "capabilities": [
+        "network_request",
+        "article_url_write"
+      ],
+      "network_hosts": [
+        "news.google.com"
+      ],
+      "files": {
+        "manifest.toml": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.google-news-resolver/manifest.toml",
+          "sha256": "bec990c380703e2219d843fb76b589724beafe82a858697b8e6dcaa9b534eeb6"
+        },
+        "plugin.wasm": {
+          "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.google-news-resolver/plugin.wasm",
+          "sha256": "1bc4db3d1106d2ac7b50f921170c5c3bb13a2bd96f0dba746fc4d3608f17b7a0"
+        }
+      }
+    },
+    {
       "id": "community.ithome",
       "name": "IT之家",
       "version": "1.0.0",
       "api_version": 1,
       "min_app_version": "0.2.0",
       "kind": "rules",
+      "capabilities": [
+        "document_read",
+        "document_write"
+      ],
+      "network_hosts": [],
       "files": {
         "manifest.toml": {
           "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.ithome/manifest.toml",
@@ -44,6 +79,11 @@
       "api_version": 1,
       "min_app_version": "0.2.0",
       "kind": "rules",
+      "capabilities": [
+        "document_read",
+        "document_write"
+      ],
+      "network_hosts": [],
       "files": {
         "manifest.toml": {
           "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.qbitai/manifest.toml",
@@ -62,6 +102,11 @@
       "api_version": 1,
       "min_app_version": "0.2.0",
       "kind": "rules",
+      "capabilities": [
+        "document_read",
+        "document_write"
+      ],
+      "network_hosts": [],
       "files": {
         "manifest.toml": {
           "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.sciencenet/manifest.toml",
@@ -80,6 +125,11 @@
       "api_version": 1,
       "min_app_version": "0.2.0",
       "kind": "rules",
+      "capabilities": [
+        "document_read",
+        "document_write"
+      ],
+      "network_hosts": [],
       "files": {
         "manifest.toml": {
           "url": "https://raw.githubusercontent.com/yuhangch/panda-reader/refs/heads/main/plugins/community/community.wechat/manifest.toml",

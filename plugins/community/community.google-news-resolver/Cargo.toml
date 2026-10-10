@@ -1,0 +1,13 @@
+[package]
+name = "panda-google-news-resolver"
+version = "1.0.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+panda-plugin-sdk = { path = "../../../crates/panda-plugin-sdk" }
+serde_json = "1"
+
+[workspace]

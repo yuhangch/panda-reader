@@ -9,6 +9,9 @@ const ARTICLE_PAGE: i64 = 20;
 
 impl ReaderWindow {
     pub(in crate::ui) fn select_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        if let Some(article_id) = self.reader.requested_article_id.take() {
+            self.services.cancel_article_work(article_id);
+        }
         self.reader.request_epoch.next();
         self.reader.is_extracting = false;
         self.list.scope = scope;
@@ -33,11 +36,15 @@ impl ReaderWindow {
     }
 
     pub(in crate::ui) fn load_snapshot(&mut self, cx: &mut Context<Self>) {
+        self.list.pending_navigation = None;
         self.list.is_loading_more = false;
         self.load_snapshot_page(false, cx);
     }
 
     pub(in crate::ui) fn load_snapshot_page(&mut self, append: bool, cx: &mut Context<Self>) {
+        if !append {
+            self.list.pending_navigation = None;
+        }
         self.list.snapshot_revision = self.list.snapshot_revision.wrapping_add(1);
         let revision = self.list.snapshot_revision;
         let after = if append {
@@ -67,6 +74,7 @@ impl ReaderWindow {
                 }
                 this.list.is_loading = false;
                 this.list.is_loading_more = false;
+                let mut continue_navigation = None;
                 match result {
                     Ok(snapshot) => {
                         let newly_loaded = snapshot.articles.clone();
@@ -80,6 +88,17 @@ impl ReaderWindow {
                             articles.extend(snapshot.articles);
                         }
                         this.list.has_more = snapshot.has_more;
+                        if append
+                            && let Some((delta, unread_only, previous_len)) =
+                                this.list.pending_navigation
+                        {
+                            if this.list.articles.len() > previous_len {
+                                this.list.pending_navigation = None;
+                                continue_navigation = Some((delta, unread_only));
+                            } else {
+                                this.list.pending_navigation = None;
+                            }
+                        }
                         if let Some(article) = &mut this.reader.article {
                             article.summary = this
                                 .list
@@ -95,7 +114,13 @@ impl ReaderWindow {
                             this.refresh(cx);
                         }
                     }
-                    Err(error) => this.set_error(error),
+                    Err(error) => {
+                        this.list.pending_navigation = None;
+                        this.set_error(error)
+                    }
+                }
+                if let Some((delta, unread_only)) = continue_navigation {
+                    this.move_article(delta, unread_only, cx);
                 }
                 cx.notify();
             });
@@ -210,6 +235,10 @@ impl ReaderWindow {
         cx: &mut Context<Self>,
     ) {
         if self.list.articles.is_empty() {
+            if delta > 0 && self.can_load_more() {
+                self.list.pending_navigation = Some((delta, unread_only, 0));
+                self.load_more_articles(cx);
+            }
             return;
         }
         let current = self
@@ -249,6 +278,11 @@ impl ReaderWindow {
                 Some(index) => {
                     let next = index as isize + delta;
                     if next < 0 || next >= self.list.articles.len() as isize {
+                        if next >= self.list.articles.len() as isize && delta > 0 {
+                            self.list.pending_navigation =
+                                Some((delta, unread_only, self.list.articles.len()));
+                            self.load_more_articles(cx);
+                        }
                         return;
                     }
                     next as usize
@@ -265,6 +299,9 @@ impl ReaderWindow {
                     .scroll_to_item(index, ScrollStrategy::Center);
             }
             self.open_article(id, cx);
+        } else if delta > 0 && self.can_load_more() {
+            self.list.pending_navigation = Some((delta, unread_only, self.list.articles.len()));
+            self.load_more_articles(cx);
         }
     }
 

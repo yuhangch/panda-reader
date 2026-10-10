@@ -3,7 +3,13 @@
 use panda_core::{ContentExtractor, TranslationLayout};
 use panda_providers::ProviderKind;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 pub const DEFAULT_THEME_ID: &str = "bamboo";
 
@@ -207,18 +213,129 @@ impl Default for Preferences {
 
 impl Preferences {
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::default();
+            }
+            Err(error) => {
+                eprintln!("could not read preferences at {}: {error}", path.display());
+                return Self::default();
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(preferences) => preferences,
+            Err(error) => {
+                let backup = corrupt_preferences_path(path);
+                match fs::rename(path, &backup) {
+                    Ok(()) => eprintln!(
+                        "preferences are invalid ({error}); original file preserved at {}",
+                        backup.display()
+                    ),
+                    Err(rename_error) => eprintln!(
+                        "preferences are invalid ({error}); could not preserve {}: {rename_error}",
+                        path.display()
+                    ),
+                }
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, bytes)
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let (temp_path, mut file) = (0..100)
+            .find_map(|_| {
+                let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let candidate = parent.join(format!(
+                    ".preferences-{}-{sequence}.tmp",
+                    std::process::id()
+                ));
+                match OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&candidate)
+                {
+                    Ok(file) => Some(Ok((candidate, file))),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .unwrap_or_else(|| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "could not allocate a temporary preferences file",
+                ))
+            })?;
+        let result = (|| {
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            drop(file);
+            replace_file(&temp_path, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
+    }
+}
+
+fn corrupt_preferences_path(path: &Path) -> PathBuf {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let base = path.file_name().unwrap_or_default().to_string_lossy();
+    (0..100)
+        .map(|index| {
+            let suffix = if index == 0 {
+                String::new()
+            } else {
+                format!("-{index}")
+            };
+            path.with_file_name(format!("{base}.corrupt-{timestamp}{suffix}"))
+        })
+        .find(|candidate| !candidate.exists())
+        .unwrap_or_else(|| path.with_file_name(format!("{base}.corrupt-{timestamp}-overflow")))
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // MoveFileExW replaces an existing file atomically on the same volume.
+    let success = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -252,5 +369,56 @@ mod tests {
             serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
         assert!(parsed.detailed_sync_logging);
         assert_eq!(parsed.sync_log_retention_days, 90);
+    }
+
+    #[test]
+    fn invalid_preferences_are_preserved_before_defaults_are_used() {
+        let directory = std::env::temp_dir().join(format!(
+            "panda-preferences-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("preferences.json");
+        fs::write(&path, b"{ not valid json").unwrap();
+
+        let preferences = Preferences::load(&path);
+
+        assert_eq!(preferences.theme, DEFAULT_THEME_ID);
+        assert!(!path.exists());
+        let backup = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| candidate.to_string_lossy().contains(".corrupt-"))
+            .expect("invalid preferences should have a backup");
+        assert_eq!(fs::read(backup).unwrap(), b"{ not valid json");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn saving_preferences_replaces_existing_file_without_truncation_window() {
+        let directory = std::env::temp_dir().join(format!(
+            "panda-preferences-save-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("preferences.json");
+        fs::write(&path, b"old contents").unwrap();
+        let mut preferences = Preferences::default();
+        preferences.theme = "bamboo-dark".into();
+
+        preferences.save(&path).unwrap();
+
+        assert_eq!(Preferences::load(&path).theme, "bamboo-dark");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

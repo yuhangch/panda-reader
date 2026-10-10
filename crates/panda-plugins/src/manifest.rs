@@ -2,9 +2,11 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[repr(i32)]
 pub enum PluginStage {
-    Prepare,
-    Cleanup,
+    Prepare = 0,
+    Cleanup = 1,
+    ResolveUrl = 2,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -22,6 +24,8 @@ pub struct PluginManifest {
     pub priority: i32,
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
+    #[serde(default)]
+    pub network_hosts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,4 +41,6 @@ pub enum PluginCapability {
     DocumentRead,
     DocumentWrite,
     ArticleBodyWrite,
+    NetworkRequest,
+    ArticleUrlWrite,
 }
