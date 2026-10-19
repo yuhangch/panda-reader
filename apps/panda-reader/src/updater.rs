@@ -14,6 +14,8 @@ use std::time::Duration;
 use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
+const STABLE_MANIFEST_URL: &str =
+    "https://yuhangch.github.io/panda-reader/updates/stable.json";
 const RELEASES_API: &str = "https://api.github.com/repos/yuhangch/panda-reader/releases/latest";
 const RELEASES_PAGE: &str = "https://github.com/yuhangch/panda-reader/releases";
 const MAX_ASSET_BYTES: u64 = 1_500_000_000;
@@ -82,6 +84,37 @@ enum InstallKind {
     LinuxAppImage,
 }
 
+#[derive(Clone, Debug)]
+struct ReleaseInfo {
+    version: String,
+    html_url: String,
+    assets: Vec<ReleaseAsset>,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseAsset {
+    name: String,
+    size: u64,
+    sha256: Option<String>,
+    urls: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct StableManifest {
+    version: String,
+    #[serde(default)]
+    html_url: Option<String>,
+    assets: std::collections::BTreeMap<String, StableAsset>,
+}
+
+#[derive(Deserialize)]
+struct StableAsset {
+    name: String,
+    size: u64,
+    sha256: String,
+    urls: Vec<String>,
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -124,21 +157,11 @@ fn check_and_download(
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|error| error.to_string())?;
-    let release = client
-        .get(RELEASES_API)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| error.to_string())?
-        .json::<GithubRelease>()
-        .map_err(|error| error.to_string())?;
-    let version = release
-        .tag_name
-        .strip_prefix('v')
-        .unwrap_or(&release.tag_name);
-    let latest = semver::Version::parse(version).map_err(|_| {
+    let release = fetch_release_info(&client)?;
+    let latest = semver::Version::parse(&release.version).map_err(|_| {
         format!(
             "The latest release has an invalid version: {}",
-            release.tag_name
+            release.version
         )
     })?;
     let current =
@@ -147,14 +170,7 @@ fn check_and_download(
         return Ok(UpdateStatus::UpToDate);
     }
 
-    let release_url = if release
-        .html_url
-        .starts_with("https://github.com/yuhangch/panda-reader/")
-    {
-        release.html_url
-    } else {
-        RELEASES_PAGE.to_owned()
-    };
+    let release_url = trusted_release_page(&release.html_url);
     let plan = match detect_installation() {
         Ok(plan) => plan,
         Err(reason) => {
@@ -166,7 +182,12 @@ fn check_and_download(
         }
     };
     let asset_name = package_name(&latest.to_string(), plan.kind);
-    let Some(asset) = release.assets.iter().find(|asset| asset.name == asset_name) else {
+    let Some(asset) = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .cloned()
+    else {
         return Ok(UpdateStatus::ManualRequired {
             version: latest.to_string(),
             reason: format!("This release does not include {asset_name} for this installation."),
@@ -179,98 +200,28 @@ fn check_and_download(
             asset.size
         ));
     }
-    let Some(checksums) = release
-        .assets
-        .iter()
-        .find(|asset| asset.name == "checksums.txt")
-    else {
-        return Ok(UpdateStatus::ManualRequired {
-            version: latest.to_string(),
-            reason: "This release has no checksums.txt, so automatic installation is disabled."
-                .into(),
-            release_url,
-        });
-    };
-    let checksum_text = client
-        .get(&checksums.browser_download_url)
-        .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
-        .map_err(|error| error.to_string())?
-        .text()
-        .map_err(|error| error.to_string())?;
-    let expected_sha256 = checksum_for(&checksum_text, &asset.name)
-        .ok_or_else(|| format!("checksums.txt has no entry for {}", asset.name))?;
+    let expected_sha256 = resolve_asset_sha256(&client, &release, &asset)?;
+    let download_urls = trusted_download_urls(&asset.urls);
+    if download_urls.is_empty() {
+        return Err(format!(
+            "No trusted download URL is available for {}.",
+            asset.name
+        ));
+    }
 
     let cache_dir = data_dir.join("updates");
     fs::create_dir_all(&cache_dir).map_err(|error| error.to_string())?;
     let package = cache_dir.join(&asset.name);
     if !package.is_file() || hash_file(&package)? != expected_sha256 {
-        let partial = cache_dir.join(format!("{}.part", asset.name));
-        let _ = fs::remove_file(&partial);
-        let mut response = client
-            .get(&asset.browser_download_url)
-            .timeout(Duration::from_secs(300))
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-            .map_err(|error| error.to_string())?;
-        if response
-            .content_length()
-            .is_some_and(|size| size > MAX_ASSET_BYTES)
-        {
-            return Err("The update package exceeds the 1.5 GB safety limit.".into());
-        }
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-            .map_err(|error| error.to_string())?;
-        let mut hasher = Sha256::new();
-        let mut received = 0_u64;
-        let mut buffer = [0_u8; 256 * 1024];
-        let _ = events.send(UpdateStatus::Downloading {
-            version: latest.to_string(),
-            received,
-            total: asset.size,
-        });
-        loop {
-            let read = response
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
-            if read == 0 {
-                break;
-            }
-            received = received
-                .checked_add(read as u64)
-                .ok_or_else(|| "The update package size overflowed.".to_owned())?;
-            if received > MAX_ASSET_BYTES || received > asset.size {
-                return Err("The downloaded package exceeded its declared size.".into());
-            }
-            output
-                .write_all(&buffer[..read])
-                .map_err(|error| error.to_string())?;
-            hasher.update(&buffer[..read]);
-            let _ = events.send(UpdateStatus::Downloading {
-                version: latest.to_string(),
-                received,
-                total: asset.size,
-            });
-        }
-        output.sync_all().map_err(|error| error.to_string())?;
-        drop(output);
-        if received != asset.size {
-            let _ = fs::remove_file(&partial);
-            return Err(format!(
-                "The downloaded package is incomplete ({received} of {} bytes).",
-                asset.size
-            ));
-        }
-        let actual = format!("{:x}", hasher.finalize());
-        if actual != expected_sha256 {
-            let _ = fs::remove_file(&partial);
-            return Err("The update package failed SHA-256 verification.".into());
-        }
-        let _ = fs::remove_file(&package);
-        fs::rename(&partial, &package).map_err(|error| error.to_string())?;
+        download_verified_package(
+            &client,
+            &download_urls,
+            &asset,
+            &expected_sha256,
+            &package,
+            &latest.to_string(),
+            events,
+        )?;
     }
 
     Ok(UpdateStatus::Ready(ReadyUpdate {
@@ -280,6 +231,313 @@ fn check_and_download(
         release_url,
         plan,
     }))
+}
+
+fn manifest_url() -> String {
+    std::env::var("PANDA_READER_UPDATE_MANIFEST_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| STABLE_MANIFEST_URL.to_owned())
+}
+
+fn fetch_release_info(client: &Client) -> Result<ReleaseInfo, String> {
+    let manifest_error = match fetch_stable_manifest(client) {
+        Ok(info) => return Ok(info),
+        Err(error) => error,
+    };
+    match fetch_github_release(client) {
+        Ok(info) => Ok(info),
+        Err(api_error) => Err(format!(
+            "Could not check for updates via the release manifest ({manifest_error}) or the GitHub API ({api_error})."
+        )),
+    }
+}
+
+fn fetch_stable_manifest(client: &Client) -> Result<ReleaseInfo, String> {
+    let response = client
+        .get(manifest_url())
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?;
+    let manifest = response
+        .json::<StableManifest>()
+        .map_err(|error| error.to_string())?;
+    release_info_from_stable(manifest)
+}
+
+fn fetch_github_release(client: &Client) -> Result<ReleaseInfo, String> {
+    let release = client
+        .get(RELEASES_API)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?
+        .json::<GithubRelease>()
+        .map_err(|error| error.to_string())?;
+    Ok(release_info_from_github(release))
+}
+
+fn release_info_from_stable(manifest: StableManifest) -> Result<ReleaseInfo, String> {
+    let version = manifest.version.trim().trim_start_matches('v');
+    if version.is_empty() {
+        return Err("The update manifest is missing a version.".into());
+    }
+    let html_url = manifest
+        .html_url
+        .filter(|url| url.starts_with("https://github.com/yuhangch/panda-reader/"))
+        .unwrap_or_else(|| format!("{RELEASES_PAGE}/tag/v{version}"));
+    let mut assets = Vec::with_capacity(manifest.assets.len());
+    for asset in manifest.assets.into_values() {
+        if asset.name.trim().is_empty() {
+            return Err("The update manifest contains an asset without a file name.".into());
+        }
+        if asset.size == 0 || asset.size > MAX_ASSET_BYTES {
+            return Err(format!(
+                "The update manifest lists an invalid size for {}.",
+                asset.name
+            ));
+        }
+        let sha256 = normalize_sha256(&asset.sha256).ok_or_else(|| {
+            format!(
+                "The update manifest lists an invalid SHA-256 for {}.",
+                asset.name
+            )
+        })?;
+        let urls = trusted_download_urls(&asset.urls);
+        if urls.is_empty() {
+            return Err(format!(
+                "The update manifest has no trusted download URL for {}.",
+                asset.name
+            ));
+        }
+        assets.push(ReleaseAsset {
+            name: asset.name,
+            size: asset.size,
+            sha256: Some(sha256),
+            urls,
+        });
+    }
+    if assets.is_empty() {
+        return Err("The update manifest does not list any packages.".into());
+    }
+    Ok(ReleaseInfo {
+        version: version.to_owned(),
+        html_url,
+        assets,
+    })
+}
+
+fn release_info_from_github(release: GithubRelease) -> ReleaseInfo {
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .unwrap_or(&release.tag_name)
+        .to_owned();
+    let html_url = trusted_release_page(&release.html_url);
+    let assets = release
+        .assets
+        .into_iter()
+        .map(|asset| ReleaseAsset {
+            name: asset.name,
+            size: asset.size,
+            sha256: None,
+            urls: vec![asset.browser_download_url],
+        })
+        .collect();
+    ReleaseInfo {
+        version,
+        html_url,
+        assets,
+    }
+}
+
+fn trusted_release_page(url: &str) -> String {
+    if url.starts_with("https://github.com/yuhangch/panda-reader/") {
+        url.to_owned()
+    } else {
+        RELEASES_PAGE.to_owned()
+    }
+}
+
+fn normalize_sha256(value: &str) -> Option<String> {
+    let hash = value.trim().to_ascii_lowercase();
+    (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(hash)
+}
+
+fn is_trusted_download_host(host: &str) -> bool {
+    matches!(
+        host,
+        "github.com"
+            | "objects.githubusercontent.com"
+            | "release-assets.githubusercontent.com"
+            | "yuhangch.github.io"
+    ) || host.ends_with(".githubusercontent.com")
+}
+
+fn is_trusted_download_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(is_trusted_download_host)
+}
+
+fn trusted_download_urls(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .filter(|url| is_trusted_download_url(url))
+        .cloned()
+        .collect()
+}
+
+fn resolve_asset_sha256(
+    client: &Client,
+    release: &ReleaseInfo,
+    asset: &ReleaseAsset,
+) -> Result<String, String> {
+    if let Some(sha256) = asset.sha256.as_deref().and_then(normalize_sha256) {
+        return Ok(sha256);
+    }
+    let Some(checksums) = release
+        .assets
+        .iter()
+        .find(|candidate| candidate.name == "checksums.txt")
+    else {
+        return Err(
+            "This release has no checksums.txt, so automatic installation is disabled.".into(),
+        );
+    };
+    let checksum_url = trusted_download_urls(&checksums.urls)
+        .into_iter()
+        .next()
+        .ok_or_else(|| "checksums.txt has no trusted download URL.".to_owned())?;
+    let checksum_text = client
+        .get(checksum_url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?
+        .text()
+        .map_err(|error| error.to_string())?;
+    checksum_for(&checksum_text, &asset.name)
+        .ok_or_else(|| format!("checksums.txt has no entry for {}", asset.name))
+}
+
+fn download_verified_package(
+    client: &Client,
+    urls: &[String],
+    asset: &ReleaseAsset,
+    expected_sha256: &str,
+    package: &Path,
+    version: &str,
+    events: &UnboundedSender<UpdateStatus>,
+) -> Result<(), String> {
+    let cache_dir = package
+        .parent()
+        .ok_or_else(|| "Could not locate the update cache folder.".to_owned())?;
+    let partial = cache_dir.join(format!("{}.part", asset.name));
+    let mut errors = Vec::new();
+    for url in urls {
+        let _ = fs::remove_file(&partial);
+        match download_url_to_partial(
+            client,
+            url,
+            asset,
+            expected_sha256,
+            &partial,
+            version,
+            events,
+        ) {
+            Ok(()) => {
+                let _ = fs::remove_file(package);
+                fs::rename(&partial, package).map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&partial);
+                errors.push(format!("{url}: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "Could not download {}: {}",
+        asset.name,
+        errors.join("; ")
+    ))
+}
+
+fn download_url_to_partial(
+    client: &Client,
+    url: &str,
+    asset: &ReleaseAsset,
+    expected_sha256: &str,
+    partial: &Path,
+    version: &str,
+    events: &UnboundedSender<UpdateStatus>,
+) -> Result<(), String> {
+    if !is_trusted_download_url(url) {
+        return Err("download URL is not on an allowed host".into());
+    }
+    let mut response = client
+        .get(url)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|error| error.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_ASSET_BYTES)
+    {
+        return Err("The update package exceeds the 1.5 GB safety limit.".into());
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(partial)
+        .map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut received = 0_u64;
+    let mut buffer = [0_u8; 256 * 1024];
+    let _ = events.send(UpdateStatus::Downloading {
+        version: version.to_owned(),
+        received,
+        total: asset.size,
+    });
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        received = received
+            .checked_add(read as u64)
+            .ok_or_else(|| "The update package size overflowed.".to_owned())?;
+        if received > MAX_ASSET_BYTES || received > asset.size {
+            return Err("The downloaded package exceeded its declared size.".into());
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| error.to_string())?;
+        hasher.update(&buffer[..read]);
+        let _ = events.send(UpdateStatus::Downloading {
+            version: version.to_owned(),
+            received,
+            total: asset.size,
+        });
+    }
+    output.sync_all().map_err(|error| error.to_string())?;
+    drop(output);
+    if received != asset.size {
+        return Err(format!(
+            "The downloaded package is incomplete ({received} of {} bytes).",
+            asset.size
+        ));
+    }
+    let actual = format!("{:x}", hasher.finalize());
+    if actual != expected_sha256 {
+        return Err("The update package failed SHA-256 verification.".into());
+    }
+    Ok(())
 }
 
 fn checksum_for(contents: &str, file_name: &str) -> Option<String> {
@@ -1018,10 +1276,94 @@ fn cleanup_stale_windows_helper_copies() {
 #[cfg(test)]
 mod updater_tests {
     use super::{
-        WindowsInstallScope, classify_windows_install_scope, normalize_windows_path,
-        windows_setup_scope_argument,
+        GithubAsset, GithubRelease, StableAsset, StableManifest, WindowsInstallScope,
+        classify_windows_install_scope, is_trusted_download_url, normalize_windows_path,
+        release_info_from_github, release_info_from_stable, windows_setup_scope_argument,
     };
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn stable_manifest_becomes_release_info_with_embedded_hashes() {
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            "windows-x86_64-setup".into(),
+            StableAsset {
+                name: "panda-reader-0.2.10-windows-x86_64-setup.exe".into(),
+                size: 29954299,
+                sha256: "82c6da310c22b4081a70ca2c92326201cee2cacbd2a75eb1e1749685f8a083cd".into(),
+                urls: vec![
+                    "https://github.com/yuhangch/panda-reader/releases/download/v0.2.10/panda-reader-0.2.10-windows-x86_64-setup.exe".into(),
+                ],
+            },
+        );
+        let info = release_info_from_stable(StableManifest {
+            version: "v0.2.10".into(),
+            html_url: Some(
+                "https://github.com/yuhangch/panda-reader/releases/tag/v0.2.10".into(),
+            ),
+            assets,
+        })
+        .unwrap();
+        assert_eq!(info.version, "0.2.10");
+        assert_eq!(info.assets.len(), 1);
+        assert_eq!(
+            info.assets[0].sha256.as_deref(),
+            Some("82c6da310c22b4081a70ca2c92326201cee2cacbd2a75eb1e1749685f8a083cd")
+        );
+    }
+
+    #[test]
+    fn stable_manifest_rejects_untrusted_download_hosts() {
+        let mut assets = BTreeMap::new();
+        assets.insert(
+            "windows-x86_64-setup".into(),
+            StableAsset {
+                name: "setup.exe".into(),
+                size: 10,
+                sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                urls: vec!["https://evil.example/setup.exe".into()],
+            },
+        );
+        let error = release_info_from_stable(StableManifest {
+            version: "0.2.10".into(),
+            html_url: None,
+            assets,
+        })
+        .unwrap_err();
+        assert!(error.contains("trusted download URL"));
+    }
+
+    #[test]
+    fn github_release_payload_maps_into_release_info() {
+        let info = release_info_from_github(GithubRelease {
+            tag_name: "v0.2.10".into(),
+            html_url: "https://github.com/yuhangch/panda-reader/releases/tag/v0.2.10".into(),
+            assets: vec![GithubAsset {
+                name: "checksums.txt".into(),
+                browser_download_url: "https://github.com/yuhangch/panda-reader/releases/download/v0.2.10/checksums.txt".into(),
+                size: 512,
+            }],
+        });
+        assert_eq!(info.version, "0.2.10");
+        assert!(info.assets[0].sha256.is_none());
+        assert_eq!(info.assets[0].name, "checksums.txt");
+    }
+
+    #[test]
+    fn download_url_allowlist_accepts_github_and_pages_hosts() {
+        assert!(is_trusted_download_url(
+            "https://github.com/yuhangch/panda-reader/releases/download/v0.2.10/setup.exe"
+        ));
+        assert!(is_trusted_download_url(
+            "https://objects.githubusercontent.com/github-production-release-asset/1/setup.exe"
+        ));
+        assert!(is_trusted_download_url(
+            "https://yuhangch.github.io/panda-reader/updates/stable.json"
+        ));
+        assert!(!is_trusted_download_url("http://github.com/yuhangch/panda-reader/a"));
+        assert!(!is_trusted_download_url("https://evil.example/setup.exe"));
+    }
 
     #[test]
     fn detects_current_user_install_from_matching_registration() {
