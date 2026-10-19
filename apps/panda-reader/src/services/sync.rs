@@ -10,6 +10,20 @@ use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use tokio::sync::oneshot;
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct SyncOutcome {
+    pub(super) saved: usize,
+    changed_article_ids: Vec<i64>,
+}
+
+impl SyncOutcome {
+    fn merge(&mut self, other: SyncOutcome) {
+        self.saved += other.saved;
+        self.changed_article_ids
+            .extend(other.changed_article_ids);
+    }
+}
+
 fn sync_log(
     database_path: &Path,
     detailed_logging: &AtomicBool,
@@ -85,6 +99,7 @@ pub(super) fn refresh_feed(
                     &detailed_logging,
                     runtime,
                 )
+                .map(|outcome| outcome.saved)
             } else if provider.is_some() {
                 Err("Connect the selected provider before syncing".into())
             } else {
@@ -104,10 +119,10 @@ pub(super) fn refresh_feed(
                             &input.url, fetched, &revisions,
                         )
                         .map_err(|error| error.to_string())?;
-                        let changed = !prepared.is_not_modified();
                         database.write(workspace, move |store| {
-                            store.persist_prepared_feed(&input.url, Some(input.id), prepared)?;
-                            Ok(usize::from(changed))
+                            let update =
+                                store.persist_prepared_feed(&input.url, Some(input.id), prepared)?;
+                            Ok(usize::from(update.feed_changed))
                         })
                     }
                     Err(error) => {
@@ -236,17 +251,22 @@ pub(super) fn refresh(
         } else {
             refresh_local_feeds(&path, &workspace, &database, runtime, force)
         };
-        if result.is_ok() {
-            *RenderCache::lock(&cache) = RenderCache::default();
+        if let Ok(outcome) = &result {
+            let mut cache = RenderCache::lock(&cache);
+            for article_id in &outcome.changed_article_ids {
+                cache.invalidate_article(*article_id);
+            }
         }
         match &result {
-            Ok(count) => sync_log(
+            Ok(outcome) => sync_log(
                 &path,
                 &detailed_logging,
                 LogDetail::Summary,
                 "INFO",
                 format!(
-                    "sync completed saved={count} elapsed_ms={}",
+                    "sync completed saved={} changed_articles={} elapsed_ms={}",
+                    outcome.saved,
+                    outcome.changed_article_ids.len(),
                     started.elapsed().as_millis()
                 ),
             ),
@@ -261,7 +281,7 @@ pub(super) fn refresh(
                 ),
             ),
         }
-        result
+        result.map(|outcome| outcome.saved)
     });
 }
 
@@ -271,11 +291,11 @@ fn refresh_local_feeds(
     database: &DbWriter,
     runtime: &tokio::runtime::Runtime,
     force: bool,
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     let feeds = Store::open_read_workspace(path, workspace)
         .and_then(|store| store.local_feeds_to_refresh())
         .map_err(|error| error.to_string())?;
-    let (refreshed, failures) = runtime.block_on(async {
+    let (outcome, failures) = runtime.block_on(async {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
         let mut tasks = tokio::task::JoinSet::new();
         for feed in feeds {
@@ -299,7 +319,7 @@ fn refresh_local_feeds(
                 Ok::<_, String>((feed, result))
             });
         }
-        let mut refreshed = 0;
+        let mut outcome = SyncOutcome::default();
         let mut failures = Vec::new();
         while let Some(result) = tasks.join_next().await {
             let (feed, result) =
@@ -315,15 +335,20 @@ fn refresh_local_feeds(
                     });
                     match prepared {
                         Ok(prepared) => {
-                            let changed = !prepared.is_not_modified();
                             let url = feed.url.clone();
                             let display_url = url.clone();
                             let id = feed.id;
                             match database.write(workspace.to_owned(), move |store| {
-                                store.persist_prepared_feed(&url, Some(id), prepared)?;
-                                Ok(usize::from(changed))
+                                store.persist_prepared_feed(&url, Some(id), prepared)
                             }) {
-                                Ok(count) => refreshed += count,
+                                Ok(update) => {
+                                    if update.feed_changed {
+                                        outcome.saved += 1;
+                                    }
+                                    outcome
+                                        .changed_article_ids
+                                        .extend(update.changed_article_ids);
+                                }
                                 Err(error) => failures.push(format!("{display_url}: {error}")),
                             }
                         }
@@ -342,15 +367,15 @@ fn refresh_local_feeds(
                 }
             }
         }
-        Ok::<_, String>((refreshed, failures))
+        Ok::<_, String>((outcome, failures))
     })?;
-    if refreshed == 0 && !failures.is_empty() {
+    if outcome.saved == 0 && !failures.is_empty() {
         return Err(format!(
             "All feeds failed to refresh: {}",
             failures.join("; ")
         ));
     }
-    Ok(refreshed)
+    Ok(outcome)
 }
 
 pub(super) fn sync_provider(
@@ -361,7 +386,7 @@ pub(super) fn sync_provider(
     kind: ProviderKind,
     detailed_logging: &AtomicBool,
     runtime: &tokio::runtime::Runtime,
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     runtime.block_on(sync_provider_async(
         path,
         workspace,
@@ -379,7 +404,7 @@ async fn sync_provider_async(
     remote: &ProviderClient,
     kind: ProviderKind,
     detailed_logging: &AtomicBool,
-) -> Result<usize, String> {
+) -> Result<SyncOutcome, String> {
     // Account detection, staging writes, pagination, and promotion must form one
     // serialized operation: every sync for this workspace shares one staging slot.
     let remote_lock = remote_mark_lock(workspace);
@@ -518,7 +543,7 @@ async fn sync_provider_async(
         })
         .map_err(|e| e.to_string())?;
     let mut cursor = cursor;
-    let mut total = 0usize;
+    let mut outcome = SyncOutcome::default();
     let mut full_sync = matches!(mode, SyncMode::Initial | SyncMode::Reconcile);
     let mut page_number = 0usize;
     loop {
@@ -551,8 +576,9 @@ async fn sync_provider_async(
         let cursor_for_write = next_cursor.clone();
         let full_at = (!page.has_more && full_sync).then(|| chrono::Utc::now().to_rfc3339());
         let full_at_for_write = full_at.clone();
+        let remote_ids: Vec<i64> = page.entries.iter().map(|entry| entry.id).collect();
         let known_revisions = Store::open_read_workspace(path, sync_workspace)
-            .and_then(|store| store.remote_content_revisions())
+            .and_then(|store| store.remote_content_revisions_for_ids(&remote_ids))
             .map_err(|error| error.to_string())?;
         let entries =
             Store::prepare_remote_entries_with_revisions(page.entries, kind, &known_revisions)
@@ -570,14 +596,19 @@ async fn sync_provider_async(
                 Ok(saved)
             })
             .map_err(|e| e.to_string())?;
-        total += saved;
+        let saved_count = saved.count;
+        let changed_count = saved.changed_article_ids.len();
+        outcome.merge(SyncOutcome {
+            saved: saved.count,
+            changed_article_ids: saved.changed_article_ids,
+        });
         sync_log(
             path,
             detailed_logging,
             LogDetail::Detailed,
             "INFO",
             format!(
-                "provider page={page_number} prepared={prepared_count} saved={saved} persist_ms={}",
+                "provider page={page_number} prepared={prepared_count} saved={saved_count} changed_articles={changed_count} persist_ms={}",
                 persist_started.elapsed().as_millis()
             ),
         );
@@ -597,7 +628,7 @@ async fn sync_provider_async(
             })
             .map_err(|error| error.to_string())?;
     }
-    Ok(total)
+    Ok(outcome)
 }
 
 async fn flush_remote_marks(

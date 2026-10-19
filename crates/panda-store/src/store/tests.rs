@@ -1,5 +1,6 @@
 use super::*;
 use panda_core::Scope;
+use std::time::Instant;
 
 #[test]
 fn migration_is_versioned_and_read_connections_do_not_change_schema() {
@@ -1631,4 +1632,179 @@ fn removing_subscription_cascades_its_cached_articles() {
         .unwrap();
     assert_eq!(feed_count, 0);
     assert_eq!(article_count, 0);
+}
+
+#[test]
+fn remote_content_revisions_for_ids_returns_only_requested_hashes() {
+    let (_directory, mut store) = test_store_for("provider:miniflux");
+    let ids = store
+        .save_remote_feeds(
+            &[RemoteFeed {
+                id: 7,
+                title: "Feed".into(),
+                feed_url: "https://example.com/feed.xml".into(),
+                site_url: "https://example.com".into(),
+                language: None,
+                category: None,
+            }],
+            ProviderKind::Miniflux,
+        )
+        .unwrap();
+    let feed_id = *ids.get(&7).unwrap();
+    let transaction = store.connection.transaction().unwrap();
+    for remote_id in 1..=20 {
+        let hash = format!("hash-{remote_id}");
+        transaction
+            .execute(
+                "INSERT INTO articles(feed_id,guid,title,remote_id,remote_content_hash,source_revision)
+                 VALUES(?1,?2,?3,?4,?5,?5)",
+                params![
+                    feed_id,
+                    format!("miniflux:{remote_id}"),
+                    format!("Article {remote_id}"),
+                    remote_id,
+                    hash
+                ],
+            )
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+
+    let revisions = store
+        .remote_content_revisions_for_ids(&[3, 11, 999])
+        .unwrap();
+    assert_eq!(revisions.len(), 2);
+    assert_eq!(revisions.get(&3).map(String::as_str), Some("hash-3"));
+    assert_eq!(revisions.get(&11).map(String::as_str), Some("hash-11"));
+    assert!(!revisions.contains_key(&999));
+    assert_eq!(
+        store.remote_content_revisions_for_ids(&[]).unwrap().len(),
+        0
+    );
+}
+
+#[test]
+fn save_prepared_remote_entries_reports_changed_article_ids() {
+    let (_directory, mut store) = test_store_for("provider:miniflux");
+    let ids = store
+        .save_remote_feeds(
+            &[RemoteFeed {
+                id: 42,
+                title: "远程订阅".into(),
+                feed_url: "https://example.com/feed.xml".into(),
+                site_url: "https://example.com".into(),
+                language: None,
+                category: None,
+            }],
+            ProviderKind::Miniflux,
+        )
+        .unwrap();
+    let entry = RemoteEntry {
+        id: 99,
+        feed_id: 42,
+        title: "远程文章".into(),
+        url: Some("https://example.com/post".into()),
+        author: None,
+        published_at: Some("2026-09-28T00:00:00Z".into()),
+        content: "<p>正文</p>".into(),
+        status: "unread".into(),
+        starred: false,
+        changed_at: None,
+        revision: None,
+    };
+    let inserted = store
+        .save_remote_entries(&[entry.clone()], &ids, ProviderKind::Miniflux)
+        .unwrap();
+    assert_eq!(inserted.count, 1);
+    assert_eq!(inserted.changed_article_ids.len(), 1);
+    let article_id = inserted.changed_article_ids[0];
+
+    let noop = store
+        .save_remote_entries(&[entry.clone()], &ids, ProviderKind::Miniflux)
+        .unwrap();
+    assert_eq!(noop.count, 0);
+    assert!(noop.changed_article_ids.is_empty());
+
+    let mut content_changed = entry;
+    content_changed.content = "<p>更新后的正文</p>".into();
+    let updated = store
+        .save_remote_entries(&[content_changed.clone()], &ids, ProviderKind::Miniflux)
+        .unwrap();
+    assert_eq!(updated.count, 1);
+    assert_eq!(updated.changed_article_ids, vec![article_id]);
+
+    let mut mark_only = content_changed;
+    mark_only.status = "read".into();
+    mark_only.starred = true;
+    let marks = store
+        .save_remote_entries(&[mark_only], &ids, ProviderKind::Miniflux)
+        .unwrap();
+    assert_eq!(marks.count, 1);
+    assert!(marks.changed_article_ids.is_empty());
+}
+
+#[test]
+#[ignore = "scale timing; run with --ignored --nocapture"]
+fn revisions_scale_compares_full_scan_vs_page_ids() {
+    let sizes = [10_000usize, 50_000, 100_000];
+    let page_size = 500usize;
+    for article_count in sizes {
+        let (_directory, mut store) = test_store_for("provider:miniflux");
+        let ids = store
+            .save_remote_feeds(
+                &[RemoteFeed {
+                    id: 1,
+                    title: "Scale Feed".into(),
+                    feed_url: "https://example.com/scale.xml".into(),
+                    site_url: "https://example.com".into(),
+                    language: None,
+                    category: None,
+                }],
+                ProviderKind::Miniflux,
+            )
+            .unwrap();
+        let feed_id = *ids.get(&1).unwrap();
+        let seed_started = Instant::now();
+        let transaction = store.connection.transaction().unwrap();
+        for remote_id in 1..=article_count as i64 {
+            let hash = format!("hash-{remote_id}");
+            transaction
+                .execute(
+                    "INSERT INTO articles(feed_id,guid,title,remote_id,remote_content_hash,source_revision)
+                     VALUES(?1,?2,?3,?4,?5,?5)",
+                    params![
+                        feed_id,
+                        format!("miniflux:{remote_id}"),
+                        format!("Article {remote_id}"),
+                        remote_id,
+                        hash
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        eprintln!(
+            "seeded {article_count} articles in {}ms",
+            seed_started.elapsed().as_millis()
+        );
+
+        let full_started = Instant::now();
+        let full = store.remote_content_revisions().unwrap();
+        let full_ms = full_started.elapsed().as_millis();
+        assert_eq!(full.len(), article_count);
+
+        let page_ids: Vec<i64> = (1..=page_size as i64).collect();
+        let page_started = Instant::now();
+        let page = store.remote_content_revisions_for_ids(&page_ids).unwrap();
+        let page_ms = page_started.elapsed().as_millis();
+        assert_eq!(page.len(), page_size);
+
+        eprintln!(
+            "articles={article_count} full_revisions_ms={full_ms} page_{page_size}_revisions_ms={page_ms}"
+        );
+        assert!(
+            page_ms <= full_ms,
+            "page lookup should not be slower than full scan for {article_count} articles"
+        );
+    }
 }

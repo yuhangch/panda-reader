@@ -283,7 +283,9 @@ impl Store {
         loop {
             let page = remote.entries_page(mode, cursor.as_ref()).await?;
             full_sync |= page.full_sync;
-            saved += self.save_remote_entries(&page.entries, &feed_ids, kind)?;
+            saved += self
+                .save_remote_entries(&page.entries, &feed_ids, kind)?
+                .count;
             cursor = page.next_cursor;
             let now = chrono::Utc::now().to_rfc3339();
             let full_sync_at = (!page.has_more && full_sync).then_some(now.as_str());
@@ -397,7 +399,7 @@ impl Store {
         entries: &[RemoteEntry],
         feed_ids: &HashMap<i64, i64>,
         kind: ProviderKind,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<SavedRemoteEntries> {
         let prepared = Self::prepare_remote_entries(entries.to_vec(), kind)?;
         self.save_prepared_remote_entries(&prepared, feed_ids)
     }
@@ -457,8 +459,9 @@ impl Store {
         &mut self,
         entries: &[PreparedRemoteEntry],
         feed_ids: &HashMap<i64, i64>,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<SavedRemoteEntries> {
         let mut saved = 0;
+        let mut changed_article_ids = Vec::new();
         for batch in entries.chunks(100) {
             let transaction = self.connection.transaction()?;
             for prepared in batch {
@@ -467,10 +470,20 @@ impl Store {
                     continue;
                 };
                 if entry.status == "removed" {
+                    let existing_id: Option<i64> = transaction
+                        .query_row(
+                            "SELECT id FROM articles WHERE remote_id=?1 AND feed_id=?2",
+                            params![entry.id, feed_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
                     transaction.execute(
                         "DELETE FROM articles WHERE remote_id=?1 AND feed_id=?2",
                         params![entry.id, feed_id],
                     )?;
+                    if let Some(article_id) = existing_id {
+                        changed_article_ids.push(article_id);
+                    }
                     continue;
                 }
                 let remote_hash = &prepared.remote_hash;
@@ -575,6 +588,7 @@ impl Store {
                     }
                     if content_changed || title_changed || author_changed {
                         sync_article_fts(&transaction, article_id)?;
+                        changed_article_ids.push(article_id);
                     }
                     saved += 1;
                 } else {
@@ -600,11 +614,15 @@ impl Store {
                     )?;
                     let article_id = transaction.last_insert_rowid();
                     sync_article_fts(&transaction, article_id)?;
+                    changed_article_ids.push(article_id);
                     saved += 1;
                 }
             }
             transaction.commit()?;
         }
-        Ok(saved)
+        Ok(SavedRemoteEntries {
+            count: saved,
+            changed_article_ids,
+        })
     }
 }

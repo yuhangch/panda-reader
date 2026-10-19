@@ -1,6 +1,7 @@
 mod store;
 
 pub use store::{
-    ExtractionInput, FeedRefreshInput, FetchedFeed, PendingRemoteMark, PreparedExtraction,
-    PreparedFeedResponse, PreparedRemoteEntry, ProviderSyncState, Store, normalize_http_url,
+    ExtractionInput, FeedRefreshInput, FetchedFeed, PendingRemoteMark, PersistedFeedUpdate,
+    PreparedExtraction, PreparedFeedResponse, PreparedRemoteEntry, ProviderSyncState,
+    SavedRemoteEntries, Store, normalize_http_url,
 };

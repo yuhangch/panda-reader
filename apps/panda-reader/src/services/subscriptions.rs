@@ -29,7 +29,8 @@ pub(super) fn add_feed(
                 kind,
                 &detailed_logging,
                 runtime,
-            )?;
+            )
+            .map(|_| ())?;
         } else if provider.is_some() {
             return Err("Connect the selected provider before adding feeds".into());
         } else {
@@ -163,6 +164,7 @@ pub(super) fn import_opml(
                 &detailed_logging,
                 runtime,
             )
+            .map(|outcome| outcome.saved)
         } else if provider.is_some() {
             Err("Connect the selected provider before importing subscriptions".into())
         } else {

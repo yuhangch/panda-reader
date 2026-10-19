@@ -123,6 +123,18 @@ pub struct PreparedRemoteEntry {
     compressed_source: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct SavedRemoteEntries {
+    pub count: usize,
+    pub changed_article_ids: Vec<i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PersistedFeedUpdate {
+    pub feed_changed: bool,
+    pub changed_article_ids: Vec<i64>,
+}
+
 #[cfg(test)]
 fn shared_http_client() -> Client {
     static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -249,6 +261,43 @@ impl Store {
         Ok(statement
             .query_map([&self.workspace], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
+    pub fn remote_content_revisions_for_ids(
+        &self,
+        remote_ids: &[i64],
+    ) -> anyhow::Result<HashMap<i64, String>> {
+        if remote_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut revisions = HashMap::with_capacity(remote_ids.len());
+        for chunk in remote_ids.chunks(500) {
+            let mut sql = String::from(
+                "SELECT a.remote_id,COALESCE(a.source_revision,a.remote_content_hash) FROM articles a JOIN feeds f ON f.id=a.feed_id
+                 WHERE f.workspace=?1 AND a.remote_id IS NOT NULL AND a.remote_content_hash IS NOT NULL
+                 AND a.remote_id IN (",
+            );
+            for index in 0..chunk.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+            }
+            sql.push(')');
+            let mut statement = self.connection.prepare(&sql)?;
+            let mut params: Vec<rusqlite::types::Value> =
+                Vec::with_capacity(chunk.len().saturating_add(1));
+            params.push(self.workspace.clone().into());
+            params.extend(chunk.iter().map(|id| rusqlite::types::Value::Integer(*id)));
+            let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?;
+            for row in rows {
+                let (remote_id, revision) = row?;
+                revisions.insert(remote_id, revision);
+            }
+        }
+        Ok(revisions)
     }
 
     pub fn has_feed_url(&self, url: &str) -> anyhow::Result<bool> {

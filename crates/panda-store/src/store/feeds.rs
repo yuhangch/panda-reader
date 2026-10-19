@@ -49,16 +49,23 @@ impl Store {
         url: &str,
         id: Option<i64>,
         response: PreparedFeedResponse,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<PersistedFeedUpdate> {
         if let Some(feed) = response.parsed {
-            self.write_prepared_feed(url, feed, id, response.etag, response.modified)?;
-            Ok(true)
+            let changed_article_ids =
+                self.write_prepared_feed(url, feed, id, response.etag, response.modified)?;
+            Ok(PersistedFeedUpdate {
+                feed_changed: true,
+                changed_article_ids,
+            })
         } else if let Some(id) = id {
             self.connection.execute(
                 "UPDATE feeds SET last_error=NULL WHERE id=?1 AND workspace=?2",
                 params![id, self.workspace],
             )?;
-            Ok(false)
+            Ok(PersistedFeedUpdate {
+                feed_changed: false,
+                changed_article_ids: Vec::new(),
+            })
         } else {
             anyhow::bail!("Feed has no content yet")
         }
@@ -126,7 +133,8 @@ impl Store {
         let Some(feed) = response.parsed else {
             return Ok(false);
         };
-        self.write_prepared_feed(url, feed, None, response.etag, response.modified)?;
+        self.write_prepared_feed(url, feed, None, response.etag, response.modified)
+            .map(|_| ())?;
         if let Some(folder) = folder.filter(|value| !value.trim().is_empty()) {
             self.connection.execute(
                 "UPDATE feeds SET folder=?1 WHERE feed_url=?2 AND workspace=?3",
@@ -369,6 +377,7 @@ impl Store {
             etag,
             modified,
         )
+        .map(|_| ())
     }
 
     fn write_prepared_feed(
@@ -378,7 +387,7 @@ impl Store {
         existing_id: Option<i64>,
         etag: Option<String>,
         modified: Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<i64>> {
         let PreparedFeed {
             title,
             site_url,
@@ -391,6 +400,7 @@ impl Store {
             self.connection.execute("INSERT INTO feeds(feed_url,title,site_url,etag,last_modified,workspace) VALUES(?1,?2,?3,?4,?5,?6)", params![url,title,site_url,etag,modified,self.workspace])?;
             self.connection.last_insert_rowid()
         };
+        let mut changed_article_ids = Vec::new();
         let mut entries = articles.into_iter().peekable();
         while entries.peek().is_some() {
             let transaction = self.connection.transaction()?;
@@ -421,11 +431,12 @@ impl Store {
                 )?;
                 if transaction.changes() > 0 {
                     sync_article_fts(&transaction, article_id)?;
+                    changed_article_ids.push(article_id);
                 }
             }
             transaction.commit()?;
         }
-        Ok(())
+        Ok(changed_article_ids)
     }
 }
 

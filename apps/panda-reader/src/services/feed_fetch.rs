@@ -2,8 +2,20 @@
 
 use panda_store::FetchedFeed;
 use reqwest::Client;
+use std::sync::OnceLock;
 
 const MAX_FEED_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
+fn shared_http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        Client::builder()
+            .user_agent("PandaReader/0.1 (+https://github.com)")
+            .timeout(std::time::Duration::from_secs(25))
+            .build()
+            .expect("feed fetch HTTP client configuration is valid")
+    })
+}
 
 pub(super) async fn fetch_feed_data(
     url: &str,
@@ -19,10 +31,7 @@ async fn fetch_feed_data_with_limit(
     modified: Option<&str>,
     max_bytes: usize,
 ) -> anyhow::Result<FetchedFeed> {
-    let client = Client::builder()
-        .user_agent("PandaReader/0.1 (+https://github.com)")
-        .timeout(std::time::Duration::from_secs(25))
-        .build()?;
+    let client = shared_http_client();
     let mut request = client.get(url);
     if let Some(etag) = etag {
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
