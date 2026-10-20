@@ -467,72 +467,91 @@ pub(super) fn extract(
     let cleanup_workspace = workspace.clone();
     let submitted = try_job(reply, move |runtime| {
         let result = (|| -> Result<(), String> {
-            let store = Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
             let plugins = read_lock(&plugins, "plugin registry");
             let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
-            let prepared = runtime.block_on(async {
-                tokio::select! {
-                    _ = wait_for_article_work_cancel(cancel_receiver) => {
-                        Err("Article task cancelled".to_owned())
-                    }
-                    result = async {
-                        let Some(input) = store.extraction_input(id, force)? else {
-                            return Ok(None);
-                        };
-                        let (resolved_url, raw_html) = if let Some(cached) = input.cached_page_html.clone() {
-                            (input.url.clone(), cached)
-                        } else {
-                            let resolved = plugins.resolve_article_url(&input.url);
-                            for diagnostic in &resolved.diagnostics {
-                                eprintln!(
-                                    "article URL resolver {} failed: {}",
-                                    diagnostic.plugin_id, diagnostic.message
-                                );
-                            }
-                            if let Some(diagnostic) = resolved.diagnostics.first() {
-                                anyhow::bail!("{}", diagnostic.message);
-                            }
-                            let referer = (resolved.url != input.url).then_some(input.url.as_str());
-                            let html = fetch::fetch_html_with_network(
-                                &resolved.url,
-                                referer,
-                                &fetch_network,
-                            )
-                            .await?;
-                            (resolved.url, html)
-                        };
-                        store.prepare_extraction_from_page(
-                            input,
-                            resolved_url.clone(),
-                            raw_html.clone(),
-                            extractor,
-                            &pipeline_hash,
-                            |raw, url, title| {
-                                let raw = RawHtml::new(raw.to_owned());
-                                let prepared = plugins.process(raw.as_str(), url, title, PluginStage::Prepare);
-                                for diagnostic in &prepared.diagnostics {
+            let mut retry_stale = false;
+            let mut force_attempt = force;
+            let result = loop {
+                let store = Store::open_read_workspace(&path, &workspace)
+                    .map_err(|error| error.to_string())?;
+                let prepared = runtime.block_on(async {
+                    tokio::select! {
+                        _ = wait_for_article_work_cancel(cancel_receiver.clone()) => {
+                            Err("Article task cancelled".to_owned())
+                        }
+                        result = async {
+                            let Some(input) = store.extraction_input(id, force_attempt)? else {
+                                return Ok(None);
+                            };
+                            let (resolved_url, raw_html) = if let Some(cached) = input.cached_page_html.clone() {
+                                (input.url.clone(), cached)
+                            } else {
+                                let resolved = plugins.resolve_article_url(&input.url);
+                                for diagnostic in &resolved.diagnostics {
                                     eprintln!(
-                                        "article plugin {} failed: {}",
+                                        "article URL resolver {} failed: {}",
                                         diagnostic.plugin_id, diagnostic.message
                                     );
                                 }
-                                Ok((!prepared.matched_plugins.is_empty())
-                                    .then_some((prepared.html.into_owned(), prepared.body_selected)))
-                            },
-                        )
-                    } => result.map_err(|error: anyhow::Error| error.to_string()),
-                }
-            });
-            let result = match prepared {
-                Ok(Some(prepared)) => database.write(workspace.clone(), move |store| {
-                    let persisted = store.persist_extraction(prepared)?;
-                    if !persisted {
-                        eprintln!("discarded stale full-text extraction for article {id}");
+                                if let Some(diagnostic) = resolved.diagnostics.first() {
+                                    anyhow::bail!("{}", diagnostic.message);
+                                }
+                                let referer = (resolved.url != input.url).then_some(input.url.as_str());
+                                let html = fetch::fetch_html_with_network(
+                                    &resolved.url,
+                                    referer,
+                                    &fetch_network,
+                                )
+                                .await?;
+                                (resolved.url, html)
+                            };
+                            store.prepare_extraction_from_page(
+                                input,
+                                resolved_url.clone(),
+                                raw_html.clone(),
+                                extractor,
+                                &pipeline_hash,
+                                |raw, url, title| {
+                                    let raw = RawHtml::new(raw.to_owned());
+                                    let prepared = plugins.process(raw.as_str(), url, title, PluginStage::Prepare);
+                                    for diagnostic in &prepared.diagnostics {
+                                        eprintln!(
+                                            "article plugin {} failed: {}",
+                                            diagnostic.plugin_id, diagnostic.message
+                                        );
+                                    }
+                                    Ok((!prepared.matched_plugins.is_empty())
+                                        .then_some((prepared.html.into_owned(), prepared.body_selected)))
+                                },
+                            )
+                        } => result.map_err(|error: anyhow::Error| error.to_string()),
                     }
-                    Ok(())
-                }),
-                Ok(None) => Ok(()),
-                Err(error) => Err(error),
+                });
+
+                match prepared {
+                    Ok(Some(prepared)) => {
+                        match database.write(workspace.clone(), move |store| {
+                            store.persist_extraction(prepared)
+                        }) {
+                            Ok(true) => break Ok(()),
+                            Ok(false) if !retry_stale => {
+                                eprintln!("retrying stale full-text extraction for article {id}");
+                                retry_stale = true;
+                                force_attempt = true;
+                            }
+                            Ok(false) => {
+                                eprintln!("discarded stale full-text extraction for article {id}");
+                                break Err(
+                                    "Article changed while extracting full text. Please try again."
+                                        .to_owned(),
+                                );
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    }
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
+                }
             };
             if result.is_ok() {
                 RenderCache::lock(&cache).invalidate_article(id);

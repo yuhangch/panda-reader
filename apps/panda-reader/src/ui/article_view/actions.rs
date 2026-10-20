@@ -508,27 +508,35 @@ impl ReaderWindow {
                 this.update_article_reader(cx, |reader| reader.is_extracting = false);
                 match result {
                     Ok(()) => {
-                        this.set_flash(this.t("Full text extracted"), cx);
                         cx.spawn(async move |this, cx| {
-                            if let Ok(Ok(prepared)) = article_response.await {
-                                let _ = this.update(cx, |this, cx| {
-                                    if this.read_article_reader(cx, |reader| {
-                                        reader.request_epoch.is_current(revision)
-                                            && reader
-                                                .article
-                                                .as_ref()
-                                                .is_some_and(|current| current.summary.id == id)
-                                    }) {
+                            let prepared = article_response
+                                .await
+                                .map_err(|_| "Background service stopped".to_owned())
+                                .and_then(|result| result);
+                            let _ = this.update(cx, |this, cx| {
+                                if !this.read_article_reader(cx, |reader| {
+                                    reader.request_epoch.is_current(revision)
+                                        && reader
+                                            .article
+                                            .as_ref()
+                                            .is_some_and(|current| current.summary.id == id)
+                                }) {
+                                    return;
+                                }
+                                match prepared {
+                                    Ok(prepared) => {
                                         this.update_article_reader(cx, |reader| {
                                             reader.body_html = prepared.body_html.into();
                                             reader.body_markdown = prepared.body_markdown.into();
                                             reader.image_urls = prepared.image_urls.to_vec();
                                             reader.article = Some(prepared.article);
                                         });
-                                        cx.notify();
+                                        this.set_flash(this.t("Full text extracted"), cx);
                                     }
-                                });
-                            }
+                                    Err(error) => this.set_error(error),
+                                }
+                                cx.notify();
+                            });
                         })
                         .detach();
                     }
