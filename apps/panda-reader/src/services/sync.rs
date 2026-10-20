@@ -19,8 +19,7 @@ pub(super) struct SyncOutcome {
 impl SyncOutcome {
     fn merge(&mut self, other: SyncOutcome) {
         self.saved += other.saved;
-        self.changed_article_ids
-            .extend(other.changed_article_ids);
+        self.changed_article_ids.extend(other.changed_article_ids);
     }
 }
 
@@ -120,8 +119,11 @@ pub(super) fn refresh_feed(
                         )
                         .map_err(|error| error.to_string())?;
                         database.write(workspace, move |store| {
-                            let update =
-                                store.persist_prepared_feed(&input.url, Some(input.id), prepared)?;
+                            let update = store.persist_prepared_feed(
+                                &input.url,
+                                Some(input.id),
+                                prepared,
+                            )?;
                             Ok(usize::from(update.feed_changed))
                         })
                     }

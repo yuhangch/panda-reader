@@ -14,8 +14,7 @@ use std::time::Duration;
 use std::time::{Instant, SystemTime};
 use tokio::sync::mpsc::UnboundedSender;
 
-const STABLE_MANIFEST_URL: &str =
-    "https://yuhangch.github.io/panda-reader/updates/stable.json";
+const STABLE_MANIFEST_URL: &str = "https://yuhangch.github.io/panda-reader/updates/stable.json";
 const RELEASES_API: &str = "https://api.github.com/repos/yuhangch/panda-reader/releases/latest";
 const RELEASES_PAGE: &str = "https://github.com/yuhangch/panda-reader/releases";
 const MAX_ASSET_BYTES: u64 = 1_500_000_000;
@@ -377,10 +376,7 @@ fn is_trusted_download_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    parsed.scheme() == "https"
-        && parsed
-            .host_str()
-            .is_some_and(is_trusted_download_host)
+    parsed.scheme() == "https" && parsed.host_str().is_some_and(is_trusted_download_host)
 }
 
 fn trusted_download_urls(urls: &[String]) -> Vec<String> {
@@ -1299,9 +1295,7 @@ mod updater_tests {
         );
         let info = release_info_from_stable(StableManifest {
             version: "v0.2.10".into(),
-            html_url: Some(
-                "https://github.com/yuhangch/panda-reader/releases/tag/v0.2.10".into(),
-            ),
+            html_url: Some("https://github.com/yuhangch/panda-reader/releases/tag/v0.2.10".into()),
             assets,
         })
         .unwrap();
@@ -1361,7 +1355,9 @@ mod updater_tests {
         assert!(is_trusted_download_url(
             "https://yuhangch.github.io/panda-reader/updates/stable.json"
         ));
-        assert!(!is_trusted_download_url("http://github.com/yuhangch/panda-reader/a"));
+        assert!(!is_trusted_download_url(
+            "http://github.com/yuhangch/panda-reader/a"
+        ));
         assert!(!is_trusted_download_url("https://evil.example/setup.exe"));
     }
 
