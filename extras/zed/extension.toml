@@ -1,6 +1,6 @@
 id = "panda-bamboo-theme"
 name = "Panda Bamboo"
-version = "0.1.3"
+version = "0.1.4"
 schema_version = 1
 authors = ["yuhangch <yhch@msn.com>"]
 description = "A warm bamboo-green light theme inspired by Panda Reader."
