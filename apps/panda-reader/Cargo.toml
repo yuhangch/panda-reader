@@ -27,6 +27,7 @@ gpui-kit.workspace = true
 image.workspace = true
 ipnet.workspace = true
 panda-content = { path = "../../crates/panda-content" }
+panda-backup = { path = "../../crates/panda-backup" }
 panda-plugins = { path = "../../crates/panda-plugins" }
 panda-core = { path = "../../crates/panda-core" }
 panda-miniflux = { path = "../../crates/panda-miniflux" }
@@ -35,6 +36,7 @@ panda-store = { path = "../../crates/panda-store" }
 panda-translate = { path = "../../crates/panda-translate" }
 reqwest.workspace = true
 reqwest_client.workspace = true
+rusqlite.workspace = true
 scraper.workspace = true
 resvg = "=0.45.1"
 qrcodegen = "1.8"
@@ -44,6 +46,7 @@ rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
+tempfile.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 url.workspace = true

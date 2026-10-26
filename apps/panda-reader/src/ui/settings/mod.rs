@@ -3,6 +3,7 @@
 mod about;
 mod actions;
 mod appearance;
+mod backup;
 mod developer;
 mod general;
 mod plugins;

@@ -22,6 +22,70 @@ pub(in crate::ui) struct ArticleNetworkModeOption {
     language: Language,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct BackupModeOption {
+    pub(in crate::ui) mode: panda_backup::BackupMode,
+    language: Language,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::ui) struct BackupTargetOption {
+    pub(in crate::ui) s3: bool,
+    language: Language,
+}
+
+impl BackupTargetOption {
+    pub(in crate::ui) fn all(language: Language) -> Vec<Self> {
+        [false, true]
+            .into_iter()
+            .map(|s3| Self { s3, language })
+            .collect()
+    }
+}
+
+impl SearchableListItem for BackupTargetOption {
+    type Value = Self;
+
+    fn title(&self) -> SharedString {
+        SharedString::from(i18n::text(
+            self.language,
+            if self.s3 { "S3 compatible" } else { "WebDAV" },
+        ))
+    }
+
+    fn value(&self) -> &Self::Value {
+        self
+    }
+}
+
+impl BackupModeOption {
+    pub(in crate::ui) fn all(language: Language) -> Vec<Self> {
+        [
+            panda_backup::BackupMode::Config,
+            panda_backup::BackupMode::Full,
+        ]
+        .into_iter()
+        .map(|mode| Self { mode, language })
+        .collect()
+    }
+}
+
+impl SearchableListItem for BackupModeOption {
+    type Value = Self;
+
+    fn title(&self) -> SharedString {
+        let label = match self.mode {
+            panda_backup::BackupMode::Config => "Configuration only (Recommended)",
+            panda_backup::BackupMode::Full => "Full backup",
+        };
+        SharedString::from(i18n::text(self.language, label))
+    }
+
+    fn value(&self) -> &Self::Value {
+        self
+    }
+}
+
 impl ArticleNetworkModeOption {
     pub(in crate::ui) fn all(language: Language) -> Vec<Self> {
         ArticleNetworkMode::ALL
@@ -168,6 +232,7 @@ pub(in crate::ui) enum SettingsPage {
     Reading,
     Translation,
     Plugins,
+    Backup,
     Developer,
     About,
 }

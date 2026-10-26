@@ -179,6 +179,10 @@ pub enum Command {
     ExportOpml {
         reply: oneshot::Sender<Result<String, String>>,
     },
+    ImportBackupFeeds {
+        feeds: Vec<panda_store::BackupFeed>,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
 }
 
 impl Command {
@@ -228,6 +232,9 @@ impl Command {
                 let _ = reply.send(Err(message));
             }
             Self::ExportOpml { reply } => {
+                let _ = reply.send(Err(message));
+            }
+            Self::ImportBackupFeeds { reply, .. } => {
                 let _ = reply.send(Err(message));
             }
         }

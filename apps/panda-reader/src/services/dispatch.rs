@@ -163,6 +163,12 @@ pub(super) fn handle(command: Command, workspace: String, state: &WorkerState) {
         Command::ExportOpml { reply } => {
             super::subscriptions::export_opml(workspace.clone(), reply, state)
         }
+        Command::ImportBackupFeeds { feeds, reply } => {
+            let result = state.database.write("local".into(), move |store| {
+                store.merge_local_backup_feeds(&feeds)
+            });
+            let _ = reply.send(result);
+        }
         Command::Connect {
             kind,
             endpoint,

@@ -21,7 +21,12 @@ Under the hood, Panda Reader is a desktop RSS reader built with [GPUI](https://w
 - Full-text extraction from the original page (manual or automatic)
 - Local article plugins for publisher-specific extraction and cleanup ([plugin guide](https://yuhangch.github.io/panda-reader/docs/plugins/))
 - Extensible article translation with pluggable providers
+- Manual backups to local files, WebDAV, or S3-compatible storage
 - Theme presets and a multilingual interface
+
+### Backups
+
+Configuration-only backups merge Local subscriptions and ordinary preferences into the current library; they do not replace articles or reading state. Full backups include the library and take effect after restarting Panda Reader. Cloud backups are always encrypted with an age password that is entered for each operation and is never saved by the app. A lost password cannot be recovered. Local backups are unencrypted by default and may contain RSS URLs with access tokens; enable local encryption or store plaintext backups somewhere private.
 
 ## Installation
 

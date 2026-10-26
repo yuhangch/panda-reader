@@ -116,6 +116,7 @@ impl ReaderWindow {
             &translator_config,
             provider_settings,
             services.clone(),
+            data_dir.clone(),
         );
         let editor = FeedEditor::new(window, cx);
         let status = Status::default();
@@ -222,6 +223,9 @@ impl ReaderWindow {
                     reader.image_viewer_url = reader.image_urls.get(*index).cloned();
                 });
                 cx.notify();
+            }
+            super::article_view::ArticleViewEvent::CopyImage(url) => {
+                this.copy_article_image(url.clone(), cx)
             }
         });
         view.pane_subscriptions.push(reader_events);

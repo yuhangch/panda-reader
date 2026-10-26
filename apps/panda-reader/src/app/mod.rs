@@ -50,6 +50,13 @@ impl AssetSource for AppAssets {
 }
 
 pub fn run() {
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Could not start Panda Reader: {error:#}");
+            return;
+        }
+    };
     let AppConfig {
         data_dir,
         database,
@@ -59,7 +66,8 @@ pub fn run() {
         preferences,
         provider_settings,
         translator_config,
-    } = AppConfig::load();
+        _instance_lock,
+    } = config;
     let services = AppServices::start(
         database,
         provider_settings_path,

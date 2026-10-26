@@ -1,0 +1,22 @@
+[package]
+name = "panda-backup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+age.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+hex.workspace = true
+opendal.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+url.workspace = true
+zip.workspace = true

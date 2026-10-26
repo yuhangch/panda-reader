@@ -13,10 +13,11 @@ use panda_core::Scope;
 use panda_plugins::{CommunityPlugin, PluginSummary};
 use panda_providers::ProviderSettingsMap;
 use panda_translate::TranslatorConfig;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use super::selectors::{
-    ArticleNetworkModeOption, LanguageOption, LogRetentionOption, SettingsPage, TranslatorProvider,
+    ArticleNetworkModeOption, BackupModeOption, BackupTargetOption, LanguageOption,
+    LogRetentionOption, SettingsPage, TranslatorProvider,
 };
 
 pub(in crate::ui) struct Settings {
@@ -28,6 +29,8 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) added_feeds_search_input: Entity<InputState>,
     pub(in crate::ui) share_template_input: Entity<InputState>,
     pub(in crate::ui) language_select: Entity<SelectState<SearchableVec<LanguageOption>>>,
+    pub(in crate::ui) backup_mode_select: Entity<SelectState<SearchableVec<BackupModeOption>>>,
+    pub(in crate::ui) backup_target_select: Entity<SelectState<SearchableVec<BackupTargetOption>>>,
     pub(in crate::ui) translation_language_select:
         Entity<SelectState<SearchableVec<LanguageOption>>>,
     pub(in crate::ui) provider_select: Entity<SelectState<SearchableVec<TranslatorProvider>>>,
@@ -72,6 +75,26 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) pending_reset_settings: bool,
     pub(in crate::ui) theme_picker_open: bool,
     pub(in crate::ui) advanced_network_settings_open: bool,
+    pub(in crate::ui) backup_full_mode: bool,
+    pub(in crate::ui) backup_status: Option<String>,
+    pub(in crate::ui) backup_encrypt_local: bool,
+    pub(in crate::ui) backup_password_input: Entity<InputState>,
+    pub(in crate::ui) backup_local_password_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_s3: bool,
+    pub(in crate::ui) backup_cloud_endpoint_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_username_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_password_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_directory_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_region_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_bucket_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_prefix_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_access_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_secret_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_session_input: Entity<InputState>,
+    pub(in crate::ui) backup_cloud_path_style: bool,
+    pub(in crate::ui) backup_cloud_allow_insecure_http: bool,
+    pub(in crate::ui) backup_cloud_credentials_saved: bool,
+    pub(in crate::ui) backup_cloud_items: Vec<panda_backup::BackupItem>,
 }
 
 impl Settings {
@@ -87,6 +110,7 @@ impl Settings {
         translator_config: &TranslatorConfig,
         provider_settings: ProviderSettingsMap,
         services: AppServices,
+        data_dir: PathBuf,
     ) -> Self {
         let library_source = preferences.library_source;
         let selected_settings = library_source
@@ -94,6 +118,124 @@ impl Settings {
             .and_then(|kind| provider_settings.get(&kind));
         let add_placeholder = i18n::text(preferences.language, "Feed URL https://…");
         let add_input = cx.new(|cx| InputState::new(window, cx).placeholder(add_placeholder));
+        let backup_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Backup password")
+                .masked(true)
+        });
+        let backup_local_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Local backup password")
+                .masked(true)
+        });
+        let saved_target = panda_backup::load_targets(&data_dir.join("backup-targets.json"))
+            .ok()
+            .and_then(|mut targets| {
+                if targets.is_empty() {
+                    None
+                } else {
+                    Some(targets.remove(0))
+                }
+            });
+        let (
+            backup_cloud_s3,
+            cloud_endpoint,
+            cloud_username,
+            cloud_directory,
+            cloud_region,
+            cloud_bucket,
+            cloud_prefix,
+            cloud_path_style,
+            cloud_allow_http,
+            credentials_saved,
+        ) = match saved_target {
+            Some(panda_backup::BackupTargetConfig::WebDav(target)) => (
+                false,
+                target.endpoint,
+                target.username,
+                target.directory,
+                String::new(),
+                String::new(),
+                String::new(),
+                false,
+                target.allow_insecure_http,
+                !target.password.is_empty(),
+            ),
+            Some(panda_backup::BackupTargetConfig::S3(target)) => (
+                true,
+                target.endpoint.unwrap_or_default(),
+                String::new(),
+                String::new(),
+                target.region,
+                target.bucket,
+                target.prefix,
+                target.path_style,
+                target.allow_insecure_http,
+                !target.access_key.is_empty() || !target.secret_key.is_empty(),
+            ),
+            None => (
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                true,
+                false,
+                false,
+            ),
+        };
+        let backup_cloud_endpoint_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("https://storage.example")
+                .default_value(&cloud_endpoint)
+        });
+        let backup_cloud_username_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Username")
+                .default_value(&cloud_username)
+        });
+        let backup_cloud_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+        let backup_cloud_directory_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Remote directory")
+                .default_value(&cloud_directory)
+        });
+        let backup_cloud_region_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Region")
+                .default_value(&cloud_region)
+        });
+        let backup_cloud_bucket_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Bucket")
+                .default_value(&cloud_bucket)
+        });
+        let backup_cloud_prefix_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Prefix")
+                .default_value(&cloud_prefix)
+        });
+        let backup_cloud_access_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Access key")
+                .masked(true)
+        });
+        let backup_cloud_secret_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Secret key")
+                .masked(true)
+        });
+        let backup_cloud_session_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Session token (optional)")
+                .masked(true)
+        });
         let provider_url_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(library_source.endpoint_placeholder())
@@ -121,6 +263,22 @@ impl Settings {
             SelectState::new(
                 SearchableVec::new(LanguageOption::all(preferences.language)),
                 Some(language_index),
+                window,
+                cx,
+            )
+        });
+        let backup_mode_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(BackupModeOption::all(preferences.language)),
+                Some(IndexPath::new(0)),
+                window,
+                cx,
+            )
+        });
+        let backup_target_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(BackupTargetOption::all(preferences.language)),
+                Some(IndexPath::new(usize::from(backup_cloud_s3))),
                 window,
                 cx,
             )
@@ -293,6 +451,26 @@ impl Settings {
             },
         ));
         _subscriptions.push(cx.subscribe_in(
+            &backup_mode_select,
+            window,
+            |this, _, event, _, cx| {
+                if let SelectEvent::Confirm(Some(option)) = event {
+                    this.settings.backup_full_mode = option.mode == panda_backup::BackupMode::Full;
+                    cx.notify();
+                }
+            },
+        ));
+        _subscriptions.push(cx.subscribe_in(
+            &backup_target_select,
+            window,
+            |this, _, event, _, cx| {
+                if let SelectEvent::Confirm(Some(option)) = event {
+                    this.settings.backup_cloud_s3 = option.s3;
+                    cx.notify();
+                }
+            },
+        ));
+        _subscriptions.push(cx.subscribe_in(
             &translation_language_select,
             window,
             |this, _, event, _, cx| {
@@ -410,6 +588,8 @@ impl Settings {
             added_feeds_search_input,
             share_template_input,
             language_select,
+            backup_mode_select,
+            backup_target_select,
             translation_language_select,
             provider_select,
             log_retention_select,
@@ -452,6 +632,26 @@ impl Settings {
             pending_reset_settings: false,
             theme_picker_open: false,
             advanced_network_settings_open: false,
+            backup_full_mode: false,
+            backup_status: None,
+            backup_encrypt_local: false,
+            backup_password_input,
+            backup_local_password_input,
+            backup_cloud_s3,
+            backup_cloud_endpoint_input,
+            backup_cloud_username_input,
+            backup_cloud_password_input,
+            backup_cloud_directory_input,
+            backup_cloud_region_input,
+            backup_cloud_bucket_input,
+            backup_cloud_prefix_input,
+            backup_cloud_access_input,
+            backup_cloud_secret_input,
+            backup_cloud_session_input,
+            backup_cloud_path_style: cloud_path_style,
+            backup_cloud_allow_insecure_http: cloud_allow_http,
+            backup_cloud_credentials_saved: credentials_saved,
+            backup_cloud_items: Vec::new(),
             _subscriptions,
         }
     }

@@ -27,6 +27,7 @@ impl Settings {
                 .render_translation_settings(owner, cx)
                 .into_any_element(),
             SettingsPage::Plugins => self.render_plugins_settings(owner, cx).into_any_element(),
+            SettingsPage::Backup => self.render_backup_settings(owner, cx).into_any_element(),
             SettingsPage::About => self.render_about_settings(owner, cx).into_any_element(),
         };
         let scroll_id = match self.page {
@@ -36,6 +37,7 @@ impl Settings {
             SettingsPage::Reading => "settings-scroll-reading",
             SettingsPage::Translation => "settings-scroll-translation",
             SettingsPage::Plugins => "settings-scroll-plugins",
+            SettingsPage::Backup => "settings-scroll-backup",
             SettingsPage::About => "settings-scroll-about",
         };
         let build_label = if cfg!(debug_assertions) {
@@ -131,6 +133,14 @@ impl Settings {
                                 "Plugins",
                                 bundled_icon(BundledIcon::Plugins),
                                 SettingsPage::Plugins,
+                                cx,
+                            ))
+                            .child(self.settings_nav_row(
+                                owner,
+                                "settings-backup",
+                                "Backup",
+                                Icon::new(IconName::Settings),
+                                SettingsPage::Backup,
                                 cx,
                             ))
                             .child(self.settings_nav_row(

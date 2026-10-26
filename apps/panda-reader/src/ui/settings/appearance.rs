@@ -169,6 +169,7 @@ impl Settings {
                     .child(Settings::theme_preview(*preset))
                     .child(
                         h_flex()
+                            .items_center()
                             .justify_between()
                             .text_sm()
                             .child(owner.t(preset.name))

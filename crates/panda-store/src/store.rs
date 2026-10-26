@@ -1,5 +1,7 @@
 use anyhow::Context as _;
 mod articles;
+mod backup_config;
+pub use backup_config::BackupFeed;
 mod extraction;
 mod feeds;
 mod fts;
@@ -29,7 +31,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 use url::Url;
 
 pub struct Store {
