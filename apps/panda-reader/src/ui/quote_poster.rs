@@ -122,8 +122,8 @@ fn poster_svg(
     let accent = color_hex(palette.accent);
     let muted = color_hex(palette.muted);
     let border = color_hex(palette.border);
-    let render_width = POSTER_WIDTH * 2;
-    let render_height = height * 2;
+    let render_width = POSTER_WIDTH;
+    let render_height = height;
     let mut svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" width="{render_width}" height="{render_height}" viewBox="0 0 {POSTER_WIDTH} {height}">
 <rect width="100%" height="100%" fill="{background}"/>
@@ -140,7 +140,7 @@ fn poster_svg(
     }
     for (index, line) in quote_lines.iter().enumerate() {
         svg.push_str(&format!(
-            "<text x=\"120\" y=\"{}\" fill=\"{foreground}\" stroke=\"{foreground}\" stroke-width=\"1.0\" paint-order=\"stroke fill\" font-size=\"40\" font-weight=\"900\" font-family=\"{font}\">{}</text>\n",
+            "<text x=\"120\" y=\"{}\" fill=\"{foreground}\" stroke=\"{foreground}\" stroke-width=\"0.7\" paint-order=\"stroke fill\" font-size=\"40\" font-weight=\"900\" font-family=\"{font}\">{}</text>\n",
             quote_start + index as u32 * quote_line_height,
             xml_escape(line),
         ));
