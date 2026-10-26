@@ -1,6 +1,7 @@
 use super::Settings;
 use crate::services::Command;
 use crate::ui::components::text_input;
+use crate::ui::i18n;
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
@@ -161,43 +162,48 @@ impl Settings {
         cx: &mut Context<ReaderWindow>,
     ) -> impl IntoElement {
         let path = self.plugin_path_input.read(cx).value().to_string();
+        let language = owner.preferences.language;
         let mut rows = v_flex().gap_2();
         for plugin in self.plugins.clone() {
-            rows = rows.child(self.plugin_row(plugin, cx));
+            rows = rows.child(self.plugin_row(plugin, language, cx));
         }
         let mut community_rows = v_flex().gap_2();
         for plugin in self.community_plugins.clone() {
-            community_rows = community_rows.child(self.community_plugin_row(plugin, cx));
+            community_rows = community_rows.child(self.community_plugin_row(plugin, language, cx));
         }
         v_flex()
             .gap_3()
             .child(self.settings_heading(owner, "Plugins"))
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(owner.t(
                 "Import a plugin folder, ZIP archive, or HTTPS ZIP URL. Plugins can only access the current document.",
-            ))
+            )))
             .child(
                 h_flex()
                     .gap_2()
                     .child(text_input(&self.plugin_path_input).flex_1())
-                    .child(Button::new("plugin-browse-folder").small().secondary().label("Browse folder").on_click(cx.listener(|this, _, _, cx| {
+                    .child(Button::new("plugin-browse-folder").small().secondary().label(owner.t("Browse folder")).on_click(cx.listener(|this, _, _, cx| {
                         this.settings.browse_plugin_source(false, cx);
                     })))
-                    .child(Button::new("plugin-browse-zip").small().secondary().label("Browse ZIP").on_click(cx.listener(|this, _, _, cx| {
+                    .child(Button::new("plugin-browse-zip").small().secondary().label(owner.t("Browse ZIP")).on_click(cx.listener(|this, _, _, cx| {
                         this.settings.browse_plugin_source(true, cx);
                     })))
-                    .child(Button::new("plugin-import").small().primary().label("Import").on_click(cx.listener(move |this, _, _, cx| {
+                    .child(Button::new("plugin-import").small().primary().label(owner.t("Import")).on_click(cx.listener(move |this, _, _, cx| {
                         this.settings.run_plugin_operation(PluginOperation::Import(path.clone()), cx);
                     }))),
             )
             .child(h_flex().justify_between().items_center().child(
-                div().text_sm().child(if self.plugins_loading { "Loading plugins…".to_owned() } else { format!("{} plugins", self.plugins.len()) }),
+                div().text_sm().child(if self.plugins_loading {
+                    owner.t("Loading plugins…").to_owned()
+                } else {
+                    i18n::format(language, "{} plugins", self.plugins.len())
+                }),
             ).child(
-                Button::new("plugin-reload").small().secondary().label("Reload").on_click(cx.listener(|this, _, _, cx| {
+                Button::new("plugin-reload").small().secondary().label(owner.t("Reload")).on_click(cx.listener(|this, _, _, cx| {
                     this.settings.run_plugin_operation(PluginOperation::Reload, cx);
                 })),
             ))
             .when_some(self.plugin_error.clone(), |view, error| view.child(
-                div().text_sm().text_color(cx.theme().danger).child(error),
+                div().text_sm().text_color(cx.theme().danger).child(i18n::error(language, error)),
             ))
             .child(rows)
             .child(div().my_3().border_t_1().border_color(cx.theme().border))
@@ -205,15 +211,15 @@ impl Settings {
                 h_flex()
                     .items_center()
                     .justify_between()
-                    .child(div().font_semibold().child("Community plugins"))
+                    .child(div().font_semibold().child(owner.t("Community plugins")))
                     .child(
                         Button::new("community-plugins-refresh")
                             .small()
                             .secondary()
                             .label(if self.community_plugins_loading {
-                                "Checking…"
+                                owner.t("Checking…")
                             } else {
-                                "Check for updates"
+                                owner.t("Check for updates")
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.settings.check_community_plugins(cx);
@@ -221,15 +227,15 @@ impl Settings {
                     ),
             )
             .when_some(self.community_plugin_error.clone(), |view, error| {
-                view.child(div().text_sm().text_color(cx.theme().danger).child(error))
+                view.child(div().text_sm().text_color(cx.theme().danger).child(i18n::error(language, error)))
             })
             .when(
                 self.community_plugins_loading && self.community_plugins.is_empty(),
-                |view| view.child(div().text_sm().child("Loading community plugins…")),
+                |view| view.child(div().text_sm().child(owner.t("Loading community plugins…"))),
             )
             .when(
                 self.community_plugins_checked && self.community_plugins.is_empty(),
-                |view| view.child(div().text_sm().child("No community plugins found.")),
+                |view| view.child(div().text_sm().child(owner.t("No community plugins found."))),
             )
             .child(community_rows)
     }
@@ -237,6 +243,7 @@ impl Settings {
     fn community_plugin_row(
         &self,
         plugin: CommunityPlugin,
+        language: i18n::Language,
         cx: &mut Context<ReaderWindow>,
     ) -> impl IntoElement {
         let id = plugin.id.clone();
@@ -251,7 +258,12 @@ impl Settings {
         let network_access = plugin
             .capabilities
             .contains(&PluginCapability::NetworkRequest)
-            .then(|| format!(" · HTTPS: {}", plugin.network_hosts.join(", ")))
+            .then(|| {
+                format!(
+                    " · {}",
+                    i18n::format(language, "HTTPS: {}", plugin.network_hosts.join(", "))
+                )
+            })
             .unwrap_or_default();
         let label = if !compatible {
             "Requires newer app"
@@ -291,7 +303,7 @@ impl Settings {
                 Button::new(format!("community-plugin-{id}"))
                     .small()
                     .secondary()
-                    .label(label)
+                    .label(i18n::text(language, label))
                     .when(!is_current && compatible, |button| {
                         button.on_click(cx.listener(move |this, _, _, cx| {
                             this.settings.run_plugin_operation(
@@ -306,6 +318,7 @@ impl Settings {
     fn plugin_row(
         &self,
         plugin: PluginSummary,
+        language: i18n::Language,
         cx: &mut Context<ReaderWindow>,
     ) -> impl IntoElement {
         let id = plugin.manifest.id.clone();
@@ -317,7 +330,16 @@ impl Settings {
             .manifest
             .capabilities
             .contains(&PluginCapability::NetworkRequest)
-            .then(|| format!(" · HTTPS: {}", plugin.manifest.network_hosts.join(", ")))
+            .then(|| {
+                format!(
+                    " · {}",
+                    i18n::format(
+                        language,
+                        "HTTPS: {}",
+                        plugin.manifest.network_hosts.join(", ")
+                    )
+                )
+            })
             .unwrap_or_default();
         h_flex()
             .w_full()
@@ -346,7 +368,12 @@ impl Settings {
                             )),
                     )
                     .when_some(plugin.last_error, |view, error| {
-                        view.child(div().text_xs().text_color(cx.theme().danger).child(error))
+                        view.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().danger)
+                                .child(i18n::error(language, error)),
+                        )
                     }),
             )
             .child(
@@ -365,7 +392,7 @@ impl Settings {
                     Button::new(format!("plugin-remove-{remove_id}"))
                         .small()
                         .ghost()
-                        .label("Remove")
+                        .label(i18n::text(language, "Remove"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.settings.run_plugin_operation(
                                 PluginOperation::Remove(remove_id.clone()),

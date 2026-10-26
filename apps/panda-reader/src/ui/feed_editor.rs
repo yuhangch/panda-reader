@@ -1,5 +1,6 @@
 use crate::services::Command;
 use crate::ui::components::text_input;
+use crate::ui::i18n::{self, Language};
 use crate::ui::window::ReaderWindow;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
@@ -117,9 +118,15 @@ impl ReaderWindow {
 }
 
 impl FeedEditor {
-    pub(in crate::ui) fn new(window: &mut Window, cx: &mut Context<ReaderWindow>) -> Self {
-        let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Feed title"));
-        let folder_input = cx.new(|cx| InputState::new(window, cx).placeholder("Folder"));
+    pub(in crate::ui) fn new(
+        window: &mut Window,
+        cx: &mut Context<ReaderWindow>,
+        language: Language,
+    ) -> Self {
+        let title_input = cx
+            .new(|cx| InputState::new(window, cx).placeholder(i18n::text(language, "Feed title")));
+        let folder_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(i18n::text(language, "Folder")));
         let url_input = cx.new(|cx| InputState::new(window, cx).placeholder("https://…"));
         Self {
             title_input,

@@ -26,7 +26,8 @@ impl Settings {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!(
+                    .child(i18n::format(
+                        owner.preferences.language,
                         "Version {} · gpui-kit",
                         env!("CARGO_PKG_VERSION")
                     )),
@@ -41,7 +42,7 @@ impl Settings {
                         div()
                             .id("about-github-link")
                             .cursor_pointer()
-                            .child("Panda Reader on GitHub")
+                            .child(owner.t("Panda Reader on GitHub"))
                             .on_click(|_, _, cx| cx.open_url("https://github.com/yuhangch/panda-reader")),
                     )
             )
@@ -164,7 +165,7 @@ impl Settings {
                         div()
                             .id("about-papr-link")
                             .cursor_pointer()
-                            .child("Papr on GitHub")
+                            .child(owner.t("Papr on GitHub"))
                             .on_click(|_, _, cx| cx.open_url("https://github.com/l0ng-ai/papr")),
                     ),
             )
