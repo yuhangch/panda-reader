@@ -8,7 +8,7 @@ static LOG_RETENTION_DAYS: AtomicU16 = AtomicU16::new(30);
 static LOG_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
-pub(super) enum LogDetail {
+pub(crate) enum LogDetail {
     Summary,
     Detailed,
 }
@@ -34,7 +34,7 @@ pub(crate) fn set_log_retention_days(days: u16, database_path: &Path) {
     cleanup_expired_logs(database_path, days);
 }
 
-pub(super) fn write_sync_log(
+pub(crate) fn write_sync_log(
     database_path: &Path,
     detailed_enabled: &AtomicBool,
     detail: LogDetail,

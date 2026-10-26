@@ -531,13 +531,13 @@ impl Store {
                     let content_changed = stored_hash.as_deref() != Some(remote_hash.as_str());
                     let title_changed = old_title != entry.title;
                     let author_changed = old_author != entry.author;
+                    let status_changed = old_is_read != is_read || old_is_starred != entry.starred;
                     let changed = content_changed
                         || title_changed
                         || old_url != entry.url
                         || author_changed
                         || old_published_at != entry.published_at
-                        || old_is_read != is_read
-                        || old_is_starred != entry.starred;
+                        || status_changed;
                     if !changed {
                         continue;
                     }
@@ -588,6 +588,8 @@ impl Store {
                     }
                     if content_changed || title_changed || author_changed {
                         sync_article_fts(&transaction, article_id)?;
+                    }
+                    if content_changed || title_changed || author_changed || status_changed {
                         changed_article_ids.push(article_id);
                     }
                     saved += 1;

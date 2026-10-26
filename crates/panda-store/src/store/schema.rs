@@ -196,6 +196,8 @@ impl Store {
                 content_html TEXT NOT NULL DEFAULT '',
                 source_html BLOB,
                 source_page_html BLOB,
+                source_page_url TEXT,
+                source_page_content_type TEXT,
                 extraction_pipeline_hash TEXT,
                 extracted_html TEXT,
                 processed_html TEXT,
@@ -293,6 +295,8 @@ impl Store {
             )?;
             ensure_column(&connection, "articles", "source_html", "BLOB")?;
             ensure_column(&connection, "articles", "source_page_html", "BLOB")?;
+            ensure_column(&connection, "articles", "source_page_url", "TEXT")?;
+            ensure_column(&connection, "articles", "source_page_content_type", "TEXT")?;
             ensure_column(&connection, "articles", "extraction_pipeline_hash", "TEXT")?;
             ensure_column(&connection, "articles", "processed_html", "TEXT")?;
             ensure_column(&connection, "articles", "processed_source_hash", "TEXT")?;
@@ -454,6 +458,13 @@ impl Store {
                 "output_tokens",
                 "INTEGER NOT NULL DEFAULT 0",
             )?;
+            connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        }
+        if schema_version < 7 {
+            // Cached article pages retain their final URL and content type so
+            // redirects and non-HTML responses can be reprocessed correctly.
+            ensure_column(&connection, "articles", "source_page_url", "TEXT")?;
+            ensure_column(&connection, "articles", "source_page_content_type", "TEXT")?;
             connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         }
         if schema_version < CURRENT_SCHEMA_VERSION {

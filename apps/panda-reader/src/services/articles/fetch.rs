@@ -9,6 +9,15 @@ const MAX_ARTICLE_REDIRECTS: usize = 10;
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
 #[derive(Clone, Debug)]
+pub(crate) struct FetchedArticlePage {
+    pub(crate) final_url: String,
+    pub(crate) content_type: String,
+    pub(crate) charset: String,
+    pub(crate) body_bytes: usize,
+    pub(crate) html: String,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct ArticleFetchNetwork {
     pub(crate) mode: ArticleNetworkMode,
     pub(crate) proxy_url: String,
@@ -88,8 +97,9 @@ pub(super) async fn fetch_html_with_network(
     url: &str,
     referer: Option<&str>,
     network: &ArticleFetchNetwork,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<FetchedArticlePage> {
     let response = fetch_public_destination_with_network(url, referer, network).await?;
+    let final_url = response.url().as_str().to_owned();
     let content_type = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -107,9 +117,84 @@ pub(super) async fn fetch_html_with_network(
         })
         .unwrap_or("utf-8")
         .trim_matches([' ', '\'', '"']);
+    validate_article_content_type(&content_type, &bytes)?;
+    let body_bytes = bytes.len();
     let encoding =
         encoding_rs::Encoding::for_label(charset.as_bytes()).unwrap_or(encoding_rs::UTF_8);
-    Ok(encoding.decode(&bytes).0.into_owned())
+    Ok(FetchedArticlePage {
+        final_url,
+        content_type: content_type
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase(),
+        charset: encoding.name().to_owned(),
+        body_bytes,
+        html: encoding.decode(&bytes).0.into_owned(),
+    })
+}
+
+fn validate_article_content_type(content_type: &str, body: &[u8]) -> anyhow::Result<()> {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if media_type.is_empty() {
+        if looks_like_html(body) || looks_like_json(body) {
+            return Ok(());
+        }
+        anyhow::bail!("article URL returned content with no recognizable document type")
+    }
+    if matches!(
+        media_type.as_str(),
+        "text/html"
+            | "application/xhtml+xml"
+            | "text/plain"
+            | "application/json"
+            | "text/xml"
+            | "application/xml"
+    ) {
+        return Ok(());
+    }
+    if media_type.starts_with("image/")
+        || media_type.starts_with("audio/")
+        || media_type.starts_with("video/")
+        || matches!(
+            media_type.as_str(),
+            "application/pdf" | "application/octet-stream" | "application/zip"
+        )
+    {
+        anyhow::bail!("article URL returned non-HTML content ({media_type})");
+    }
+    // Some publishers serve HTML with an incorrect MIME type. Keep those pages
+    // usable when the response body clearly starts with recognizable markup.
+    if looks_like_html(body) {
+        return Ok(());
+    }
+    anyhow::bail!("article URL returned an unsupported content type ({media_type})")
+}
+
+fn looks_like_html(body: &[u8]) -> bool {
+    let sample = String::from_utf8_lossy(&body[..body.len().min(4096)]).to_ascii_lowercase();
+    let sample = sample.trim_start_matches('\u{feff}').trim_start();
+    [
+        "<!doctype html",
+        "<html",
+        "<head",
+        "<body",
+        "<article",
+        "<main",
+    ]
+    .iter()
+    .any(|prefix| sample.starts_with(prefix) || sample.contains(prefix))
+}
+
+fn looks_like_json(body: &[u8]) -> bool {
+    let sample = String::from_utf8_lossy(&body[..body.len().min(4096)]);
+    matches!(sample.trim_start().chars().next(), Some('{' | '['))
 }
 
 #[cfg(test)]
@@ -459,6 +544,21 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     #[test]
+    fn article_content_type_validation_accepts_html_and_rejects_binary_media() {
+        assert!(
+            validate_article_content_type("text/html; charset=utf-8", b"<html>ok</html>").is_ok()
+        );
+        assert!(validate_article_content_type("application/json", br#"{"body":"text"}"#).is_ok());
+        assert!(validate_article_content_type("application/pdf", b"%PDF-1.7").is_err());
+        assert!(validate_article_content_type("image/png", b"\x89PNG").is_err());
+        assert!(validate_article_content_type("application/x-custom", b"<html>ok</html>").is_ok());
+        assert!(validate_article_content_type("application/x-custom", b"opaque binary").is_err());
+        assert!(validate_article_content_type("", b"<html>ok</html>").is_ok());
+        assert!(validate_article_content_type("", br#"{"content":"ok"}"#).is_ok());
+        assert!(validate_article_content_type("", b"opaque binary").is_err());
+    }
+
+    #[test]
     fn article_fetch_only_allows_public_ip_destinations() {
         for address in [
             "127.0.0.1",
@@ -586,9 +686,65 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response, "proxy works");
+        assert_eq!(response.html, "proxy works");
+        assert_eq!(response.final_url, "http://reader-test.invalid/story");
+        assert_eq!(response.content_type, "text/html");
+        assert_eq!(response.charset, "UTF-8");
         let request = server.join().unwrap();
         assert!(request.starts_with("GET http://reader-test.invalid/story HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn fetched_page_reports_final_redirect_url_and_decodes_declared_charset() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in [
+                b"HTTP/1.1 302 Found\r\nLocation: http://reader-test.invalid/final/story?key=private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=windows-1252\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x63\x61\x66\xe9".as_slice(),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(response).unwrap();
+            }
+            requests
+        });
+        let network = ArticleFetchNetwork {
+            mode: ArticleNetworkMode::ExplicitProxy,
+            proxy_url,
+            ..ArticleFetchNetwork::default()
+        };
+
+        let page = fetch_html_with_network("http://reader-test.invalid/start", None, &network)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.final_url,
+            "http://reader-test.invalid/final/story?key=private"
+        );
+        assert_eq!(page.content_type, "text/html");
+        assert_eq!(page.charset, "windows-1252");
+        assert_eq!(page.html, "café");
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with("GET http://reader-test.invalid/start HTTP/1.1"));
+        assert!(
+            requests[1]
+                .starts_with("GET http://reader-test.invalid/final/story?key=private HTTP/1.1")
+        );
     }
 
     #[tokio::test]
@@ -645,7 +801,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response, "proxy works");
+        assert_eq!(response.html, "proxy works");
+        assert_eq!(response.final_url, "http://reader-test.invalid/story");
         assert_eq!(server.join().unwrap(), ("reader-test.invalid".into(), 80));
     }
 }

@@ -4,6 +4,7 @@ pub(crate) mod fetch;
 
 use super::command::{TitleTranslationInput, TitleTranslationOutcome, TitleTranslationStatus};
 use super::database::DbWriter;
+use super::diagnostics::{LogDetail, write_sync_log};
 use super::worker::{
     TranslationJobKey, WorkerState, finish_article_work, job, lock_mutex, read_lock,
     register_article_work, remote_mark_lock, title_job, try_background_job, try_job,
@@ -457,6 +458,8 @@ pub(super) fn extract(
     state: &WorkerState,
 ) {
     let path = state.path.clone();
+    let diagnostics_path = path.clone();
+    let detailed_logging = state.detailed_sync_logging.clone();
     let cache = state.body_cache.clone();
     let plugins = state.plugin_registry.clone();
     let database = state.database.clone();
@@ -466,12 +469,21 @@ pub(super) fn extract(
     let cleanup_cancellations = cancellations.clone();
     let cleanup_workspace = workspace.clone();
     let submitted = try_job(reply, move |runtime| {
+        let started_at = std::time::Instant::now();
+        write_sync_log(
+            &diagnostics_path,
+            &detailed_logging,
+            LogDetail::Summary,
+            "info",
+            format!("full-text extraction started article_id={id}"),
+        );
         let result = (|| -> Result<(), String> {
             let plugins = read_lock(&plugins, "plugin registry");
             let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
             let mut retry_stale = false;
             let mut force_attempt = force;
             let result = loop {
+                let mut failure_stage = "load_input".to_owned();
                 let store = Store::open_read_workspace(&path, &workspace)
                     .map_err(|error| error.to_string())?;
                 let prepared = runtime.block_on(async {
@@ -483,9 +495,11 @@ pub(super) fn extract(
                             let Some(input) = store.extraction_input(id, force_attempt)? else {
                                 return Ok(None);
                             };
-                            let (resolved_url, raw_html) = if let Some(cached) = input.cached_page_html.clone() {
-                                (input.url.clone(), cached)
+                            let (resolved_url, source_page_url, content_type, raw_html) = if let Some(cached) = input.cached_page_html.clone() {
+                                let page_url = input.cached_page_url.clone().unwrap_or_else(|| input.url.clone());
+                                (input.url.clone(), page_url, input.cached_page_content_type.clone().unwrap_or_default(), cached)
                             } else {
+                                failure_stage = "fetch_page".to_owned();
                                 let resolved = plugins.resolve_article_url(&input.url);
                                 for diagnostic in &resolved.diagnostics {
                                     eprintln!(
@@ -497,17 +511,36 @@ pub(super) fn extract(
                                     anyhow::bail!("{}", diagnostic.message);
                                 }
                                 let referer = (resolved.url != input.url).then_some(input.url.as_str());
-                                let html = fetch::fetch_html_with_network(
+                                let fetch_started = std::time::Instant::now();
+                                let page = fetch::fetch_html_with_network(
                                     &resolved.url,
                                     referer,
                                     &fetch_network,
                                 )
                                 .await?;
-                                (resolved.url, html)
+                                write_sync_log(
+                                    &diagnostics_path,
+                                    &detailed_logging,
+                                    LogDetail::Detailed,
+                                    "info",
+                                    format!(
+                                        "full-text fetch article_id={id} host={} mime={} charset={} bytes={} elapsed_ms={}",
+                                        safe_url_host(&page.final_url),
+                                        if page.content_type.is_empty() { "unknown" } else { &page.content_type },
+                                        page.charset,
+                                        page.body_bytes,
+                                        fetch_started.elapsed().as_millis(),
+                                    ),
+                                );
+                                (resolved.url, page.final_url, page.content_type, page.html)
                             };
+                            failure_stage = "extract_content".to_owned();
+                            let process_started = std::time::Instant::now();
                             store.prepare_extraction_from_page(
                                 input,
                                 resolved_url.clone(),
+                                source_page_url.clone(),
+                                content_type.clone(),
                                 raw_html.clone(),
                                 extractor,
                                 &pipeline_hash,
@@ -523,17 +556,57 @@ pub(super) fn extract(
                                     Ok((!prepared.matched_plugins.is_empty())
                                         .then_some((prepared.html.into_owned(), prepared.body_selected)))
                                 },
-                            )
+                            ).map(|prepared| {
+                                write_sync_log(
+                                    &diagnostics_path,
+                                    &detailed_logging,
+                                    LogDetail::Detailed,
+                                    "info",
+                                    format!(
+                                        "full-text processing article_id={id} extractor={extractor:?} host={} mime={} result={} result_bytes={} elapsed_ms={}",
+                                        safe_url_host(&source_page_url),
+                                        if content_type.is_empty() { "unknown" } else { &content_type },
+                                        if prepared.is_some() { "content" } else { "cached" },
+                                        prepared.as_ref().map_or(0, |result| result.extracted_html.len()),
+                                        process_started.elapsed().as_millis(),
+                                    ),
+                                );
+                                prepared
+                            })
                         } => result.map_err(|error: anyhow::Error| error.to_string()),
                     }
                 });
 
+                if prepared.is_err() {
+                    write_sync_log(
+                        &diagnostics_path,
+                        &detailed_logging,
+                        LogDetail::Detailed,
+                        "error",
+                        format!("full-text stage failed article_id={id} stage={failure_stage}"),
+                    );
+                }
+
                 match prepared {
                     Ok(Some(prepared)) => {
+                        failure_stage = "persist_result".to_owned();
+                        let persist_started = std::time::Instant::now();
                         match database.write(workspace.clone(), move |store| {
                             store.persist_extraction(prepared)
                         }) {
-                            Ok(true) => break Ok(()),
+                            Ok(true) => {
+                                write_sync_log(
+                                    &diagnostics_path,
+                                    &detailed_logging,
+                                    LogDetail::Detailed,
+                                    "info",
+                                    format!(
+                                        "full-text persistence article_id={id} elapsed_ms={}",
+                                        persist_started.elapsed().as_millis()
+                                    ),
+                                );
+                                break Ok(());
+                            }
                             Ok(false) if !retry_stale => {
                                 eprintln!("retrying stale full-text extraction for article {id}");
                                 retry_stale = true;
@@ -546,7 +619,18 @@ pub(super) fn extract(
                                         .to_owned(),
                                 );
                             }
-                            Err(error) => break Err(error),
+                            Err(error) => {
+                                write_sync_log(
+                                    &diagnostics_path,
+                                    &detailed_logging,
+                                    LogDetail::Detailed,
+                                    "error",
+                                    format!(
+                                        "full-text stage failed article_id={id} stage={failure_stage}"
+                                    ),
+                                );
+                                break Err(error);
+                            }
                         }
                     }
                     Ok(None) => break Ok(()),
@@ -558,12 +642,34 @@ pub(super) fn extract(
             }
             result
         })();
+        write_sync_log(
+            &diagnostics_path,
+            &detailed_logging,
+            LogDetail::Summary,
+            if result.is_ok() { "info" } else { "error" },
+            format!(
+                "full-text extraction {} article_id={id} elapsed_ms={}",
+                if result.is_ok() {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                started_at.elapsed().as_millis(),
+            ),
+        );
         finish_article_work(&cleanup_cancellations, &workspace, id, cancel_id);
         result
     });
     if !submitted {
         finish_article_work(&cancellations, &cleanup_workspace, id, cancel_id);
     }
+}
+
+fn safe_url_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 pub(super) fn translate(

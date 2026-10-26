@@ -4,6 +4,8 @@ use crate::ui::context_menus::PaneMenuEvent;
 use gpui_kit::*;
 use panda_core::{Article, MarkField, TranslationLayout};
 use panda_translate::TranslatorConfig;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub(in crate::ui) enum ArticleViewEvent {
@@ -20,6 +22,7 @@ pub(in crate::ui) enum ArticleViewEvent {
     SelectFeed(i64),
     SaveReadingProgress,
     OpenImage(usize),
+    CopyImage(Arc<gpui::Image>),
 }
 
 impl EventEmitter<ArticleViewEvent> for ArticleView {}
@@ -45,6 +48,11 @@ pub(in crate::ui) struct ArticleView {
     pub(in crate::ui) is_extracting: bool,
     pub(in crate::ui) requested_article_id: Option<i64>,
     pub(in crate::ui) show_loading_skeleton: bool,
+    pub(in crate::ui) pending_context_image: Option<String>,
+    pub(in crate::ui) context_menu_image: Option<String>,
+    pub(in crate::ui) article_image_cache: HashMap<String, Arc<gpui::Image>>,
+    pub(in crate::ui) article_image_cache_order: VecDeque<String>,
+    pub(in crate::ui) article_images_loading: HashSet<String>,
 }
 
 impl ArticleView {
@@ -72,6 +80,11 @@ impl ArticleView {
             is_extracting: false,
             requested_article_id: None,
             show_loading_skeleton: false,
+            pending_context_image: None,
+            context_menu_image: None,
+            article_image_cache: HashMap::new(),
+            article_image_cache_order: VecDeque::new(),
+            article_images_loading: HashSet::new(),
         }
     }
 

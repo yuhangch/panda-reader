@@ -92,6 +92,8 @@ pub struct PreparedExtraction {
     pub article_id: i64,
     pub source_revision: i64,
     pub resolved_url: String,
+    pub source_page_url: String,
+    pub source_page_content_type: String,
     pub source_page_html: Vec<u8>,
     pub extracted_html: String,
     pub pipeline_hash: String,
@@ -106,6 +108,8 @@ pub struct ExtractionInput {
     pub existing_html: Option<String>,
     pub existing_hash: Option<String>,
     pub cached_page_html: Option<String>,
+    pub cached_page_url: Option<String>,
+    pub cached_page_content_type: Option<String>,
 }
 
 #[derive(Clone, Debug)]

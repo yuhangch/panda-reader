@@ -1487,6 +1487,53 @@ async fn cached_page_can_be_reprocessed_offline_and_skips_unchanged_pipeline() {
         .unwrap();
 }
 
+#[test]
+fn extraction_uses_and_persists_final_page_url_and_content_type() {
+    let (_directory, store) = test_store();
+    store
+        .connection
+        .execute(
+            "INSERT INTO feeds(feed_url,title) VALUES('https://example.com/feed.xml','Example')",
+            [],
+        )
+        .unwrap();
+    store
+        .connection
+        .execute(
+            "INSERT INTO articles(feed_id,guid,title,url,content_html) VALUES(1,'entry','Title','https://news.example/redirect','<p>feed</p>')",
+            [],
+        )
+        .unwrap();
+    let input = store.extraction_input(1, true).unwrap().unwrap();
+    let source_url = "https://publisher.example/final/story";
+    let body = "A full article body with enough readable content to pass the normal extraction threshold. ".repeat(2);
+    let html = format!("<html><body><p>{body}</p></body></html>");
+    let prepared = store
+        .prepare_extraction_from_page(
+            input,
+            "https://news.example/resolved".into(),
+            source_url.into(),
+            "text/html".into(),
+            html,
+            ContentExtractor::DomSmoothie,
+            "pipeline-v1",
+            |_, url, _| {
+                assert_eq!(url, source_url);
+                Ok(None)
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(prepared.resolved_url, "https://news.example/resolved");
+    assert_eq!(prepared.source_page_url, source_url);
+    assert_eq!(prepared.source_page_content_type, "text/html");
+    assert!(store.persist_extraction(prepared).unwrap());
+    let input = store.extraction_input(1, false).unwrap().unwrap();
+    assert_eq!(input.cached_page_url.as_deref(), Some(source_url));
+    assert_eq!(input.cached_page_content_type.as_deref(), Some("text/html"));
+}
+
 #[tokio::test]
 async fn stale_extraction_is_discarded_after_article_source_changes() {
     let (_directory, store) = test_store();
@@ -1735,12 +1782,20 @@ fn save_prepared_remote_entries_reports_changed_article_ids() {
 
     let mut mark_only = content_changed;
     mark_only.status = "read".into();
+    let read_status = store
+        .save_remote_entries(&[mark_only.clone()], &ids, ProviderKind::Miniflux)
+        .unwrap();
+    assert_eq!(read_status.count, 1);
+    assert_eq!(read_status.changed_article_ids, vec![article_id]);
+    assert!(store.article(article_id).unwrap().summary.is_read);
+
     mark_only.starred = true;
-    let marks = store
+    let starred_status = store
         .save_remote_entries(&[mark_only], &ids, ProviderKind::Miniflux)
         .unwrap();
-    assert_eq!(marks.count, 1);
-    assert!(marks.changed_article_ids.is_empty());
+    assert_eq!(starred_status.count, 1);
+    assert_eq!(starred_status.changed_article_ids, vec![article_id]);
+    assert!(store.article(article_id).unwrap().summary.is_starred);
 }
 
 #[test]

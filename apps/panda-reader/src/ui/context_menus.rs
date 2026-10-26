@@ -248,12 +248,17 @@ pub(in crate::ui) fn article_context_menu(
     } else {
         String::new()
     };
-    let mut menu = menu.min_w(px(220.));
+    let mut menu = menu;
     if !selected_text.trim().is_empty() {
         let quote_article = article.clone();
         let quote_text = selected_text.clone();
         let emit_quote = emit.clone();
-        menu = menu
+        return menu
+            .item(PopupMenuItem::new(i18n::text(language, "Copy")).on_click({
+                let selected_text = selected_text.clone();
+                move |_, _, cx| copy_text(cx, selected_text.clone())
+            }))
+            .separator()
             .item(
                 PopupMenuItem::new(i18n::text(language, "Create Bamboo Leaf")).on_click({
                     move |_, _, cx| {
@@ -266,26 +271,17 @@ pub(in crate::ui) fn article_context_menu(
                         )
                     }
                 }),
-            )
-            .submenu(
-                i18n::text(language, "Edit"),
-                window,
-                cx,
-                move |menu, _, _| {
-                    menu.item(PopupMenuItem::new(i18n::text(language, "Copy")).on_click({
-                        let selected_text = selected_text.clone();
-                        move |_, _, cx| copy_text(cx, selected_text.clone())
-                    }))
-                },
-            )
+            );
+    }
+    if !include_selection_edit {
+        menu = menu
+            .item(PopupMenuItem::new(i18n::text(language, "Open")).on_click({
+                let emit = emit.clone();
+                move |_, _, cx| emit(PaneMenuEvent::OpenArticle(id), cx)
+            }))
             .separator();
     }
     menu = menu
-        .item(PopupMenuItem::new(i18n::text(language, "Open")).on_click({
-            let emit = emit.clone();
-            move |_, _, cx| emit(PaneMenuEvent::OpenArticle(id), cx)
-        }))
-        .separator()
         .item(
             PopupMenuItem::new(i18n::text(
                 language,
@@ -353,12 +349,6 @@ pub(in crate::ui) fn article_context_menu(
         )
         .separator()
         .item(
-            PopupMenuItem::new(i18n::text(language, "Copy title")).on_click({
-                let title = title.clone();
-                move |_, _, cx| copy_text(cx, title.clone())
-            }),
-        )
-        .item(
             PopupMenuItem::new(i18n::text(language, "Translate title")).on_click({
                 let emit = emit.clone();
                 move |_, _, cx| emit(PaneMenuEvent::TranslateTitle(id), cx)
@@ -367,6 +357,25 @@ pub(in crate::ui) fn article_context_menu(
 
     if let Some(url) = url {
         menu = menu
+            .item(
+                PopupMenuItem::new(i18n::text(language, "Translate")).on_click({
+                    let emit = emit.clone();
+                    move |_, _, cx| emit(PaneMenuEvent::ToggleTranslation(id), cx)
+                }),
+            )
+            .item(
+                PopupMenuItem::new(i18n::text(language, "Extract full text")).on_click({
+                    let emit = emit.clone();
+                    move |_, _, cx| emit(PaneMenuEvent::ExtractFullText(id), cx)
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(i18n::text(language, "Copy title")).on_click({
+                    let title = title.clone();
+                    move |_, _, cx| copy_text(cx, title.clone())
+                }),
+            )
             .item(
                 PopupMenuItem::new(i18n::text(language, "Copy link")).on_click({
                     let url = url.clone();
@@ -378,19 +387,14 @@ pub(in crate::ui) fn article_context_menu(
                     let url = url.clone();
                     move |_, _, cx| cx.open_url(&url)
                 }),
-            )
-            .item(
-                PopupMenuItem::new(i18n::text(language, "Extract full text")).on_click({
-                    let emit = emit.clone();
-                    move |_, _, cx| emit(PaneMenuEvent::ExtractFullText(id), cx)
-                }),
-            )
-            .item(
-                PopupMenuItem::new(i18n::text(language, "Translate")).on_click({
-                    let emit = emit.clone();
-                    move |_, _, cx| emit(PaneMenuEvent::ToggleTranslation(id), cx)
-                }),
             );
+    } else {
+        menu = menu.separator().item(
+            PopupMenuItem::new(i18n::text(language, "Copy title")).on_click({
+                let title = title.clone();
+                move |_, _, cx| copy_text(cx, title.clone())
+            }),
+        );
     }
 
     menu

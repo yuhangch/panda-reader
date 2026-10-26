@@ -1,4 +1,5 @@
 use crate::services::Command;
+use crate::ui::article_view::ArticleView;
 use crate::ui::i18n;
 use crate::ui::settings::SettingsPage;
 use crate::ui::window::ReaderWindow;
@@ -6,6 +7,99 @@ use gpui_kit::*;
 use panda_core::{MarkField, Scope, TranslationLayout};
 use std::sync::Arc;
 use tokio::sync::oneshot;
+
+impl ReaderWindow {
+    pub(in crate::ui) fn copy_article_image(
+        &mut self,
+        image: Arc<gpui_kit::gpui::Image>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.write_to_clipboard(ClipboardItem::new_image(&image));
+        self.set_flash(self.t("Image copied"), cx);
+    }
+}
+
+impl ArticleView {
+    pub(in crate::ui) fn load_article_image(
+        &mut self,
+        url: &str,
+        cx: &mut Context<ArticleView>,
+    ) -> Option<Arc<gpui_kit::gpui::Image>> {
+        if let Some(image) = self.article_image_cache.get(url) {
+            return Some(image.clone());
+        }
+        if !self.article_images_loading.insert(url.to_owned()) {
+            return None;
+        }
+
+        const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+        use futures::AsyncReadExt as _;
+        use gpui_kit::gpui::http_client::{AsyncBody, HttpRequestExt};
+
+        let client = cx.http_client();
+        let url = url.to_owned();
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let request = gpui_kit::gpui::http_client::Request::builder()
+                    .uri(&url)
+                    .timeout(std::time::Duration::from_secs(15))
+                    .body(AsyncBody::empty())
+                    .map_err(|error| error.to_string())?;
+                let mut response = client
+                    .send(request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !response.status().is_success() {
+                    return Err(format!("image request returned {}", response.status()));
+                }
+                if response
+                    .headers()
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .is_some_and(|size| size > MAX_IMAGE_BYTES)
+                {
+                    return Err("Image exceeds the 16 MiB copy limit".to_owned());
+                }
+                let mut bytes = Vec::new();
+                response
+                    .body_mut()
+                    .take((MAX_IMAGE_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if bytes.len() > MAX_IMAGE_BYTES {
+                    return Err("Image exceeds the 16 MiB copy limit".to_owned());
+                }
+                let decoded = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
+                let mut png = std::io::Cursor::new(Vec::new());
+                decoded
+                    .write_to(&mut png, image::ImageFormat::Png)
+                    .map_err(|error| error.to_string())?;
+                Ok(Arc::new(gpui_kit::gpui::Image::from_bytes(
+                    gpui_kit::gpui::ImageFormat::Png,
+                    png.into_inner(),
+                )))
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.article_images_loading.remove(&url);
+                if let Ok(image) = result {
+                    if this.article_image_cache.len() >= 32 {
+                        if let Some(oldest) = this.article_image_cache_order.pop_front() {
+                            this.article_image_cache.remove(&oldest);
+                        }
+                    }
+                    this.article_image_cache_order.push_back(url.clone());
+                    this.article_image_cache.insert(url, image);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        None
+    }
+}
 
 impl ReaderWindow {
     pub(in crate::ui) fn share_article(&mut self, cx: &mut Context<Self>) {

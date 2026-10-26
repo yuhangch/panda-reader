@@ -140,7 +140,7 @@ fn poster_svg(
     }
     for (index, line) in quote_lines.iter().enumerate() {
         svg.push_str(&format!(
-            "<text x=\"120\" y=\"{}\" fill=\"{foreground}\" stroke=\"{foreground}\" stroke-width=\"0.7\" paint-order=\"stroke fill\" font-size=\"40\" font-weight=\"900\" font-family=\"{font}\">{}</text>\n",
+            "<text x=\"120\" y=\"{}\" fill=\"{foreground}\" stroke=\"{foreground}\" stroke-width=\"1.0\" paint-order=\"stroke fill\" font-size=\"40\" font-weight=\"900\" font-family=\"{font}\">{}</text>\n",
             quote_start + index as u32 * quote_line_height,
             xml_escape(line),
         ));
