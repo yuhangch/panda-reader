@@ -76,12 +76,15 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) theme_picker_open: bool,
     pub(in crate::ui) advanced_network_settings_open: bool,
     pub(in crate::ui) backup_full_mode: bool,
-    pub(in crate::ui) backup_status: Option<String>,
-    pub(in crate::ui) backup_encrypt_local: bool,
     pub(in crate::ui) backup_password_input: Entity<InputState>,
-    pub(in crate::ui) backup_local_password_input: Entity<InputState>,
+    pub(in crate::ui) backup_password_prompt_open: bool,
+    pub(in crate::ui) backup_password_prompt_for_export: bool,
+    pub(in crate::ui) backup_password_prompt_input: Entity<InputState>,
+    pub(in crate::ui) backup_import_pending_path: Option<PathBuf>,
+    pub(in crate::ui) backup_password_prompt_error: Option<String>,
     pub(in crate::ui) backup_cloud_s3: bool,
-    pub(in crate::ui) backup_cloud_endpoint_input: Entity<InputState>,
+    pub(in crate::ui) backup_webdav_endpoint_input: Entity<InputState>,
+    pub(in crate::ui) backup_s3_endpoint_input: Entity<InputState>,
     pub(in crate::ui) backup_cloud_username_input: Entity<InputState>,
     pub(in crate::ui) backup_cloud_password_input: Entity<InputState>,
     pub(in crate::ui) backup_cloud_directory_input: Entity<InputState>,
@@ -94,6 +97,12 @@ pub(in crate::ui) struct Settings {
     pub(in crate::ui) backup_cloud_path_style: bool,
     pub(in crate::ui) backup_cloud_allow_insecure_http: bool,
     pub(in crate::ui) backup_cloud_credentials_saved: bool,
+    pub(in crate::ui) backup_cloud_password_saved: bool,
+    pub(in crate::ui) backup_cloud_access_saved: bool,
+    pub(in crate::ui) backup_cloud_secret_saved: bool,
+    pub(in crate::ui) backup_cloud_session_saved: bool,
+    pub(in crate::ui) backup_webdav_insecure_http: bool,
+    pub(in crate::ui) backup_s3_insecure_http: bool,
     pub(in crate::ui) backup_cloud_items: Vec<panda_backup::BackupItem>,
 }
 
@@ -120,120 +129,155 @@ impl Settings {
         let add_input = cx.new(|cx| InputState::new(window, cx).placeholder(add_placeholder));
         let backup_password_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Backup password")
+                .placeholder(i18n::text(preferences.language, "Backup password"))
                 .masked(true)
         });
-        let backup_local_password_input = cx.new(|cx| {
+        let backup_password_prompt_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Local backup password")
+                .placeholder(i18n::text(
+                    preferences.language,
+                    "Optional: leave blank for an unencrypted backup",
+                ))
                 .masked(true)
         });
-        let saved_target = panda_backup::load_targets(&data_dir.join("backup-targets.json"))
-            .ok()
-            .and_then(|mut targets| {
-                if targets.is_empty() {
-                    None
-                } else {
-                    Some(targets.remove(0))
-                }
-            });
-        let (
-            backup_cloud_s3,
-            cloud_endpoint,
-            cloud_username,
-            cloud_directory,
-            cloud_region,
-            cloud_bucket,
-            cloud_prefix,
-            cloud_path_style,
-            cloud_allow_http,
-            credentials_saved,
-        ) = match saved_target {
-            Some(panda_backup::BackupTargetConfig::WebDav(target)) => (
-                false,
-                target.endpoint,
-                target.username,
-                target.directory,
-                String::new(),
-                String::new(),
-                String::new(),
-                false,
-                target.allow_insecure_http,
-                !target.password.is_empty(),
-            ),
-            Some(panda_backup::BackupTargetConfig::S3(target)) => (
-                true,
-                target.endpoint.unwrap_or_default(),
-                String::new(),
-                String::new(),
-                target.region,
-                target.bucket,
-                target.prefix,
-                target.path_style,
-                target.allow_insecure_http,
-                !target.access_key.is_empty() || !target.secret_key.is_empty(),
-            ),
-            None => (
-                false,
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                true,
-                false,
-                false,
-            ),
+        let saved_targets =
+            panda_backup::load_targets(&data_dir.join("backup-targets.json")).unwrap_or_default();
+        let saved_webdav = saved_targets.iter().find_map(|target| match target {
+            panda_backup::BackupTargetConfig::WebDav(target) => Some(target.clone()),
+            panda_backup::BackupTargetConfig::S3(_) => None,
+        });
+        let saved_s3 = saved_targets.iter().find_map(|target| match target {
+            panda_backup::BackupTargetConfig::S3(target) => Some(target.clone()),
+            panda_backup::BackupTargetConfig::WebDav(_) => None,
+        });
+        let backup_cloud_s3 = saved_webdav.is_none() && saved_s3.is_some();
+        let webdav_endpoint = saved_webdav
+            .as_ref()
+            .map_or_else(String::new, |target| target.endpoint.clone());
+        let webdav_username = saved_webdav
+            .as_ref()
+            .map_or_else(String::new, |target| target.username.clone());
+        let webdav_directory = saved_webdav
+            .as_ref()
+            .map(|target| target.directory.trim().to_owned())
+            .filter(|directory| !directory.is_empty())
+            .unwrap_or_else(|| "/panda-reader".into());
+        let s3_endpoint = saved_s3
+            .as_ref()
+            .and_then(|target| target.endpoint.clone())
+            .unwrap_or_default();
+        let s3_region = saved_s3
+            .as_ref()
+            .map_or_else(String::new, |target| target.region.clone());
+        let s3_bucket = saved_s3
+            .as_ref()
+            .map_or_else(String::new, |target| target.bucket.clone());
+        let s3_prefix = saved_s3
+            .as_ref()
+            .map(|target| target.prefix.trim().to_owned())
+            .filter(|prefix| !prefix.is_empty())
+            .unwrap_or_else(|| "/panda-reader".into());
+        let backup_cloud_password_saved = saved_webdav
+            .as_ref()
+            .is_some_and(|target| !target.password.is_empty());
+        let backup_cloud_access_saved = saved_s3
+            .as_ref()
+            .is_some_and(|target| !target.access_key.is_empty());
+        let backup_cloud_secret_saved = saved_s3
+            .as_ref()
+            .is_some_and(|target| !target.secret_key.is_empty());
+        let backup_cloud_session_saved = saved_s3.as_ref().is_some_and(|target| {
+            target
+                .session_token
+                .as_ref()
+                .is_some_and(|token| !token.is_empty())
+        });
+        let backup_webdav_insecure_http = saved_webdav
+            .as_ref()
+            .is_some_and(|target| target.allow_insecure_http);
+        let backup_s3_insecure_http = saved_s3
+            .as_ref()
+            .is_some_and(|target| target.allow_insecure_http);
+        let backup_cloud_allow_insecure_http = if backup_cloud_s3 {
+            backup_s3_insecure_http
+        } else {
+            backup_webdav_insecure_http
         };
-        let backup_cloud_endpoint_input = cx.new(|cx| {
+        let backup_cloud_path_style = saved_s3.as_ref().map_or(true, |target| target.path_style);
+        let backup_cloud_credentials_saved = if backup_cloud_s3 {
+            backup_cloud_access_saved || backup_cloud_secret_saved || backup_cloud_session_saved
+        } else {
+            backup_cloud_password_saved
+        };
+        let backup_webdav_endpoint_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("https://storage.example")
-                .default_value(&cloud_endpoint)
+                .placeholder(i18n::text(preferences.language, "https://dav.example.com/"))
+                .default_value(&webdav_endpoint)
+        });
+        let backup_s3_endpoint_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(i18n::text(preferences.language, "https://s3.example.com"))
+                .default_value(&s3_endpoint)
         });
         let backup_cloud_username_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Username")
-                .default_value(&cloud_username)
+                .placeholder(i18n::text(preferences.language, "Username"))
+                .default_value(&webdav_username)
         });
         let backup_cloud_password_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Password")
+                .placeholder(if backup_cloud_password_saved {
+                    "••••••••"
+                } else {
+                    i18n::text(preferences.language, "Password")
+                })
                 .masked(true)
         });
         let backup_cloud_directory_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Remote directory")
-                .default_value(&cloud_directory)
+                .placeholder(i18n::text(preferences.language, "Remote directory"))
+                .default_value(&webdav_directory)
         });
         let backup_cloud_region_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Region")
-                .default_value(&cloud_region)
+                .placeholder(i18n::text(preferences.language, "Region"))
+                .default_value(&s3_region)
         });
         let backup_cloud_bucket_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Bucket")
-                .default_value(&cloud_bucket)
+                .placeholder(i18n::text(preferences.language, "Bucket"))
+                .default_value(&s3_bucket)
         });
         let backup_cloud_prefix_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Prefix")
-                .default_value(&cloud_prefix)
+                .placeholder(i18n::text(preferences.language, "Prefix"))
+                .default_value(&s3_prefix)
         });
         let backup_cloud_access_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Access key")
+                .placeholder(if backup_cloud_access_saved {
+                    "••••••••"
+                } else {
+                    i18n::text(preferences.language, "Access key")
+                })
                 .masked(true)
         });
         let backup_cloud_secret_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Secret key")
+                .placeholder(if backup_cloud_secret_saved {
+                    "••••••••"
+                } else {
+                    i18n::text(preferences.language, "Secret key")
+                })
                 .masked(true)
         });
         let backup_cloud_session_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Session token (optional)")
+                .placeholder(if backup_cloud_session_saved {
+                    "••••••••"
+                } else {
+                    i18n::text(preferences.language, "Session token (optional)")
+                })
                 .masked(true)
         });
         let provider_url_input = cx.new(|cx| {
@@ -243,12 +287,15 @@ impl Settings {
         });
         let provider_username_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Username")
+                .placeholder(i18n::text(preferences.language, "Username"))
                 .default_value(selected_settings.map_or("", |value| value.username.as_str()))
         });
         let provider_secret_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("API token or API password")
+                .placeholder(i18n::text(
+                    preferences.language,
+                    "API token or API password",
+                ))
                 .masked(true)
                 .default_value(selected_settings.map_or("", |value| value.secret.as_str()))
         });
@@ -329,18 +376,21 @@ impl Settings {
         });
         let article_proxy_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("http://127.0.0.1:7890 or socks5h://127.0.0.1:1080")
+                .placeholder(i18n::text(
+                    preferences.language,
+                    "http://127.0.0.1:7890 or socks5h://127.0.0.1:1080",
+                ))
                 .default_value(preferences.article_proxy_url.as_str())
         });
         let trusted_fake_ip_ranges_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(2, 4)
-                .placeholder("One CIDR per line")
+                .placeholder(i18n::text(preferences.language, "One CIDR per line"))
                 .default_value(preferences.trusted_proxy_fake_ip_ranges.as_str())
         });
         let azure_key_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Azure Translator key")
+                .placeholder(i18n::text(preferences.language, "Azure Translator key"))
                 .masked(true)
                 .default_value(translator_config.azure_key.as_str())
         });
@@ -351,12 +401,12 @@ impl Settings {
         });
         let volcengine_ak_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Access Key ID")
+                .placeholder(i18n::text(preferences.language, "Access Key ID"))
                 .default_value(translator_config.volcengine_access_key.as_str())
         });
         let volcengine_sk_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("Secret Access Key")
+                .placeholder(i18n::text(preferences.language, "Secret Access Key"))
                 .masked(true)
                 .default_value(translator_config.volcengine_secret_key.as_str())
         });
@@ -367,7 +417,7 @@ impl Settings {
         });
         let openai_key_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("API key")
+                .placeholder(i18n::text(preferences.language, "API key"))
                 .masked(true)
                 .default_value(translator_config.openai_key.as_str())
         });
@@ -383,7 +433,7 @@ impl Settings {
         });
         let anthropic_key_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("API key")
+                .placeholder(i18n::text(preferences.language, "API key"))
                 .masked(true)
                 .default_value(translator_config.anthropic_key.as_str())
         });
@@ -399,7 +449,7 @@ impl Settings {
         });
         let gemini_key_input = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("API key")
+                .placeholder(i18n::text(preferences.language, "API key"))
                 .masked(true)
                 .default_value(translator_config.gemini_key.as_str())
         });
@@ -409,7 +459,10 @@ impl Settings {
                 .default_value(translator_config.gemini_model.as_str())
         });
         let plugin_path_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Plugin folder, ZIP path, or HTTPS ZIP URL")
+            InputState::new(window, cx).placeholder(i18n::text(
+                preferences.language,
+                "Plugin folder, ZIP path, or HTTPS ZIP URL",
+            ))
         });
         let added_feeds_search_for_events = added_feeds_search_input.clone();
         let mut _subscriptions = Vec::new();
@@ -466,6 +519,18 @@ impl Settings {
             |this, _, event, _, cx| {
                 if let SelectEvent::Confirm(Some(option)) = event {
                     this.settings.backup_cloud_s3 = option.s3;
+                    this.settings.backup_cloud_allow_insecure_http = if option.s3 {
+                        this.settings.backup_s3_insecure_http
+                    } else {
+                        this.settings.backup_webdav_insecure_http
+                    };
+                    this.settings.backup_cloud_credentials_saved = if option.s3 {
+                        this.settings.backup_cloud_access_saved
+                            || this.settings.backup_cloud_secret_saved
+                            || this.settings.backup_cloud_session_saved
+                    } else {
+                        this.settings.backup_cloud_password_saved
+                    };
                     cx.notify();
                 }
             },
@@ -633,12 +698,15 @@ impl Settings {
             theme_picker_open: false,
             advanced_network_settings_open: false,
             backup_full_mode: false,
-            backup_status: None,
-            backup_encrypt_local: false,
             backup_password_input,
-            backup_local_password_input,
+            backup_password_prompt_open: false,
+            backup_password_prompt_for_export: false,
+            backup_password_prompt_input,
+            backup_import_pending_path: None,
+            backup_password_prompt_error: None,
             backup_cloud_s3,
-            backup_cloud_endpoint_input,
+            backup_webdav_endpoint_input,
+            backup_s3_endpoint_input,
             backup_cloud_username_input,
             backup_cloud_password_input,
             backup_cloud_directory_input,
@@ -648,9 +716,15 @@ impl Settings {
             backup_cloud_access_input,
             backup_cloud_secret_input,
             backup_cloud_session_input,
-            backup_cloud_path_style: cloud_path_style,
-            backup_cloud_allow_insecure_http: cloud_allow_http,
-            backup_cloud_credentials_saved: credentials_saved,
+            backup_cloud_path_style,
+            backup_cloud_allow_insecure_http,
+            backup_cloud_credentials_saved,
+            backup_cloud_password_saved,
+            backup_cloud_access_saved,
+            backup_cloud_secret_saved,
+            backup_cloud_session_saved,
+            backup_webdav_insecure_http,
+            backup_s3_insecure_http,
             backup_cloud_items: Vec::new(),
             _subscriptions,
         }

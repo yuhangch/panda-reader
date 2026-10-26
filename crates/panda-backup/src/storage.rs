@@ -89,6 +89,7 @@ pub struct RemoteStorage {
 
 impl RemoteStorage {
     pub fn new(config: &BackupTargetConfig) -> anyhow::Result<Self> {
+        opendal::install_default();
         match config {
             BackupTargetConfig::WebDav(target) => {
                 validate_endpoint(&target.endpoint, target.allow_insecure_http)?;
@@ -144,7 +145,13 @@ impl RemoteStorage {
     }
 
     pub async fn test_connection(&self) -> anyhow::Result<()> {
-        self.operator.list("").await.map_err(|_| anyhow::anyhow!("Cloud storage connection failed; check endpoint, credentials, permissions and network"))?;
+        self.operator.list("").await.map_err(|error| {
+            anyhow::anyhow!(
+                "listing cloud backup root failed ({:?}): {}",
+                error.kind(),
+                error.message()
+            )
+        })?;
         Ok(())
     }
 
@@ -158,8 +165,8 @@ impl RemoteStorage {
     ) -> anyhow::Result<BackupItem> {
         validate_object_name(archive_name)?;
         ensure!(
-            archive_name.ends_with(".prbackup.age"),
-            "cloud backups must use age encryption"
+            archive_name.ends_with(".pdbk") || archive_name.ends_with(".prbackup.age"),
+            "cloud backups must use the .pdbk extension"
         );
         let (size, sha256) = hash_file(encrypted_file)?;
         let archive_path = archive_name.to_owned();
@@ -227,7 +234,9 @@ impl RemoteStorage {
         let mut result = Vec::new();
         for entry in entries {
             let marker_name = entry.name();
-            if !marker_name.ends_with(".prbackup.age.complete.json") {
+            if !marker_name.ends_with(".pdbk.complete.json")
+                && !marker_name.ends_with(".prbackup.age.complete.json")
+            {
                 continue;
             }
             let Ok(bytes) = self.operator.read(marker_name).await else {
@@ -268,18 +277,30 @@ impl RemoteStorage {
             .operator
             .reader(&item.archive_name)
             .await
-            .map_err(|_| anyhow::anyhow!("Cloud backup download could not be started"))?;
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "opening cloud backup reader failed ({:?}): {}",
+                    error.kind(),
+                    error.message()
+                )
+            })?;
         let output = temp.as_file().try_clone()?;
         let mut output = std::io::BufWriter::new(output);
         let mut offset = 0_u64;
-        loop {
-            let chunk = reader
-                .read(offset..offset.saturating_add(256 * 1024))
-                .await
-                .map_err(|_| anyhow::anyhow!("Cloud backup download failed"))?;
-            if chunk.is_empty() {
-                break;
-            }
+        while offset < item.encrypted_bytes {
+            let range = download_range(offset, item.encrypted_bytes);
+            let chunk = reader.read(range).await.map_err(|error| {
+                anyhow::anyhow!(
+                    "reading cloud backup at byte {offset} failed ({:?}): {}",
+                    error.kind(),
+                    error.message()
+                )
+            })?;
+            ensure!(
+                !chunk.is_empty(),
+                "cloud backup ended at byte {offset}; expected {} bytes",
+                item.encrypted_bytes
+            );
             let chunk = chunk.to_bytes();
             offset = offset.saturating_add(chunk.len() as u64);
             output.write_all(&chunk)?;
@@ -288,9 +309,11 @@ impl RemoteStorage {
         output.get_ref().sync_all()?;
         let (size, hash) = hash_file(temp.path())?;
         ensure!(
-            size == item.encrypted_bytes && hash == item.sha256,
-            "downloaded backup checksum mismatch"
+            size == item.encrypted_bytes,
+            "downloaded backup size mismatch: expected {} bytes, received {size}",
+            item.encrypted_bytes
         );
+        ensure!(hash == item.sha256, "downloaded backup checksum mismatch");
         temp.persist(destination).map_err(|error| error.error)?;
         Ok(())
     }
@@ -399,6 +422,10 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
     Ok((total, hex::encode(hasher.finalize())))
 }
 
+fn download_range(offset: u64, total_size: u64) -> std::ops::Range<u64> {
+    offset..offset.saturating_add(256 * 1024).min(total_size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +478,42 @@ mod tests {
         assert!(validate_endpoint("http://cloud.example", false).is_err());
         assert!(validate_endpoint("https://user:password@cloud.example", false).is_err());
         assert!(validate_endpoint("http://127.0.0.1:8080", false).is_ok());
+    }
+
+    #[test]
+    fn download_ranges_clamp_the_final_chunk_to_the_archive_size() {
+        assert_eq!(download_range(0, 128 * 1024), 0..128 * 1024);
+        assert_eq!(download_range(0, 512 * 1024), 0..256 * 1024);
+        assert_eq!(
+            download_range(256 * 1024, 512 * 1024),
+            256 * 1024..512 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_probe_uses_the_installed_default_http_transport() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let target = BackupTargetConfig::WebDav(WebDavTarget {
+            endpoint,
+            username: String::new(),
+            password: String::new(),
+            directory: String::new(),
+            allow_insecure_http: true,
+        });
+
+        let error = RemoteStorage::new(&target)
+            .unwrap()
+            .test_connection()
+            .await
+            .unwrap_err();
+
+        assert!(
+            !error
+                .to_string()
+                .contains("default HTTP transport is not installed"),
+            "{error:#}"
+        );
     }
 }

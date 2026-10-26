@@ -48,7 +48,7 @@ pub(crate) fn write_sync_log(
     let line = format!(
         "{} [{level}] {}\n",
         chrono::Utc::now().to_rfc3339(),
-        redact_urls(message.as_ref())
+        redact_diagnostic_message(message.as_ref())
     );
     let path = log_path(database_path);
     let Some(parent) = path.parent() else {
@@ -83,6 +83,17 @@ pub(crate) fn write_sync_log(
     }
 }
 
+pub(crate) fn write_sync_summary_log(database_path: &Path, level: &str, message: impl AsRef<str>) {
+    static ALWAYS_ENABLED: AtomicBool = AtomicBool::new(false);
+    write_sync_log(
+        database_path,
+        &ALWAYS_ENABLED,
+        LogDetail::Summary,
+        level,
+        message,
+    );
+}
+
 fn cleanup_expired_logs(database_path: &Path, retention_days: u16) {
     cleanup_expired_logs_at(database_path, retention_days, std::time::SystemTime::now());
 }
@@ -108,7 +119,7 @@ fn cleanup_expired_logs_at(database_path: &Path, retention_days: u16, now: std::
     }
 }
 
-fn redact_urls(message: &str) -> String {
+pub(crate) fn redact_diagnostic_message(message: &str) -> String {
     let mut output = String::with_capacity(message.len());
     let mut rest = message;
     while let Some((start, prefix_len)) = find_url_start(rest) {
@@ -200,7 +211,7 @@ mod tests {
 
     #[test]
     fn log_redacts_url_credentials_query_and_fragment() {
-        let redacted = redact_urls(
+        let redacted = redact_diagnostic_message(
             "request failed https://reader:secret@example.com/api?token=abc#frag, try later",
         );
         assert_eq!(

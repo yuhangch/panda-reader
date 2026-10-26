@@ -23,7 +23,7 @@ mod config;
 mod crypto;
 mod storage;
 pub use config::{safe_preferences, safe_provider_hints, safe_translator_config};
-pub use crypto::{decrypt_file, encrypt_file};
+pub use crypto::{decrypt_file, encrypt_file, is_age_encrypted_file};
 pub use storage::{
     BackupItem, BackupTargetConfig, RemoteStorage, S3Target, WebDavTarget, load_targets,
     save_targets,
@@ -470,7 +470,7 @@ fn hash_file(path: &Path) -> anyhow::Result<(u64, String)> {
 
 pub fn suggested_filename(mode: BackupMode) -> String {
     format!(
-        "panda-reader-{}-{}-{}.prbackup",
+        "panda-reader-{}-{}-{}.pdbk",
         Utc::now().format("%Y%m%dT%H%M%SZ"),
         Uuid::new_v4(),
         mode.label()

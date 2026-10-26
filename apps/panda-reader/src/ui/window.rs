@@ -118,7 +118,7 @@ impl ReaderWindow {
             services.clone(),
             data_dir.clone(),
         );
-        let editor = FeedEditor::new(window, cx);
+        let editor = FeedEditor::new(window, cx, preferences.language);
         let status = Status::default();
         let status_view = cx.new(|_| StatusBar::default());
         let (update_events, mut update_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -455,6 +455,9 @@ impl Render for ReaderWindow {
             })
             .when(self.quote_poster.is_some(), |view| {
                 view.child(self.render_quote_poster(cx))
+            })
+            .when(self.settings.backup_password_prompt_open, |view| {
+                view.child(self.settings.render_backup_password_prompt(self, cx))
             })
             .when_some(
                 self.reader.read(cx).image_viewer_url.clone(),

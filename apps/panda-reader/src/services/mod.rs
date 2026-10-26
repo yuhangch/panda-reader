@@ -20,4 +20,6 @@ pub use command::Command;
 pub(crate) use command::TitleTranslationInput;
 #[allow(unused_imports)]
 pub(crate) use command::TitleTranslationStatus;
+#[allow(unused_imports)]
+pub(crate) use diagnostics::{redact_diagnostic_message, write_sync_summary_log};
 pub use worker::AppServices;
