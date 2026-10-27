@@ -29,6 +29,59 @@ pub fn data_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default().join("data"))
 }
 
+/// Remove cached installer packages while preserving any package selected for
+/// installation now or on the next launch. Partial downloads are not touched.
+pub fn cleanup_download_cache(data_dir: &Path, keep: Option<&Path>) -> Result<usize, String> {
+    let cache_dir = data_dir.join("updates");
+    let pending_package = fs::read(data_dir.join("pending-update.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ReadyUpdate>(&bytes).ok())
+        .map(|update| update.package);
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(format!("Could not read update cache: {error}")),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not inspect update cache: {error}"))?;
+        let path = entry.path();
+        if Some(path.as_path()) == keep || pending_package.as_deref() == Some(path.as_path()) {
+            continue;
+        }
+        if !entry
+            .file_type()
+            .map_err(|error| format!("Could not inspect update package: {error}"))?
+            .is_file()
+            || !is_release_package_name(&entry.file_name().to_string_lossy())
+        {
+            continue;
+        }
+        fs::remove_file(&path)
+            .map_err(|error| format!("Could not remove cached update package: {error}"))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn is_release_package_name(name: &str) -> bool {
+    let Some(version) = name.strip_prefix("panda-reader-").and_then(|name| {
+        name.split_once('-')
+            .map(|(version, suffix)| (version, suffix))
+    }) else {
+        return false;
+    };
+    let (version, suffix) = version;
+    semver::Version::parse(version).is_ok()
+        && matches!(
+            suffix,
+            "windows-x86_64-setup.exe"
+                | "macos-arm64.zip"
+                | "macos-x86_64.zip"
+                | "linux-x86_64.AppImage"
+        )
+}
+
 #[derive(Clone, Debug)]
 pub enum UpdateStatus {
     Idle,
@@ -1273,11 +1326,53 @@ fn cleanup_stale_windows_helper_copies() {
 mod updater_tests {
     use super::{
         GithubAsset, GithubRelease, StableAsset, StableManifest, WindowsInstallScope,
-        classify_windows_install_scope, is_trusted_download_url, normalize_windows_path,
-        release_info_from_github, release_info_from_stable, windows_setup_scope_argument,
+        classify_windows_install_scope, cleanup_download_cache, is_release_package_name,
+        is_trusted_download_url, normalize_windows_path, release_info_from_github,
+        release_info_from_stable, windows_setup_scope_argument,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    #[test]
+    fn cleanup_removes_only_old_release_packages_and_keeps_selected_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("updates");
+        std::fs::create_dir(&cache).unwrap();
+        let old = cache.join("panda-reader-0.2.10-windows-x86_64-setup.exe");
+        let selected = cache.join("panda-reader-0.2.12-windows-x86_64-setup.exe");
+        let partial = cache.join("panda-reader-0.2.11-windows-x86_64-setup.exe.part");
+        let unrelated = cache.join("notes.txt");
+        for path in [&old, &selected, &partial, &unrelated] {
+            std::fs::write(path, b"test").unwrap();
+        }
+
+        assert_eq!(
+            cleanup_download_cache(directory.path(), Some(&selected)).unwrap(),
+            1
+        );
+        assert!(!old.exists());
+        assert!(selected.exists());
+        assert!(partial.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn release_package_filter_accepts_only_supported_versioned_assets() {
+        assert!(is_release_package_name(
+            "panda-reader-0.2.12-windows-x86_64-setup.exe"
+        ));
+        assert!(is_release_package_name(
+            "panda-reader-0.2.12-linux-x86_64.AppImage"
+        ));
+        assert!(is_release_package_name(
+            "panda-reader-0.2.12-macos-arm64.zip"
+        ));
+        assert!(!is_release_package_name(
+            "panda-reader-0.2.12-windows-x86_64-setup.exe.part"
+        ));
+        assert!(!is_release_package_name("panda-reader-not-a-version.exe"));
+        assert!(!is_release_package_name("unrelated.exe"));
+    }
 
     #[test]
     fn stable_manifest_becomes_release_info_with_embedded_hashes() {

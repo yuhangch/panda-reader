@@ -91,6 +91,15 @@ impl Settings {
                 h_flex()
                     .gap_2()
                     .pt_2()
+                    .child(
+                        Button::new("cleanup-old-update-downloads")
+                            .small()
+                            .secondary()
+                            .label(owner.t("Clean old update downloads"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cleanup_update_downloads(cx);
+                            })),
+                    )
                     .when(!matches!(owner.update_status, UpdateStatus::Ready(_) | UpdateStatus::NextLaunch(_)), |row| {
                         row.child(
                             Button::new("check-for-updates")

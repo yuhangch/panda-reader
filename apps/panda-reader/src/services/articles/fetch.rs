@@ -197,14 +197,6 @@ fn looks_like_json(body: &[u8]) -> bool {
     matches!(sample.trim_start().chars().next(), Some('{' | '['))
 }
 
-#[cfg(test)]
-async fn fetch_public_destination(
-    url: &str,
-    referer: Option<&str>,
-) -> anyhow::Result<reqwest::Response> {
-    fetch_public_destination_with_network(url, referer, &ArticleFetchNetwork::default()).await
-}
-
 async fn fetch_public_destination_with_network(
     url: &str,
     referer: Option<&str>,

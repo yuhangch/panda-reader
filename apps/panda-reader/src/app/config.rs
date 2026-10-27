@@ -221,12 +221,9 @@ fn apply_pending_restore(data_dir: &std::path::Path, database: &std::path::Path)
         return;
     }
     if !pending.exists() {
-        if prefs_pending.exists() {
-            let prefs = data_dir.join("preferences.json");
-            if let Err(error) = std::fs::rename(&prefs_pending, &prefs) {
-                eprintln!("could not finish restored Panda Reader preferences: {error}");
-                return;
-            }
+        if let Err(error) = apply_pending_preferences(data_dir) {
+            eprintln!("could not finish restored Panda Reader preferences: {error:#}");
+            return;
         }
         if let Err(error) = apply_pending_public_translator(data_dir) {
             eprintln!("could not finish restored Panda Reader translator settings: {error:#}");
@@ -297,6 +294,20 @@ fn apply_pending_restore(data_dir: &std::path::Path, database: &std::path::Path)
     if let Err(error) = result {
         eprintln!("could not apply staged Panda Reader restore: {error:#}");
     }
+}
+
+fn apply_pending_preferences(data_dir: &std::path::Path) -> anyhow::Result<()> {
+    let pending = data_dir.join("preferences.json.restore-pending");
+    if !pending.exists() {
+        return Ok(());
+    }
+    let path = data_dir.join("preferences.json");
+    let bytes = std::fs::read(&pending)?;
+    let temp = tempfile::NamedTempFile::new_in(data_dir)?;
+    std::fs::write(temp.path(), bytes)?;
+    temp.persist(&path).map_err(|error| error.error)?;
+    std::fs::remove_file(pending)?;
+    Ok(())
 }
 
 fn apply_pending_public_translator(data_dir: &std::path::Path) -> anyhow::Result<()> {
@@ -417,5 +428,27 @@ mod backup_restore_tests {
                 .to_string_lossy()
                 .contains("pre-restore-")
         }));
+    }
+
+    #[test]
+    fn resumed_restore_atomically_replaces_existing_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("panda-reader.sqlite3");
+        std::fs::write(dir.path().join("restore-ready"), b"v1").unwrap();
+        std::fs::write(dir.path().join("preferences.json"), b"{\"theme\":\"old\"}").unwrap();
+        std::fs::write(
+            dir.path().join("preferences.json.restore-pending"),
+            b"{\"theme\":\"new\"}",
+        )
+        .unwrap();
+
+        apply_pending_restore(dir.path(), &database);
+
+        let preferences: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("preferences.json")).unwrap())
+                .unwrap();
+        assert_eq!(preferences["theme"], "new");
+        assert!(!dir.path().join("preferences.json.restore-pending").exists());
+        assert!(!dir.path().join("restore-ready").exists());
     }
 }

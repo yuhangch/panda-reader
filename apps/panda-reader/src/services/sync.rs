@@ -297,7 +297,7 @@ fn refresh_local_feeds(
     let feeds = Store::open_read_workspace(path, workspace)
         .and_then(|store| store.local_feeds_to_refresh())
         .map_err(|error| error.to_string())?;
-    let (outcome, failures) = runtime.block_on(async {
+    let (outcome, successful, failures) = runtime.block_on(async {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(8));
         let mut tasks = tokio::task::JoinSet::new();
         for feed in feeds {
@@ -322,6 +322,7 @@ fn refresh_local_feeds(
             });
         }
         let mut outcome = SyncOutcome::default();
+        let mut successful = 0;
         let mut failures = Vec::new();
         while let Some(result) = tasks.join_next().await {
             let (feed, result) =
@@ -344,6 +345,7 @@ fn refresh_local_feeds(
                                 store.persist_prepared_feed(&url, Some(id), prepared)
                             }) {
                                 Ok(update) => {
+                                    successful += 1;
                                     if update.feed_changed {
                                         outcome.saved += 1;
                                     }
@@ -369,15 +371,19 @@ fn refresh_local_feeds(
                 }
             }
         }
-        Ok::<_, String>((outcome, failures))
+        Ok::<_, String>((outcome, successful, failures))
     })?;
-    if outcome.saved == 0 && !failures.is_empty() {
+    if all_local_feeds_failed(successful, &failures) {
         return Err(format!(
             "All feeds failed to refresh: {}",
             failures.join("; ")
         ));
     }
     Ok(outcome)
+}
+
+fn all_local_feeds_failed(successful: usize, failures: &[String]) -> bool {
+    successful == 0 && !failures.is_empty()
 }
 
 pub(super) fn sync_provider(
@@ -672,4 +678,22 @@ async fn flush_remote_marks(
             store.acknowledge_remote_marks(&pending).map(|_| ())
         })
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::all_local_feeds_failed;
+
+    #[test]
+    fn unchanged_successful_feeds_are_not_reported_as_total_failure() {
+        let failures = vec!["https://example.com/broken.xml: timeout".to_owned()];
+        assert!(!all_local_feeds_failed(1, &failures));
+    }
+
+    #[test]
+    fn reports_failure_when_every_attempt_failed() {
+        let failures = vec!["https://example.com/broken.xml: timeout".to_owned()];
+        assert!(all_local_feeds_failed(0, &failures));
+        assert!(!all_local_feeds_failed(0, &[]));
+    }
 }

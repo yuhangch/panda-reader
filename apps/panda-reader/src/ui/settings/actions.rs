@@ -121,6 +121,36 @@ impl ReaderWindow {
         cx.notify();
     }
 
+    pub(in crate::ui) fn cleanup_update_downloads(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.update_status,
+            UpdateStatus::Checking | UpdateStatus::Downloading { .. }
+        ) {
+            self.set_flash(self.t("Wait for the update download to finish"), cx);
+            cx.notify();
+            return;
+        }
+        let keep = match &self.update_status {
+            UpdateStatus::Ready(update)
+            | UpdateStatus::NextLaunch(update)
+            | UpdateStatus::Later(update) => Some(update.package.as_path()),
+            _ => None,
+        };
+        match updater::cleanup_download_cache(&self.data_dir, keep) {
+            Ok(0) => self.set_flash(self.t("No old update downloads to remove"), cx),
+            Ok(count) => self.set_flash(
+                i18n::format(
+                    self.preferences.language,
+                    "Removed {} old update download(s)",
+                    &count.to_string(),
+                ),
+                cx,
+            ),
+            Err(error) => self.set_error(error),
+        }
+        cx.notify();
+    }
+
     pub(in crate::ui) fn set_update_checks(&mut self, enabled: bool, cx: &mut Context<Self>) {
         self.preferences.check_for_updates = enabled;
         self.save_preferences();

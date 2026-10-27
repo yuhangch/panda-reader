@@ -1,9 +1,6 @@
-#[cfg(not(test))]
 use crate::ui::window::ReaderWindow;
 use base64::Engine as _;
-#[cfg(not(test))]
 use gpui_kit::base::StyledExt as _;
-#[cfg(not(test))]
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -11,7 +8,6 @@ use gpui_kit::component::{
     scroll::ScrollableElement as _,
     v_flex,
 };
-#[cfg(not(test))]
 use gpui_kit::*;
 
 const POSTER_WIDTH: u32 = 1080;
@@ -19,14 +15,12 @@ static POSTER_FONT_DB: std::sync::OnceLock<std::sync::Arc<resvg::usvg::fontdb::D
     std::sync::OnceLock::new();
 
 #[derive(Clone)]
-#[cfg(not(test))]
 pub(in crate::ui) struct QuotePoster {
     pub image: Image,
     pub png: Vec<u8>,
     pub scale: f32,
 }
 
-#[cfg(not(test))]
 impl QuotePoster {
     fn generate(
         quote: String,
@@ -335,7 +329,6 @@ fn color_hex(color: u32) -> String {
     format!("#{color:06x}")
 }
 
-#[cfg(not(test))]
 impl ReaderWindow {
     pub(in crate::ui) fn begin_quote_poster(
         &mut self,
