@@ -1,38 +1,38 @@
 {
-  "version": "0.2.11",
+  "version": "0.2.12",
   "channel": "stable",
-  "html_url": "https://github.com/yuhangch/panda-reader/releases/tag/v0.2.11",
+  "html_url": "https://github.com/yuhangch/panda-reader/releases/tag/v0.2.12",
   "assets": {
     "windows-x86_64-setup": {
-      "name": "panda-reader-0.2.11-windows-x86_64-setup.exe",
-      "size": 30479216,
-      "sha256": "5cddb08a0baf31ff975685042369a3416dc60b4a827143e00268df5cdf6c8c57",
+      "name": "panda-reader-0.2.12-windows-x86_64-setup.exe",
+      "size": 32635479,
+      "sha256": "8e3475ff790936468edf3f3db248b7460f00302e54143a445153e0b69322e82b",
       "urls": [
-        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.11/panda-reader-0.2.11-windows-x86_64-setup.exe"
+        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.12/panda-reader-0.2.12-windows-x86_64-setup.exe"
       ]
     },
     "macos-arm64-zip": {
-      "name": "panda-reader-0.2.11-macos-arm64.zip",
-      "size": 43595698,
-      "sha256": "7ea231a5c62d73f95b3cda83ab5fd81ea7b126650bedcebeed5e53ed32e42f94",
+      "name": "panda-reader-0.2.12-macos-arm64.zip",
+      "size": 47740826,
+      "sha256": "b799d79a4d89efa53c81caf15571fcbcdd261518b10ab094ce816125adb3e7b7",
       "urls": [
-        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.11/panda-reader-0.2.11-macos-arm64.zip"
+        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.12/panda-reader-0.2.12-macos-arm64.zip"
       ]
     },
     "macos-x86_64-zip": {
-      "name": "panda-reader-0.2.11-macos-x86_64.zip",
-      "size": 45369816,
-      "sha256": "f35d9c12588bd62081def86b291cfc58824859e19bf6958e795e1ce702d8a09b",
+      "name": "panda-reader-0.2.12-macos-x86_64.zip",
+      "size": 49955929,
+      "sha256": "74b0c8b0f35b3c7485d68372ab395d824c787bf207a98e81a10b81f593758a15",
       "urls": [
-        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.11/panda-reader-0.2.11-macos-x86_64.zip"
+        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.12/panda-reader-0.2.12-macos-x86_64.zip"
       ]
     },
     "linux-x86_64-appimage": {
-      "name": "panda-reader-0.2.11-linux-x86_64.AppImage",
-      "size": 46766584,
-      "sha256": "348f27ea72a6f37e8848913303f0ee11ced4734b35d14901411e16d34d75c760",
+      "name": "panda-reader-0.2.12-linux-x86_64.AppImage",
+      "size": 50788856,
+      "sha256": "0600fb3436a7328d77a77aab34f2c3b33725dc711d2147100044bb9537426fe7",
       "urls": [
-        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.11/panda-reader-0.2.11-linux-x86_64.AppImage"
+        "https://github.com/yuhangch/panda-reader/releases/download/v0.2.12/panda-reader-0.2.12-linux-x86_64.AppImage"
       ]
     }
   }
