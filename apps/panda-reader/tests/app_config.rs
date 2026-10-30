@@ -1,12 +1,18 @@
 // Exercise non-UI configuration code without the GPUI-heavy binary test harness.
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
+#[path = "../src/app/backup.rs"]
+mod backup;
 #[path = "../src/app/config.rs"]
 mod config;
 #[path = "../src/ui/i18n.rs"]
 mod i18n;
 #[path = "../src/app/preferences.rs"]
 pub(crate) mod preferences;
+#[path = "../src/request_epoch.rs"]
+mod request_epoch;
+#[path = "../src/services/mod.rs"]
+mod services;
 
 mod app {
     pub(crate) use crate::preferences;
@@ -15,6 +21,44 @@ mod app {
 use config::AppConfig;
 use panda_providers::{ProviderKind, ProviderSettings, ProviderSettingsMap};
 use preferences::{Language, LibrarySource, Preferences};
+
+#[test]
+fn full_backup_is_staged_and_restored_on_next_start() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let db = source.path().join("panda-reader.sqlite3");
+    panda_store::Store::migrate(&db).unwrap();
+    let connection = rusqlite::Connection::open(&db).unwrap();
+    connection
+        .execute(
+            "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    let archive = scratch.path().join("backup.pdbk");
+    backup::write_backup_archive(
+        source.path(),
+        panda_backup::BackupMode::Full,
+        &archive,
+        serde_json::to_vec(&Preferences::default()).unwrap(),
+        b"{}".to_vec(),
+        b"{}".to_vec(),
+        scratch.path(),
+    )
+    .unwrap();
+    let validated = panda_backup::read_archive(&archive).unwrap();
+    backup::stage_full_restore(target.path(), validated).unwrap();
+    assert!(target.path().join("restore-ready").exists());
+    let _config = AppConfig::load_from(target.path().to_owned());
+    let restored = rusqlite::Connection::open(target.path().join("panda-reader.sqlite3")).unwrap();
+    let count: i64 = restored
+        .query_row("SELECT COUNT(*) FROM feeds", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
+    assert!(!target.path().join("restore-ready").exists());
+}
 
 #[test]
 fn fresh_install_loads_defaults_without_creating_settings() {

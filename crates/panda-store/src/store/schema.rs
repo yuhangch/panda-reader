@@ -467,6 +467,12 @@ impl Store {
             ensure_column(&connection, "articles", "source_page_content_type", "TEXT")?;
             connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         }
+        if schema_version < 8 {
+            // Keep translation identities stable when a changed plugin pipeline
+            // produces the same canonical body as an older pipeline.
+            ensure_column(&connection, "articles", "processed_identity_hash", "TEXT")?;
+            connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
+        }
         if schema_version < CURRENT_SCHEMA_VERSION {
             let integrity: String =
                 connection.query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))?;

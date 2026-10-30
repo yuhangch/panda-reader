@@ -12,20 +12,27 @@ pub(super) fn handle(command: Command, workspace: String, state: &WorkerState) {
             let _ = reply.send(state.plugin_list().map_err(|error| error.to_string()));
         }
         Command::ReloadPlugins { reply } => {
-            let _ = reply.send(state.reload_plugins().map_err(|error| error.to_string()));
+            let state = state.clone();
+            super::worker::long_job(reply, move |_| {
+                state.reload_plugins().map_err(|error| error.to_string())
+            });
         }
         Command::SetPluginEnabled { id, enabled, reply } => {
-            let _ = reply.send(
+            let state = state.clone();
+            super::worker::long_job(reply, move |_| {
                 state
                     .set_plugin_enabled(&id, enabled)
-                    .map_err(|error| error.to_string()),
-            );
+                    .map_err(|error| error.to_string())
+            });
         }
         Command::ImportPlugin { source, reply } => {
             super::worker::import_plugin(source, reply, state);
         }
         Command::RemovePlugin { id, reply } => {
-            let _ = reply.send(state.remove_plugin(&id).map_err(|error| error.to_string()));
+            let state = state.clone();
+            super::worker::long_job(reply, move |_| {
+                state.remove_plugin(&id).map_err(|error| error.to_string())
+            });
         }
         Command::Snapshot {
             scope,
@@ -164,10 +171,12 @@ pub(super) fn handle(command: Command, workspace: String, state: &WorkerState) {
             super::subscriptions::export_opml(workspace.clone(), reply, state)
         }
         Command::ImportBackupFeeds { feeds, reply } => {
-            let result = state.database.write("local".into(), move |store| {
-                store.merge_local_backup_feeds(&feeds)
+            let database = state.database.clone();
+            super::worker::long_job(reply, move |_| {
+                database.write("local".into(), move |store| {
+                    store.merge_local_backup_feeds(&feeds)
+                })
             });
-            let _ = reply.send(result);
         }
         Command::Connect {
             kind,

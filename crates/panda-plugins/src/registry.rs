@@ -121,7 +121,9 @@ impl PluginRegistry {
     /// Stable cache key covering the ordered manifests, plugin bytes, and enabled state.
     pub fn cache_key(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.generation.to_le_bytes());
+        // Preserve the original startup key while keeping reload generations
+        // out of the content identity: a reload alone changes no plugin bytes.
+        hasher.update(0_u64.to_le_bytes());
         for plugin in &self.plugins {
             hasher.update(plugin.summary.manifest.id.as_bytes());
             hasher.update([0]);
@@ -129,6 +131,30 @@ impl PluginRegistry {
             hasher.update([u8::from(plugin.summary.enabled)]);
             hasher.update(plugin.summary.content_hash.as_bytes());
             hasher.update([0xff]);
+        }
+        hex::encode(hasher.finalize())
+    }
+
+    /// Identify only the enabled plugins that can affect this document and stage.
+    pub fn cache_key_for(&self, url: &str, stage: PluginStage) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"panda-matching-plugins-v1\0");
+        if let Ok(url) = Url::parse(url)
+            && let Some(host) = url.host_str()
+        {
+            for plugin in &self.plugins {
+                let manifest = &plugin.summary.manifest;
+                if plugin.summary.enabled
+                    && manifest.stage == stage
+                    && manifest_matches(manifest, host, &url)
+                {
+                    hasher.update(manifest.id.as_bytes());
+                    hasher.update([0]);
+                    hasher.update(toml::to_string(manifest).unwrap_or_default());
+                    hasher.update(plugin.summary.content_hash.as_bytes());
+                    hasher.update([0xff]);
+                }
+            }
         }
         hex::encode(hasher.finalize())
     }
@@ -780,6 +806,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reload_generation_does_not_change_content_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = PluginRegistry::load(temp.path(), &PluginSettings::default(), 0);
+        let reloaded = PluginRegistry::load(temp.path(), &PluginSettings::default(), 9);
+        assert_eq!(first.cache_key(), reloaded.cache_key());
+    }
+
+    #[test]
     fn network_hosts_must_be_explicit_public_dns_names() {
         assert!(valid_network_host("news.google.com"));
         assert!(!valid_network_host("*.google.com"));
@@ -838,6 +872,14 @@ capabilities = ["document_read", "document_write"]
         let mut settings = PluginSettings::default();
         settings.set_enabled("example.cleanup", false);
         let disabled = PluginRegistry::load(temp.path(), &settings, 2);
+        assert_eq!(
+            registry.cache_key_for("https://unrelated.org/story", PluginStage::Cleanup),
+            disabled.cache_key_for("https://unrelated.org/story", PluginStage::Cleanup)
+        );
+        assert_ne!(
+            registry.cache_key_for("https://example.com/story", PluginStage::Cleanup),
+            disabled.cache_key_for("https://example.com/story", PluginStage::Cleanup)
+        );
         assert!(
             disabled
                 .process(

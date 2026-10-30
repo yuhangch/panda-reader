@@ -212,6 +212,112 @@ fn test_store_for(workspace: &str) -> (tempfile::TempDir, Store) {
 }
 
 #[test]
+fn stale_processed_content_cannot_clear_new_translation() {
+    let (_directory, store) = test_store();
+    store
+        .connection
+        .execute(
+            "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+            [],
+        )
+        .unwrap();
+    store.connection.execute("INSERT INTO articles(id,feed_id,guid,title,content_html) VALUES(1,1,'one','Title','old')", []).unwrap();
+    let revision = store.article(1).unwrap().content_revision;
+    store.connection.execute("UPDATE articles SET content_html='new', translated_html='new translation', content_revision=content_revision+1 WHERE id=1", []).unwrap();
+    store
+        .save_processed_content(
+            1,
+            revision,
+            "old",
+            "https://example.org",
+            "Title",
+            "pipeline",
+            "pipeline",
+            "old result",
+        )
+        .unwrap();
+    let article = store.article(1).unwrap();
+    assert_eq!(article.translated_html.as_deref(), Some("new translation"));
+    assert_eq!(article.content_revision, revision + 1);
+}
+
+#[test]
+fn unchanged_processed_body_keeps_translation_across_pipeline_changes() {
+    let (_directory, store) = test_store();
+    store
+        .connection
+        .execute(
+            "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+            [],
+        )
+        .unwrap();
+    store.connection.execute("INSERT INTO articles(id,feed_id,guid,title,content_html,processed_html,processed_source_hash,processed_pipeline_hash,translated_html,translation_source_hash) VALUES(1,1,'one','Title','raw','clean',?1,'old-pipeline','translation','translation-key')", [processed_source_hash("raw", "https://example.org", "Title")]).unwrap();
+    let revision = store.article(1).unwrap().content_revision;
+    store
+        .save_processed_content(
+            1,
+            revision,
+            "raw",
+            "https://example.org",
+            "Title",
+            "new-pipeline",
+            "old-pipeline",
+            "clean",
+        )
+        .unwrap();
+    let article = store.article(1).unwrap();
+    assert_eq!(article.translated_html.as_deref(), Some("translation"));
+    assert_eq!(
+        article.translation_source_hash.as_deref(),
+        Some("translation-key")
+    );
+    assert_eq!(article.content_revision, revision);
+    let state = store
+        .processed_content_state(1, "raw", "https://example.org", "Title")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state,
+        ("clean".into(), "new-pipeline".into(), "old-pipeline".into())
+    );
+}
+
+#[test]
+fn version_seven_cache_and_translation_survive_identity_migration() {
+    let (directory, store) = test_store();
+    store
+        .connection
+        .execute(
+            "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+            [],
+        )
+        .unwrap();
+    store.connection.execute("INSERT INTO articles(id,feed_id,guid,title,content_html,processed_html,processed_source_hash,processed_pipeline_hash,translated_html,translation_source_hash) VALUES(1,1,'one','Title','raw','clean',?1,'old-pipeline','translation','translation-key')", [processed_source_hash("raw", "https://example.org", "Title")]).unwrap();
+    drop(store);
+    let path = directory.path().join("reader.sqlite3");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE articles DROP COLUMN processed_identity_hash; PRAGMA user_version=7;",
+    )
+    .unwrap();
+    drop(conn);
+    Store::migrate(&path).unwrap();
+    let store = Store::open_read_workspace(&path, "local").unwrap();
+    let state = store
+        .processed_content_state(1, "raw", "https://example.org", "Title")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state,
+        ("clean".into(), "old-pipeline".into(), "old-pipeline".into())
+    );
+    assert_eq!(
+        store.article(1).unwrap().translated_html.as_deref(),
+        Some("translation")
+    );
+}
+
+#[test]
 fn full_text_search_covers_metadata_body_translation_and_cjk_then_tracks_changes() {
     let (_directory, store) = test_store();
     store
@@ -245,9 +351,11 @@ fn full_text_search_covers_metadata_body_translation_and_cjk_then_tracks_changes
     store
         .save_processed_content(
             1,
+            store.article(1).unwrap().content_revision,
             "<p>raw body</p>",
             "https://example.org/article",
             "湖南大学找到植物生长开关",
+            "canonical-v1",
             "canonical-v1",
             "<p>replacement body about ocean currents</p>",
         )
@@ -1320,9 +1428,11 @@ fn processed_content_cache_invalidates_on_source_url_title_or_pipeline_change() 
     store
         .save_processed_content(
             1,
+            store.article(1).unwrap().content_revision,
             "<p>raw</p>",
             "https://example.com/1",
             "Title",
+            "plugins-v1",
             "plugins-v1",
             "<p>cleaned</p>",
         )
@@ -1458,9 +1568,11 @@ async fn cached_page_can_be_reprocessed_offline_and_skips_unchanged_pipeline() {
     store
         .save_processed_content(
             1,
+            updated.content_revision,
             canonical,
             "https://127.0.0.1:1/story",
             "Title",
+            "canonical-html-v1:new-pipeline",
             "canonical-html-v1:new-pipeline",
             canonical,
         )

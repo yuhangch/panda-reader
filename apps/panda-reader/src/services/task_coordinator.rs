@@ -12,6 +12,8 @@ type Task = Box<dyn FnOnce(&tokio::runtime::Runtime) + Send + 'static>;
 const GENERAL_CAPACITY: usize = 256;
 const BACKGROUND_CAPACITY: usize = 128;
 const TITLE_CAPACITY: usize = 128;
+const LONG_CAPACITY: usize = 64;
+const LONG_WORKERS: usize = 3;
 const GENERAL_WORKERS: usize = 3;
 const BLOCKING_WORKERS: usize = GENERAL_WORKERS + 1;
 
@@ -19,6 +21,7 @@ struct TaskCoordinator {
     general: SyncSender<Task>,
     background: SyncSender<Task>,
     titles: SyncSender<Task>,
+    long_running: SyncSender<Task>,
 }
 
 impl TaskCoordinator {
@@ -67,6 +70,25 @@ impl TaskCoordinator {
             })
             .expect("failed to start background synchronization lane");
 
+        let (long_running, long_receiver) = mpsc::sync_channel::<Task>(LONG_CAPACITY);
+        let long_receiver = Arc::new(Mutex::new(long_receiver));
+        for index in 0..LONG_WORKERS {
+            let receiver = long_receiver.clone();
+            let runtime = runtime.clone();
+            thread::Builder::new()
+                .name(format!("panda-reader-long-{index}"))
+                .spawn(move || {
+                    loop {
+                        let next = receiver
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .recv();
+                        let Ok(task) = next else { break };
+                        task(&runtime);
+                    }
+                })
+                .expect("failed to start long-running task worker");
+        }
         let (titles, title_receiver) = mpsc::sync_channel::<Task>(TITLE_CAPACITY);
         let title_runtime = runtime;
         thread::Builder::new()
@@ -82,8 +104,28 @@ impl TaskCoordinator {
             general,
             background,
             titles,
+            long_running,
         }
     }
+}
+
+pub(super) fn try_long_job<T: Send + 'static>(
+    reply: oneshot::Sender<Result<T, String>>,
+    run: impl FnOnce(&tokio::runtime::Runtime) -> Result<T, String> + Send + 'static,
+) -> bool {
+    submit(
+        TaskCoordinator::global().long_running.clone(),
+        reply,
+        run,
+        "Article",
+    )
+}
+
+pub(super) fn long_job<T: Send + 'static>(
+    reply: oneshot::Sender<Result<T, String>>,
+    run: impl FnOnce(&tokio::runtime::Runtime) -> Result<T, String> + Send + 'static,
+) {
+    let _ = try_long_job(reply, run);
 }
 
 pub(super) fn job<T: Send + 'static>(
@@ -224,5 +266,34 @@ mod tests {
         assert!(try_job(reader_reply, |_| Ok("readable")));
         assert_eq!(reader_result.blocking_recv().unwrap().unwrap(), "readable");
         release_tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn saturated_article_lane_does_not_block_reader_work() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        for _ in 0..LONG_WORKERS {
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            releases.push(release_tx);
+            let started = started_tx.clone();
+            let (reply, _) = oneshot::channel();
+            assert!(try_long_job(reply, move |_| {
+                started.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok(())
+            }));
+        }
+        for _ in 0..LONG_WORKERS {
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (reply, _) = oneshot::channel();
+        assert!(try_job(reply, move |_| {
+            completed_tx.send(()).unwrap();
+            Ok(())
+        }));
+        let completed = completed_rx.recv_timeout(Duration::from_secs(2));
+        drop(releases);
+        assert!(completed.is_ok(), "reader task was blocked by article jobs");
     }
 }

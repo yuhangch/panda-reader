@@ -1,4 +1,4 @@
-use super::worker::{WorkerState, job};
+use super::worker::{WorkerState, job, long_job};
 use panda_providers::ProviderClient;
 use panda_store::Store;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ pub(super) fn add_feed(
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
     let detailed_logging = state.detailed_sync_logging.clone();
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         if let (Some(kind), Some(config)) = (provider, config) {
             let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
             runtime
@@ -63,7 +63,7 @@ pub(super) fn remove_feed(
     let provider = state.provider_kind_for(&workspace);
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         let read = Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
         let (remote_id, _, source) = read.feed_removal_info(id).map_err(|e| e.to_string())?;
         if let (Some(kind), Some(config)) = (provider, config) {
@@ -149,7 +149,7 @@ pub(super) fn import_opml(
     let config = provider.and_then(|kind| state.provider_settings(kind));
     let database = state.database.clone();
     let detailed_logging = state.detailed_sync_logging.clone();
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         if let (Some(kind), Some(config)) = (provider, config) {
             let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
             runtime
@@ -240,7 +240,7 @@ pub(super) fn export_opml(
     let path = state.path.clone();
     let provider = state.provider_kind_for(&workspace);
     let config = provider.and_then(|kind| state.provider_settings(kind));
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         if let (Some(kind), Some(config)) = (provider, config) {
             let remote = ProviderClient::new(kind, &config).map_err(|e| e.to_string())?;
             runtime

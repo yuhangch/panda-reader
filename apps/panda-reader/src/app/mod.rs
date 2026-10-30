@@ -1,5 +1,6 @@
 //! Application startup and dependency assembly.
 
+pub(crate) mod backup;
 mod config;
 pub(crate) mod preferences;
 

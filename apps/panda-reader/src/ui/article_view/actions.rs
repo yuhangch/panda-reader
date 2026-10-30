@@ -71,15 +71,15 @@ impl ArticleView {
                 if bytes.len() > MAX_IMAGE_BYTES {
                     return Err("Image exceeds the 16 MiB copy limit".to_owned());
                 }
-                let decoded = image::load_from_memory(&bytes).map_err(|error| error.to_string())?;
-                let mut png = std::io::Cursor::new(Vec::new());
-                decoded
-                    .write_to(&mut png, image::ImageFormat::Png)
-                    .map_err(|error| error.to_string())?;
-                Ok(Arc::new(gpui_kit::gpui::Image::from_bytes(
-                    gpui_kit::gpui::ImageFormat::Png,
-                    png.into_inner(),
-                )))
+                cx.background_executor()
+                    .spawn(async move {
+                        let png = crate::services::image_decode::decode_image_png(&bytes)?;
+                        Ok(Arc::new(gpui_kit::gpui::Image::from_bytes(
+                            gpui_kit::gpui::ImageFormat::Png,
+                            png,
+                        )))
+                    })
+                    .await
             }
             .await;
             let _ = this.update(cx, |this, cx| {

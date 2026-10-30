@@ -31,7 +31,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub const CURRENT_SCHEMA_VERSION: i64 = 8;
 use url::Url;
 
 pub struct Store {
@@ -566,6 +566,22 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Return the cached body, lookup key, and identity used by its translations.
+    pub fn processed_content_state(
+        &self,
+        article_id: i64,
+        source: &str,
+        url: &str,
+        title: &str,
+    ) -> anyhow::Result<Option<(String, String, String)>> {
+        let source_hash = processed_source_hash(source, url, title);
+        self.connection.query_row(
+            "SELECT processed_html, processed_pipeline_hash, COALESCE(processed_identity_hash, processed_pipeline_hash) FROM articles WHERE id=?1 AND processed_source_hash=?2 AND processed_html IS NOT NULL AND processed_pipeline_hash IS NOT NULL AND EXISTS(SELECT 1 FROM feeds WHERE feeds.id=articles.feed_id AND feeds.workspace=?3)",
+            params![article_id, source_hash, self.workspace],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).optional().map_err(Into::into)
+    }
+
     /// Stable identity for a canonical body, derived from its source and the
     /// pipeline that produced it rather than re-hashing HTML on every read.
     pub fn canonical_revision(
@@ -586,24 +602,37 @@ impl Store {
     pub fn save_processed_content(
         &self,
         article_id: i64,
+        expected_revision: i64,
         source: &str,
         url: &str,
         title: &str,
         pipeline: &str,
+        identity: &str,
         processed: &str,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<i64>> {
         let source_hash = processed_source_hash(source, url, title);
-        let changed = self.connection.execute(
-            "UPDATE articles SET processed_html=?1,processed_source_hash=?2,processed_pipeline_hash=?3,
-                translated_html=NULL,translated_title=NULL,translated_lang=NULL,translation_source_hash=NULL,
-                content_revision=content_revision+1 WHERE id=?4 AND
-                (processed_html IS NOT ?1 OR processed_source_hash IS NOT ?2 OR processed_pipeline_hash IS NOT ?3)",
-            params![processed, source_hash, pipeline, article_id],
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE articles SET
+                translated_html=CASE WHEN processed_html IS ?1 AND processed_source_hash IS ?2 THEN translated_html ELSE NULL END,
+                translated_title=CASE WHEN processed_html IS ?1 AND processed_source_hash IS ?2 THEN translated_title ELSE NULL END,
+                translated_lang=CASE WHEN processed_html IS ?1 AND processed_source_hash IS ?2 THEN translated_lang ELSE NULL END,
+                translation_source_hash=CASE WHEN processed_html IS ?1 AND processed_source_hash IS ?2 THEN translation_source_hash ELSE NULL END,
+                content_revision=content_revision+CASE WHEN processed_html IS ?1 AND processed_source_hash IS ?2 THEN 0 ELSE 1 END,
+                processed_html=?1,processed_source_hash=?2,processed_pipeline_hash=?3,processed_identity_hash=?6
+                WHERE id=?4 AND content_revision=?5 AND EXISTS(SELECT 1 FROM feeds WHERE feeds.id=articles.feed_id AND feeds.workspace=?7)
+                AND (processed_html IS NOT ?1 OR processed_source_hash IS NOT ?2 OR processed_pipeline_hash IS NOT ?3 OR processed_identity_hash IS NOT ?6)",
+            params![processed, source_hash, pipeline, article_id, expected_revision, identity, self.workspace],
         )?;
         if changed > 0 {
-            sync_article_fts(&self.connection, article_id)?;
+            sync_article_fts(&transaction, article_id)?;
         }
-        Ok(())
+        let revision = transaction.query_row(
+            "SELECT content_revision FROM articles WHERE id=?1 AND EXISTS(SELECT 1 FROM feeds WHERE feeds.id=articles.feed_id AND feeds.workspace=?2)",
+            params![article_id, self.workspace], |row| row.get::<_, i64>(0),
+        ).optional()?;
+        transaction.commit()?;
+        Ok(revision.filter(|revision| changed > 0 || *revision == expected_revision))
     }
 }
 

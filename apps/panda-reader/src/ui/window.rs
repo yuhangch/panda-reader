@@ -151,6 +151,23 @@ impl ReaderWindow {
             mark_revisions: HashMap::new(),
             next_mark_revision: 0,
         };
+        let mut service_status = view.services.status();
+        cx.spawn(async move |this, cx| {
+            loop {
+                let status = service_status.borrow_and_update().clone();
+                if let crate::services::ServiceStatus::Failed(message) = status {
+                    let _ = this.update(cx, |this, cx| {
+                        this.set_error(message);
+                        cx.notify();
+                    });
+                    break;
+                }
+                if service_status.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let sidebar_events = cx.subscribe(&view.sidebar, |this, _, event, cx| match event {
             super::sidebar::SidebarEvent::SelectScope(scope) => {
                 this.select_scope(scope.clone(), cx)

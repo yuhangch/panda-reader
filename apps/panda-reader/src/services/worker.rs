@@ -26,7 +26,7 @@ use std::{
 use tokio::sync::{mpsc, oneshot};
 
 pub(super) use super::task_coordinator::{
-    background_job, job, title_job, try_background_job, try_job,
+    background_job, job, long_job, title_job, try_background_job, try_long_job,
 };
 
 pub(super) type TranslationJobKey = (String, i64, String, i64, String, String);
@@ -43,7 +43,15 @@ pub struct AppServices {
     detailed_sync_logging: Arc<AtomicBool>,
     article_fetch_network: Arc<RwLock<super::ArticleFetchNetwork>>,
     database_path: PathBuf,
+    status: tokio::sync::watch::Receiver<ServiceStatus>,
     pub(super) article_work_cancellations: ArticleWorkCancellations,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceStatus {
+    Starting,
+    Ready,
+    Failed(String),
 }
 
 type ArticleWorkKey = (String, i64);
@@ -121,6 +129,7 @@ impl AppServices {
         let worker_article_fetch_network = article_fetch_network.clone();
         let body_cache = Arc::new(Mutex::new(RenderCache::default()));
         let (sender, mut receiver) = mpsc::channel::<QueuedCommand>(COMMAND_QUEUE_CAPACITY);
+        let (status_sender, status) = tokio::sync::watch::channel(ServiceStatus::Starting);
         thread::Builder::new()
             .name("panda-reader-services".into())
             .spawn(move || {
@@ -133,6 +142,11 @@ impl AppServices {
                         Ok(writer) => writer,
                         Err(error) => {
                             eprintln!("could not start Panda Reader database writer: {error:#}");
+                            let message = format!("Could not start the database: {error:#}");
+                            status_sender.send_replace(ServiceStatus::Failed(message.clone()));
+                            while let Some(queued) = receiver.recv().await {
+                                queued.command.reject(message.clone());
+                            }
                             return;
                         }
                     };
@@ -167,7 +181,10 @@ impl AppServices {
                         translator_path,
                         database: writer,
                         plugin_dir: plugin_dir.clone(),
-                        plugin_registry: Arc::new(RwLock::new(load_plugin_registry(&plugin_dir))),
+                        plugin_registry: Arc::new(RwLock::new(Arc::new(load_plugin_registry(
+                            &plugin_dir,
+                        )))),
+                        plugin_operations: Arc::new(Mutex::new(())),
                         provider_settings_path,
                         provider_settings: settings.clone(),
                         detailed_sync_logging: worker_detailed_sync_logging,
@@ -179,6 +196,7 @@ impl AppServices {
                         latest_translation: Arc::new(Mutex::new(HashMap::new())),
                         article_work_cancellations: worker_article_work_cancellations,
                     };
+                    status_sender.send_replace(ServiceStatus::Ready);
                     loop {
                         let Some(command) = receiver.recv().await else {
                             break;
@@ -203,8 +221,13 @@ impl AppServices {
             detailed_sync_logging,
             article_fetch_network,
             database_path,
+            status,
             article_work_cancellations,
         }
+    }
+
+    pub fn status(&self) -> tokio::sync::watch::Receiver<ServiceStatus> {
+        self.status.clone()
     }
 
     pub fn send(&self, command: Command) {
@@ -247,13 +270,15 @@ impl AppServices {
     }
 }
 
+#[derive(Clone)]
 pub struct WorkerState {
     pub path: PathBuf,
     pub provider_settings_path: PathBuf,
     pub translator_path: PathBuf,
     pub database: DbWriter,
     pub plugin_dir: PathBuf,
-    pub plugin_registry: Arc<RwLock<PluginRegistry>>,
+    pub plugin_registry: Arc<RwLock<Arc<PluginRegistry>>>,
+    plugin_operations: Arc<Mutex<()>>,
     pub provider_settings: Arc<RwLock<ProviderSettingsMap>>,
     pub detailed_sync_logging: Arc<AtomicBool>,
     pub article_fetch_network: Arc<RwLock<super::ArticleFetchNetwork>>,
@@ -339,13 +364,18 @@ impl WorkerState {
     }
 
     pub(super) fn reload_plugins(&self) -> anyhow::Result<Vec<PluginSummary>> {
+        let _operation = lock_mutex(&self.plugin_operations, "plugin operations");
+        self.reload_plugins_locked()
+    }
+
+    fn reload_plugins_locked(&self) -> anyhow::Result<Vec<PluginSummary>> {
         let generation = read_lock(&self.plugin_registry, "plugin registry")
             .generation()
             .wrapping_add(1);
         let settings = self.plugin_settings()?;
         let next = PluginRegistry::load(&self.plugin_dir, &settings, generation);
         let plugins = next.plugins();
-        *write_lock(&self.plugin_registry, "plugin registry") = next;
+        *write_lock(&self.plugin_registry, "plugin registry") = Arc::new(next);
         RenderCache::lock(&self.body_cache).clear();
         Ok(plugins)
     }
@@ -355,18 +385,20 @@ impl WorkerState {
         id: &str,
         enabled: bool,
     ) -> anyhow::Result<Vec<PluginSummary>> {
+        let _operation = lock_mutex(&self.plugin_operations, "plugin operations");
         let mut settings = self.plugin_settings()?;
         settings.set_enabled(id, enabled);
         self.save_plugin_settings(&settings)?;
-        self.reload_plugins()
+        self.reload_plugins_locked()
     }
 
     pub(super) fn remove_plugin(&self, id: &str) -> anyhow::Result<Vec<PluginSummary>> {
+        let _operation = lock_mutex(&self.plugin_operations, "plugin operations");
         PluginRegistry::remove_user_plugin(&self.plugin_dir, id)?;
         let mut settings = self.plugin_settings()?;
         settings.remove(id);
         self.save_plugin_settings(&settings)?;
-        self.reload_plugins()
+        self.reload_plugins_locked()
     }
 }
 
@@ -378,8 +410,10 @@ pub(super) fn import_plugin(
     let plugin_dir = state.plugin_dir.clone();
     let registry = state.plugin_registry.clone();
     let body_cache = state.body_cache.clone();
-    job(reply, move |runtime| {
+    let operations = state.plugin_operations.clone();
+    long_job(reply, move |runtime| {
         (|| -> anyhow::Result<Vec<PluginSummary>> {
+            let _operation = lock_mutex(&operations, "plugin operations");
             let source = source.trim();
             if source.is_empty() {
                 bail!("enter a plugin folder path, ZIP path, or HTTPS ZIP URL");
@@ -423,7 +457,7 @@ pub(super) fn import_plugin(
                 .wrapping_add(1);
             let next = PluginRegistry::load(&plugin_dir, &settings, generation);
             let plugins = next.plugins();
-            *write_lock(&registry, "plugin registry") = next;
+            *write_lock(&registry, "plugin registry") = Arc::new(next);
             RenderCache::lock(&body_cache).clear();
             Ok(plugins)
         })()
@@ -434,7 +468,7 @@ pub(super) fn import_plugin(
 pub(super) fn community_plugin_catalog(
     reply: oneshot::Sender<Result<Vec<CommunityPlugin>, String>>,
 ) {
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         load_community_catalog(runtime)
             .map(|catalog| catalog.plugins)
             .map_err(|error| format!("{error:#}"))
@@ -449,8 +483,10 @@ pub(super) fn install_community_plugin(
     let plugin_dir = state.plugin_dir.clone();
     let registry = state.plugin_registry.clone();
     let body_cache = state.body_cache.clone();
-    job(reply, move |runtime| {
+    let operations = state.plugin_operations.clone();
+    long_job(reply, move |runtime| {
         (|| -> anyhow::Result<Vec<PluginSummary>> {
+            let _operation = lock_mutex(&operations, "plugin operations");
             let catalog = load_community_catalog(runtime)?;
             let plugin = catalog
                 .plugins
@@ -502,7 +538,7 @@ pub(super) fn install_community_plugin(
                 .wrapping_add(1);
             let next = PluginRegistry::load(&plugin_dir, &settings, generation);
             let plugins = next.plugins();
-            *write_lock(&registry, "plugin registry") = next;
+            *write_lock(&registry, "plugin registry") = Arc::new(next);
             RenderCache::lock(&body_cache).clear();
             Ok(plugins)
         })()

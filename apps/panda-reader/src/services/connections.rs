@@ -1,7 +1,7 @@
 use super::articles::cache::RenderCache;
 use super::command::ConnectOutcome;
 use super::diagnostics::{LogDetail, write_sync_log};
-use super::worker::{WorkerState, job, read_lock, write_lock};
+use super::worker::{WorkerState, long_job, read_lock, write_lock};
 use panda_providers::{ProviderClient, ProviderKind, ProviderSettings, save_settings};
 use tokio::sync::oneshot;
 
@@ -30,7 +30,7 @@ pub(super) fn connect(
     let detailed_logging = state.detailed_sync_logging.clone();
     let generations = state.provider_connection_generations.clone();
     let generation = next_generation(state, kind);
-    job(reply, move |runtime| {
+    long_job(reply, move |runtime| {
         let started = std::time::Instant::now();
         let settings = ProviderSettings {
             endpoint,

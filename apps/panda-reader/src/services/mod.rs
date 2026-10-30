@@ -9,6 +9,7 @@ mod diagnostics;
 mod dispatch;
 pub(crate) mod favicon;
 mod feed_fetch;
+pub(crate) mod image_decode;
 mod subscriptions;
 mod sync;
 mod task_coordinator;
@@ -23,3 +24,4 @@ pub(crate) use command::TitleTranslationStatus;
 #[allow(unused_imports)]
 pub(crate) use diagnostics::{redact_diagnostic_message, write_sync_summary_log};
 pub use worker::AppServices;
+pub use worker::ServiceStatus;

@@ -7,7 +7,7 @@ use super::database::DbWriter;
 use super::diagnostics::{LogDetail, write_sync_log};
 use super::worker::{
     TranslationJobKey, WorkerState, finish_article_work, job, lock_mutex, read_lock,
-    register_article_work, remote_mark_lock, title_job, try_background_job, try_job,
+    register_article_work, remote_mark_lock, title_job, try_background_job, try_long_job,
     wait_for_article_work_cancel,
 };
 use panda_core::{
@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use cache::{RenderCache, RenderCacheKey};
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::{collections::HashSet, sync::OnceLock};
 
 fn remote_mark_flushes() -> &'static Mutex<HashSet<String>> {
@@ -112,15 +112,28 @@ pub fn prepare_article(
     translation_layout: TranslationLayout,
     hide_images: bool,
     paragraph_indent: bool,
-    plugins: &PluginRegistry,
+    plugins: &Arc<PluginRegistry>,
+    registry_source: &Arc<RwLock<Arc<PluginRegistry>>>,
     database: &DbWriter,
     workspace: &str,
 ) -> Result<PreparedArticle, String> {
     let mut article = store.article(id).map_err(|e| e.to_string())?;
     let reading_progress = store.reading_progress(id).map_err(|e| e.to_string())?;
-    article.canonical = Some(canonical_article_body(
-        store, &article, plugins, database, workspace,
-    )?);
+    let (canonical, revision) = canonical_article_body(
+        store,
+        &article,
+        plugins,
+        registry_source,
+        database,
+        workspace,
+    )?;
+    if revision != article.content_revision {
+        article = store.article(id).map_err(|e| e.to_string())?;
+        if article.content_revision != revision {
+            return Err("Article changed while preparing its content".into());
+        }
+    }
+    article.canonical = Some(canonical);
     let options = RenderOptions {
         show_translation,
         translation_layout,
@@ -153,10 +166,11 @@ pub fn prepare_article(
 fn canonical_article_body(
     store: &Store,
     article: &panda_core::Article,
-    plugins: &PluginRegistry,
+    plugins: &Arc<PluginRegistry>,
+    registry_source: &Arc<RwLock<Arc<PluginRegistry>>>,
     database: &DbWriter,
     workspace: &str,
-) -> Result<CanonicalArticle, String> {
+) -> Result<(CanonicalArticle, i64), String> {
     let source = article
         .extracted_html
         .as_deref()
@@ -168,23 +182,31 @@ fn canonical_article_body(
         .as_deref()
         .or(article.summary.url.as_deref())
         .unwrap_or("");
-    let pipeline = format!("canonical-html-v1:{}", plugins.cache_key());
-    let revision = Store::canonical_revision(source, source_url, &article.summary.title, &pipeline);
-    if let Some(cached) = store
-        .processed_content(
+    let pipeline = format!(
+        "canonical-html-v1:{}",
+        plugins.cache_key_for(source_url, PluginStage::Cleanup)
+    );
+    let previous = store
+        .processed_content_state(
             article.summary.id,
             source,
             source_url,
             &article.summary.title,
-            &pipeline,
         )
-        .map_err(|error| format!("could not read processed article cache: {error:#}"))?
+        .map_err(|error| format!("could not read processed article cache: {error:#}"))?;
+    if let Some((cached, cached_pipeline, identity)) =
+        previous.as_ref().filter(|(_, key, _)| key == &pipeline)
     {
-        return Ok(CanonicalArticle {
-            html: CanonicalHtml::new(cached),
-            revision,
-            pipeline_revision: pipeline.into(),
-        });
+        let revision =
+            Store::canonical_revision(source, source_url, &article.summary.title, identity);
+        return Ok((
+            CanonicalArticle {
+                html: CanonicalHtml::new(cached.clone()),
+                revision,
+                pipeline_revision: cached_pipeline.clone().into(),
+            },
+            article.content_revision,
+        ));
     }
     let raw = RawHtml::new(source.to_owned());
     let processed = plugins.process(
@@ -208,27 +230,48 @@ fn canonical_article_body(
         processed.html.into_owned()
     };
     let canonical_html = panda_content::sanitize_html(&body, Some(source_url));
+    let identity = previous
+        .as_ref()
+        .filter(|(cached, _, _)| cached == &canonical_html)
+        .map(|(_, _, identity)| identity.clone())
+        .unwrap_or_else(|| pipeline.clone());
+    let revision = Store::canonical_revision(source, source_url, &article.summary.title, &identity);
     let id = article.summary.id;
+    let expected_revision = article.content_revision;
     let source = raw.as_str().to_owned();
     let source_url = source_url.to_owned();
     let title = article.summary.title.clone();
     let pipeline_for_write = pipeline.clone();
+    let identity_for_write = identity;
     let cached = canonical_html.clone();
-    database.enqueue(workspace.to_owned(), move |store| {
-        store.save_processed_content(
-            id,
-            &source,
-            &source_url,
-            &title,
-            &pipeline_for_write,
-            &cached,
-        )
-    })?;
-    Ok(CanonicalArticle {
-        html: CanonicalHtml::new(canonical_html),
-        revision,
-        pipeline_revision: pipeline.into(),
-    })
+    let registry_source = registry_source.clone();
+    let snapshot = plugins.clone();
+    let saved_revision = database
+        .write(workspace.to_owned(), move |store| {
+            let current = read_lock(&registry_source, "plugin registry");
+            if !Arc::ptr_eq(&current, &snapshot) {
+                return Ok(None);
+            }
+            store.save_processed_content(
+                id,
+                expected_revision,
+                &source,
+                &source_url,
+                &title,
+                &pipeline_for_write,
+                &identity_for_write,
+                &cached,
+            )
+        })?
+        .ok_or_else(|| "Article or plugins changed while preparing its content".to_owned())?;
+    Ok((
+        CanonicalArticle {
+            html: CanonicalHtml::new(canonical_html),
+            revision,
+            pipeline_revision: pipeline.into(),
+        },
+        saved_revision,
+    ))
 }
 
 pub(super) fn snapshot(
@@ -266,7 +309,7 @@ pub(super) fn article(
     let database = state.database.clone();
     job(reply, move |_| {
         let store = Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
-        let plugins = read_lock(&plugins, "plugin registry");
+        let snapshot = read_lock(&plugins, "plugin registry").clone();
         prepare_article(
             &store,
             &cache,
@@ -275,6 +318,7 @@ pub(super) fn article(
             translation_layout,
             hide_images,
             paragraph_indent,
+            &snapshot,
             &plugins,
             &database,
             &workspace,
@@ -468,7 +512,7 @@ pub(super) fn extract(
     let (cancel_id, cancel_receiver) = register_article_work(&cancellations, &workspace, id);
     let cleanup_cancellations = cancellations.clone();
     let cleanup_workspace = workspace.clone();
-    let submitted = try_job(reply, move |runtime| {
+    let submitted = try_long_job(reply, move |runtime| {
         let started_at = std::time::Instant::now();
         write_sync_log(
             &diagnostics_path,
@@ -478,7 +522,8 @@ pub(super) fn extract(
             format!("full-text extraction started article_id={id}"),
         );
         let result = (|| -> Result<(), String> {
-            let plugins = read_lock(&plugins, "plugin registry");
+            let registry_source = plugins.clone();
+            let plugins = read_lock(&registry_source, "plugin registry").clone();
             let pipeline_hash = format!("{}:{extractor:?}", plugins.cache_key());
             let mut retry_stale = false;
             let mut force_attempt = force;
@@ -591,7 +636,15 @@ pub(super) fn extract(
                     Ok(Some(prepared)) => {
                         failure_stage = "persist_result".to_owned();
                         let persist_started = std::time::Instant::now();
+                        let registry_source = registry_source.clone();
+                        let snapshot = plugins.clone();
                         match database.write(workspace.clone(), move |store| {
+                            let current = read_lock(&registry_source, "plugin registry");
+                            if !Arc::ptr_eq(&current, &snapshot) {
+                                anyhow::bail!(
+                                    "Plugins changed while extracting the article; please retry"
+                                );
+                            }
                             store.persist_extraction(prepared)
                         }) {
                             Ok(true) => {
@@ -718,7 +771,7 @@ pub(super) fn translate(
     let cleanup_workspace = workspace.clone();
     let completion_latest = latest_translation.clone();
     let rejected_latest = latest_translation.clone();
-    let submitted = try_job(completion, move |runtime| {
+    let submitted = try_long_job(completion, move |runtime| {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             (|| -> Result<PreparedArticle, String> {
                 if !translation_is_latest(&latest_translation, &key) {
@@ -729,11 +782,16 @@ pub(super) fn translate(
                 let store =
                     Store::open_read_workspace(&path, &workspace).map_err(|e| e.to_string())?;
                 let mut article = store.article(id).map_err(|e| e.to_string())?;
-                let expected_content_revision = article.content_revision;
-                let registry = read_lock(&plugins, "plugin registry");
-                let canonical =
-                    canonical_article_body(&store, &article, &registry, &database, &workspace)?;
-                drop(registry);
+                let registry = read_lock(&plugins, "plugin registry").clone();
+                let (canonical, prepared_revision) =
+                    canonical_article_body(&store, &article, &registry, &plugins, &database, &workspace)?;
+                if article.content_revision != prepared_revision {
+                    article = store.article(id).map_err(|e| e.to_string())?;
+                    if article.content_revision != prepared_revision {
+                        return Err("Article changed while preparing its content".into());
+                    }
+                }
+                let expected_content_revision = prepared_revision;
                 let prompt_revision = translator.resumable_prompt_revision();
                 let backend_id = translator.cache_id();
                 let translation_context_hash =
@@ -774,7 +832,13 @@ pub(super) fn translate(
                     let hash = source_hash.clone();
                     let latest = latest_translation.clone();
                     let expected_key = key.clone();
+                    let registry_source = plugins.clone();
+                    let snapshot = registry.clone();
                     database.write(workspace.clone(), move |store| {
+                        let current = read_lock(&registry_source, "plugin registry");
+                        if !Arc::ptr_eq(&current, &snapshot) {
+                            anyhow::bail!("Plugins changed while translating; please retry");
+                        }
                         let latest = lock_mutex(&latest, "latest translation task");
                         if latest.get(&(expected_key.0.clone(), expected_key.1))
                             != Some(&expected_key)
@@ -921,7 +985,13 @@ pub(super) fn translate(
                     }
                     let latest = latest_translation.clone();
                     let expected_key = key.clone();
+                    let registry_source = plugins.clone();
+                    let snapshot = registry.clone();
                     database.write(workspace.clone(), move |store| {
+                        let current = read_lock(&registry_source, "plugin registry");
+                        if !Arc::ptr_eq(&current, &snapshot) {
+                            anyhow::bail!("Plugins changed while translating; please retry");
+                        }
                         let latest = lock_mutex(&latest, "latest translation task");
                         if latest.get(&(expected_key.0.clone(), expected_key.1))
                             != Some(&expected_key)
@@ -1296,6 +1366,40 @@ pub(super) fn translate_titles(
 mod translation_dedup_tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn stale_plugin_snapshot_cannot_write_processed_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("reader.sqlite3");
+        Store::migrate(&path).unwrap();
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO feeds(id,feed_url,title) VALUES(1,'https://example.org/feed','feed')",
+                [],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO articles(id,feed_id,guid,title,url,content_html) VALUES(1,1,'one','Title','https://example.org/article','<p>body</p>')", []).unwrap();
+        drop(connection);
+        let writer = DbWriter::start(path.clone()).unwrap();
+        let store = Store::open_read_workspace(&path, "local").unwrap();
+        let article = store.article(1).unwrap();
+        let old_snapshot = Arc::new(PluginRegistry::empty());
+        let current = Arc::new(RwLock::new(Arc::new(PluginRegistry::empty())));
+        assert!(
+            canonical_article_body(&store, &article, &old_snapshot, &current, &writer, "local")
+                .is_err()
+        );
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let cached: Option<String> = connection
+            .query_row(
+                "SELECT processed_html FROM articles WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(cached.is_none());
+    }
 
     #[tokio::test]
     async fn identical_translation_requests_share_one_in_flight_result() {
