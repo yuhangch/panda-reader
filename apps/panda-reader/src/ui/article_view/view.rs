@@ -7,7 +7,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    menu::ContextMenuExt as _,
+    menu::{PopupMenu, PopupMenuItem},
     scroll::Scrollbar,
     text::{TextView, TextViewStyle},
     v_flex,
@@ -62,7 +62,6 @@ impl ArticleView {
 
     fn render_reader(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let reader_entity = cx.entity().downgrade();
-        let menu_emit = super::super::context_menus::pane_menu_emitter(reader_entity.clone());
         let language = self.preferences.language;
         let mut reader = v_flex()
             .flex_1()
@@ -73,8 +72,6 @@ impl ArticleView {
         if let Some(article) = &self.article {
             let summary = &article.summary;
             let id = summary.id;
-            let menu_emit = menu_emit.clone();
-            let menu_article = summary.clone();
             let star_label = i18n::text(
                 language,
                 if summary.is_starred {
@@ -407,86 +404,30 @@ impl ArticleView {
                 .child(div().pt_1().text_sm().child(meta));
             reader = reader.child(
                 v_flex()
+                    .id("article-menu-region")
                     .flex_1()
                     .h_full()
                     .min_w_0()
-                    .on_mouse_down(gpui::MouseButton::Right, {
-                        let article_view = reader_entity.clone();
-                        move |event, window, cx| {
-                            let selectable = gpui_kit::base::TextSelection::is_selectable_at(
-                                event.position,
+                    // TextView resolves link hits on release and stops propagation.
+                    // The reader handles the remaining right clicks after its children.
+                    .on_mouse_up(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            this.open_article_menu(event.position, window, cx);
+                        }),
+                    )
+                    .on_aux_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                        if let ClickEvent::Touch(touch) = event
+                            && touch.long_press
+                            && !gpui_kit::base::TextSelection::is_selectable_at(
+                                touch.position,
                                 window,
                                 cx,
-                            );
-                            let image_target = article_view
-                                .update(cx, |view, _| {
-                                    view.context_menu_image = view.pending_context_image.take();
-                                    view.context_menu_image.is_some()
-                                })
-                                .unwrap_or(false);
-                            if image_target || !selectable {
-                                gpui_kit::base::TextSelection::clear(window, cx);
-                            }
-                        }
-                    })
-                    .context_menu({
-                        let context_reader = reader_entity.clone();
-                        move |menu, window, cx| {
-                            let image_target = context_reader
-                                .update(cx, |view, _| {
-                                    view.context_menu_image.take().and_then(|url| {
-                                        view.article_image_cache
-                                            .get(&url)
-                                            .cloned()
-                                            .map(|image| (url, image))
-                                    })
-                                })
-                                .ok()
-                                .flatten();
-                            if let Some((image_url, image)) = image_target {
-                                let article_view = context_reader.clone();
-                                return menu
-                                    .item(
-                                        gpui_kit::component::menu::PopupMenuItem::new(
-                                            crate::ui::i18n::text(language, "Copy image"),
-                                        )
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                let _ = article_view.update(cx, |_, cx| {
-                                                    cx.emit(ArticleViewEvent::CopyImage(
-                                                        image.clone(),
-                                                    ));
-                                                });
-                                            },
-                                        ),
-                                    )
-                                    .separator()
-                                    .item(
-                                        gpui_kit::component::menu::PopupMenuItem::new(
-                                            crate::ui::i18n::text(language, "Copy image link"),
-                                        )
-                                        .on_click(
-                                            move |_, _, cx| {
-                                                cx.write_to_clipboard(
-                                                    gpui_kit::ClipboardItem::new_string(
-                                                        image_url.clone(),
-                                                    ),
-                                                );
-                                            },
-                                        ),
-                                    );
-                            }
-                            super::super::context_menus::article_context_menu(
-                                menu,
-                                window,
-                                cx,
-                                &menu_article,
-                                &menu_emit,
-                                language,
-                                true,
                             )
+                        {
+                            this.open_article_menu(touch.position, window, cx);
                         }
-                    })
+                    }))
                     .child(toolbar)
                     .child(
                         v_flex()
@@ -597,6 +538,7 @@ impl ArticleView {
                                                     image_viewer: reader_entity.clone(),
                                                 })
                                                 .plugin(ArticleHeadingMarkdown {
+                                                    reader: reader_entity.clone(),
                                                     style: article_style.clone(),
                                                     font: article_font_family(
                                                         self.preferences.reader_font_family
@@ -626,24 +568,9 @@ impl ArticleView {
                                                 ))
                                                 .style(article_style)
                                                 .pb_12()
-                                                .on_link_click(move |url, _, _, cx| {
-                                                    if let Some(index) =
-                                                        url.strip_prefix("panda-image://").and_then(
-                                                            |index| index.parse::<usize>().ok(),
-                                                        )
-                                                    {
-                                                        let _ =
-                                                            reader_entity.update(cx, |_, cx| {
-                                                                cx.emit(
-                                                                    ArticleViewEvent::OpenImage(
-                                                                        index,
-                                                                    ),
-                                                                );
-                                                            });
-                                                    } else {
-                                                        cx.open_url(url);
-                                                    }
-                                                }),
+                                                .on_link_click(body_link_handler(
+                                                    reader_entity.clone(),
+                                                )),
                                             )
                                             .child(Scrollbar::vertical(&self.scroll)),
                                     ),
@@ -677,7 +604,113 @@ impl ArticleView {
                     ),
             );
         }
+        if let Some((article_id, position, menu)) = &self.body_menu
+            && self
+                .article
+                .as_ref()
+                .is_some_and(|article| article.summary.id == *article_id)
+        {
+            reader = reader.child(
+                deferred(
+                    anchored()
+                        .position(*position)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(gpui_kit::base::POPUP_PRIORITY),
+            );
+        }
         reader
+    }
+}
+
+impl ArticleView {
+    fn open_article_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(summary) = self.article.as_ref().map(|article| article.summary.clone()) else {
+            return;
+        };
+        if !gpui_kit::base::TextSelection::is_selectable_at(position, window, cx) {
+            gpui_kit::base::TextSelection::clear(window, cx);
+        }
+        let language = self.preferences.language;
+        let emit = super::super::context_menus::pane_menu_emitter(cx.entity().downgrade());
+        self.open_body_menu(position, window, cx, |menu, window, cx| {
+            super::super::context_menus::article_context_menu(
+                menu, window, cx, &summary, &emit, language, true,
+            )
+        });
+    }
+
+    fn open_body_menu(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu,
+    ) {
+        let Some(article_id) = self.article.as_ref().map(|article| article.summary.id) else {
+            return;
+        };
+        let previous_focus = window.focused(cx);
+        let menu = PopupMenu::build(window, cx, |menu, window, cx| {
+            let menu = build(menu, window, cx);
+            match previous_focus {
+                Some(focus) => menu.action_context(focus),
+                None => menu,
+            }
+        });
+        self.body_menu_subscription =
+            Some(cx.subscribe(&menu, |this, menu, _: &DismissEvent, cx| {
+                if this
+                    .body_menu
+                    .as_ref()
+                    .is_some_and(|(_, _, active)| active == &menu)
+                {
+                    this.body_menu = None;
+                    cx.notify();
+                }
+            }));
+        menu.read(cx).focus_handle(cx).focus(window, cx);
+        self.body_menu = Some((article_id, position, menu));
+        cx.notify();
+    }
+}
+
+fn body_link_handler(
+    reader: WeakEntity<ArticleView>,
+) -> impl Fn(&SharedString, &ClickEvent, &mut Window, &mut App) + Send + Sync + use<> {
+    move |url, event, window, cx| {
+        if let ClickEvent::Mouse(click) = event
+            && click.up.button == MouseButton::Right
+        {
+            let url = url.to_string();
+            let _ = reader.update(cx, |view, cx| {
+                let language = view.preferences.language;
+                view.open_body_menu(click.up.position, window, cx, |menu, _, _| {
+                    menu.item(
+                        PopupMenuItem::new(i18n::text(language, "Copy link")).on_click(
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
+                            },
+                        ),
+                    )
+                });
+            });
+        } else if !matches!(event, ClickEvent::Touch(click) if click.long_press) {
+            if let Some(index) = url
+                .strip_prefix("panda-image://")
+                .and_then(|index| index.parse().ok())
+            {
+                let _ = reader.update(cx, |_, cx| cx.emit(ArticleViewEvent::OpenImage(index)));
+            } else {
+                cx.open_url(url);
+            }
+        }
     }
 }
 
@@ -732,7 +765,9 @@ impl MarkdownPlugin for TranslationMarkdown {
             .map(|range| format!("article-translation-{}", range.start))
             .unwrap_or_else(|| "article-translation".to_owned());
         TextView::markdown(id, node.as_markdown().to_owned())
+            .on_link_click(body_link_handler(self.image_viewer.clone()))
             .plugin(ArticleHeadingMarkdown {
+                reader: self.image_viewer.clone(),
                 style: self.style.clone(),
                 font: self.font.clone(),
                 line_height: self.line_height,
@@ -813,12 +848,52 @@ impl MarkdownPlugin for ArticleImageMarkdown {
                 div()
                     .flex_none()
                     .max_w_full()
-                    .on_mouse_down(gpui::MouseButton::Right, {
+                    .on_mouse_up(MouseButton::Right, {
                         let url = image.url.clone();
                         let article_view = article_view.clone();
-                        move |_, _, cx| {
-                            let _ = article_view.update(cx, |view, _| {
-                                view.pending_context_image = Some(url.clone());
+                        move |event, window, cx| {
+                            cx.stop_propagation();
+                            gpui_kit::base::TextSelection::clear(window, cx);
+                            let _ = article_view.update(cx, |view, cx| {
+                                let language = view.preferences.language;
+                                let image = view.article_image_cache.get(&url).cloned();
+                                let article_view = article_view.clone();
+                                let url = url.clone();
+                                view.open_body_menu(
+                                    event.position,
+                                    window,
+                                    cx,
+                                    |mut menu, _, _| {
+                                        if let Some(image) = image {
+                                            menu = menu
+                                                .item(
+                                                    PopupMenuItem::new(i18n::text(
+                                                        language,
+                                                        "Copy image",
+                                                    ))
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = article_view.update(cx, |_, cx| {
+                                                            cx.emit(ArticleViewEvent::CopyImage(
+                                                                image.clone(),
+                                                            ));
+                                                        });
+                                                    }),
+                                                )
+                                                .separator();
+                                        }
+                                        menu.item(
+                                            PopupMenuItem::new(i18n::text(
+                                                language,
+                                                "Copy image link",
+                                            ))
+                                            .on_click(move |_, _, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    url.clone(),
+                                                ));
+                                            }),
+                                        )
+                                    },
+                                );
                             });
                         }
                     })
@@ -850,6 +925,7 @@ impl MarkdownPlugin for ArticleImageMarkdown {
 }
 
 struct ArticleHeadingMarkdown {
+    reader: WeakEntity<ArticleView>,
     style: TextViewStyle,
     font: gpui::Font,
     line_height: gpui::Rems,
@@ -918,6 +994,7 @@ impl MarkdownPlugin for ArticleHeadingMarkdown {
             TextView::markdown(id, node.as_markdown().to_owned())
                 .font(self.font.clone())
                 .text_size(size)
+                .on_link_click(body_link_handler(self.reader.clone()))
                 .font_weight(weight)
                 .line_height(self.line_height)
                 .style(self.style.clone().paragraph_gap(rems(0.))),
