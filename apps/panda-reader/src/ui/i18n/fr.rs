@@ -29,6 +29,8 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Select an article first", "Sélectionnez d’abord un article"),
     ("Feed", "Flux"),
     ("Loading articles…", "Chargement des articles…"),
+    ("Loading image…", "Chargement de l’image…"),
+    ("Image unavailable", "Image indisponible"),
     ("No articles yet", "Aucun article pour le moment"),
     (
         "Connect Miniflux in Settings to see your articles here",

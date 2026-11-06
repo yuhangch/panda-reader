@@ -24,9 +24,11 @@ gpui_kit::assets::icon_assets!(
         Puzzle,
         Image,
         ImageOff,
+        Loader,
         Star,
         Bookmark,
         BookmarkCheck,
+        Copy,
         Share,
     ]
 );

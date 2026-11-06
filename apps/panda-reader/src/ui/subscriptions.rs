@@ -222,8 +222,7 @@ impl ReaderWindow {
                 });
                 match result {
                     Ok(count) => {
-                        this.record_refresh_success();
-                        this.set_flash(
+                        this.record_refresh_success(
                             i18n::format(this.preferences.language, "Synced {} articles", count),
                             cx,
                         );
@@ -335,8 +334,7 @@ impl ReaderWindow {
             let _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(_) => {
-                        this.record_refresh_success();
-                        this.set_flash(this.t("Feed refreshed"), cx);
+                        this.record_refresh_success(this.t("Feed refreshed"), cx);
                         this.load_snapshot(cx);
                     }
                     Err(error) => this.set_error(error),

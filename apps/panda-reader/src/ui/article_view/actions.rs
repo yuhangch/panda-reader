@@ -28,7 +28,9 @@ impl ArticleView {
         if let Some(image) = self.article_image_cache.get(url) {
             return Some(image.clone());
         }
-        if !self.article_images_loading.insert(url.to_owned()) {
+        if self.article_images_failed.contains(url)
+            || !self.article_images_loading.insert(url.to_owned())
+        {
             return None;
         }
 
@@ -92,8 +94,10 @@ impl ArticleView {
                     }
                     this.article_image_cache_order.push_back(url.clone());
                     this.article_image_cache.insert(url, image);
-                    cx.notify();
+                } else if this.image_urls.contains(&url) {
+                    this.article_images_failed.insert(url);
                 }
+                cx.notify();
             });
         })
         .detach();
@@ -137,6 +141,7 @@ impl ReaderWindow {
             reader.restore_progress = None;
             reader.image_viewer_url = None;
             reader.image_urls.clear();
+            reader.article_images_failed.clear();
             reader.scroll.set_offset(point(px(0.), px(0.)));
             reader.is_extracting = false;
             reader.translating_article_id = None;

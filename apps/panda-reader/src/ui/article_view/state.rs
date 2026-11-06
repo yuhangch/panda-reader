@@ -57,6 +57,7 @@ pub(in crate::ui) struct ArticleView {
     pub(in crate::ui) article_image_cache: HashMap<String, Arc<gpui::Image>>,
     pub(in crate::ui) article_image_cache_order: VecDeque<String>,
     pub(in crate::ui) article_images_loading: HashSet<String>,
+    pub(in crate::ui) article_images_failed: HashSet<String>,
 }
 
 impl ArticleView {
@@ -89,6 +90,7 @@ impl ArticleView {
             article_image_cache: HashMap::new(),
             article_image_cache_order: VecDeque::new(),
             article_images_loading: HashSet::new(),
+            article_images_failed: HashSet::new(),
         }
     }
 

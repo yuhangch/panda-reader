@@ -9,6 +9,7 @@ use gpui_kit::component::{
     h_flex,
     menu::{PopupMenu, PopupMenuItem},
     scroll::Scrollbar,
+    spinner::Spinner,
     text::{TextView, TextViewStyle},
     v_flex,
 };
@@ -840,10 +841,16 @@ impl MarkdownPlugin for ArticleImageMarkdown {
         if let Some(image) = node.data::<ArticleImageData>() {
             let index = image.index;
             let article_view = self.article_view.clone();
-            let display_image = article_view
-                .update(cx, |view, cx| view.load_article_image(&image.url, cx))
-                .ok()
-                .flatten();
+            let (display_image, failed, language) = article_view
+                .update(cx, |view, cx| {
+                    let image_data = view.load_article_image(&image.url, cx);
+                    (
+                        image_data,
+                        view.article_images_failed.contains(&image.url),
+                        view.preferences.language,
+                    )
+                })
+                .unwrap_or((None, true, Default::default()));
             let image_element = if let Some(display_image) = display_image {
                 div()
                     .flex_none()
@@ -908,8 +915,31 @@ impl MarkdownPlugin for ArticleImageMarkdown {
                                 });
                             }),
                     )
+                    .into_any_element()
             } else {
-                div().w_full().h(px(160.)).max_w_full()
+                v_flex()
+                    .id(("article-image-placeholder", index as u64))
+                    .w_full()
+                    .h(px(160.))
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted)
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .when(!failed, |placeholder| {
+                        placeholder.child(Spinner::new().small().color(cx.theme().muted_foreground))
+                    })
+                    .child(i18n::text(
+                        language,
+                        if failed {
+                            "Image unavailable"
+                        } else {
+                            "Loading image…"
+                        },
+                    ))
+                    .into_any_element()
             };
             container = container.child(
                 div()

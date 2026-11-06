@@ -26,6 +26,8 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Select an article first", "先に記事を選択してください"),
     ("Feed", "フィード"),
     ("Loading articles…", "記事を読み込み中…"),
+    ("Loading image…", "画像を読み込み中…"),
+    ("Image unavailable", "画像を読み込めません"),
     ("No articles yet", "まだ記事がありません"),
     (
         "Connect Miniflux in Settings to see your articles here",

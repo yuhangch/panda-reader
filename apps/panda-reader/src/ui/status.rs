@@ -1,7 +1,12 @@
+use crate::ui::components::{BundledIcon, bundled_icon};
 use crate::ui::i18n;
 use crate::ui::window::ReaderWindow;
 use chrono::{DateTime, Local};
-use gpui_kit::component::{ActiveTheme as _, h_flex};
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use panda_core::Scope;
@@ -26,6 +31,7 @@ pub(in crate::ui) struct StatusBarPresentation {
     pub(in crate::ui) message: String,
     pub(in crate::ui) tone: StatusTone,
     pub(in crate::ui) update_prompt: bool,
+    copy_error_label: Option<&'static str>,
     pub(in crate::ui) right: String,
 }
 
@@ -58,6 +64,7 @@ impl Default for StatusBar {
                 message: String::new(),
                 tone: StatusTone::Busy,
                 update_prompt: false,
+                copy_error_label: None,
                 right: String::new(),
             },
         }
@@ -99,10 +106,15 @@ impl ReaderWindow {
         self.status.status = None;
     }
 
-    pub(in crate::ui) fn record_refresh_success(&mut self) {
+    pub(in crate::ui) fn record_refresh_success(
+        &mut self,
+        message: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.preferences.last_refresh_at = Some(chrono::Utc::now().to_rfc3339());
-        if let Err(error) = self.preferences.save(&self.preferences_path) {
-            self.set_error(format!("Could not save settings: {error}"));
+        match self.preferences.save(&self.preferences_path) {
+            Ok(()) => self.set_flash(message, cx),
+            Err(error) => self.set_error(format!("Could not save settings: {error}")),
         }
     }
 
@@ -151,19 +163,26 @@ impl Status {
         owner: &ReaderWindow,
         cx: &App,
     ) -> StatusBarPresentation {
-        let (message, update_prompt) = match &owner.update_status {
-            crate::updater::UpdateStatus::Ready(update) => (
+        let (message, update_prompt, tone) = match (&owner.update_status, &self.status) {
+            (_, Some(error)) if self.tone == StatusTone::Error => {
+                (error.clone(), false, StatusTone::Error)
+            }
+            (crate::updater::UpdateStatus::Ready(update), _) => (
                 format!("{} · {}", owner.t("Update ready"), update.version),
                 true,
+                StatusTone::Flash,
             ),
-            crate::updater::UpdateStatus::ManualRequired { version, .. } => {
-                (format!("{} · {version}", owner.t("Update available")), true)
-            }
-            crate::updater::UpdateStatus::NextLaunch(update) => (
+            (crate::updater::UpdateStatus::ManualRequired { version, .. }, _) => (
+                format!("{} · {version}", owner.t("Update available")),
+                true,
+                StatusTone::Flash,
+            ),
+            (crate::updater::UpdateStatus::NextLaunch(update), _) => (
                 format!("{} · {}", owner.t("Update on next launch"), update.version),
                 false,
+                StatusTone::Flash,
             ),
-            _ => (self.status.clone().unwrap_or_default(), false),
+            _ => (self.status.clone().unwrap_or_default(), false, self.tone),
         };
         let provider = if owner.sidebar.read(cx).is_refreshing || owner.settings.is_connecting {
             owner.t("Syncing…").to_owned()
@@ -189,8 +208,10 @@ impl Status {
         });
         StatusBarPresentation {
             context: owner.status_context_label(cx),
+            copy_error_label: (tone == StatusTone::Error && !message.is_empty())
+                .then(|| i18n::text(owner.preferences.language, "Copy")),
             message,
-            tone: self.tone,
+            tone,
             update_prompt,
             right,
         }
@@ -239,18 +260,39 @@ impl Render for StatusBar {
                     .child(presentation.context.clone()),
             )
             .child(
-                div()
-                    .id("update-status-prompt")
+                h_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_center()
-                    .text_color(mid_color)
-                    .child(presentation.message.clone())
-                    .when(presentation.update_prompt, |el| {
-                        el.cursor_pointer().on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(StatusBarEvent::OpenAbout);
-                        }))
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("update-status-prompt")
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_center()
+                            .text_color(mid_color)
+                            .child(presentation.message.clone())
+                            .when(presentation.update_prompt, |el| {
+                                el.cursor_pointer().on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(StatusBarEvent::OpenAbout);
+                                }))
+                            }),
+                    )
+                    .when_some(presentation.copy_error_label, |row, label| {
+                        let error = presentation.message.clone();
+                        row.child(
+                            Button::new("copy-status-error")
+                                .small()
+                                .ghost()
+                                .icon(bundled_icon(BundledIcon::Copy))
+                                .flex_shrink_0()
+                                .h(px(20.))
+                                .tooltip(label)
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(error.clone()));
+                                }),
+                        )
                     }),
             )
             .child(

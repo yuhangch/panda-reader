@@ -26,6 +26,8 @@ pub(super) const TABLE: &[(&str, &str)] = &[
     ("Select an article first", "請先選擇一篇文章"),
     ("Feed", "訂閱"),
     ("Loading articles…", "正在載入文章…"),
+    ("Loading image…", "正在載入圖片…"),
+    ("Image unavailable", "圖片載入失敗"),
     ("No articles yet", "這裡還沒有文章"),
     (
         "Connect Miniflux in Settings to see your articles here",

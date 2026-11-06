@@ -19,6 +19,7 @@ pub(in crate::ui) enum BundledIcon {
     StarFill,
     Bookmark,
     BookmarkCheck,
+    Copy,
     Share,
 }
 
@@ -51,6 +52,7 @@ pub(in crate::ui) fn bundled_icon(icon: BundledIcon) -> Icon {
         }
         BundledIcon::Bookmark => Icon::new(IconName::Bookmark),
         BundledIcon::BookmarkCheck => Icon::new(IconName::BookmarkCheck),
+        BundledIcon::Copy => Icon::new(IconName::Copy),
         BundledIcon::Share => Icon::new(IconName::Share),
     }
 }
